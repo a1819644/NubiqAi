@@ -1,24 +1,28 @@
-import React from 'react';
-import { 
-  MessageSquare, 
-  Plus, 
-  History, 
-  Users, 
-  FolderOpen, 
-  BarChart3, 
-  Settings, 
+import React from "react";
+import {
+  MessageSquare,
+  Plus,
+  History,
+  Users,
+  FolderOpen,
+  BarChart3,
+  Settings,
   ChevronRight,
   Bot,
   FileText,
   Home,
   CreditCard,
   User,
-  Palette
-} from 'lucide-react';
-import { Button } from './ui/button';
-import { cn } from './ui/utils';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
-import type { ActiveSection } from '../App';
+  Palette,
+} from "lucide-react";
+import { Button } from "./ui/button";
+import { cn } from "./ui/utils";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "./ui/collapsible";
+import type { ActiveSection } from "../App";
 
 interface SidebarProps {
   activeSection: ActiveSection;
@@ -26,54 +30,98 @@ interface SidebarProps {
   onNewChat: () => void;
 }
 
-export function Sidebar({ activeSection, onSectionChange, onNewChat }: SidebarProps) {
-  const isWorkspaceExpanded = activeSection.startsWith('workspace');
-  const isSettingsExpanded = activeSection.startsWith('settings');
+export function Sidebar({
+  activeSection,
+  onSectionChange,
+  onNewChat,
+}: SidebarProps) {
+  const isWorkspaceExpanded = activeSection.startsWith("workspace");
+  const isSettingsExpanded = activeSection.startsWith("settings");
 
   const sidebarItems = [
     {
-      type: 'button' as const,
+      type: "button" as const,
       icon: Plus,
-      label: 'New Chat',
+      label: "New Chat",
       onClick: onNewChat,
-      variant: 'default' as const,
+      variant: "default" as const,
     },
     {
-      type: 'item' as const,
+      type: "item" as const,
       icon: MessageSquare,
-      label: 'Home',
-      section: 'chat' as ActiveSection,
+      label: "Home",
+      section: "chat" as ActiveSection,
     },
     {
-      type: 'item' as const,
+      type: "item" as const,
       icon: History,
-      label: 'History',
-      section: 'history' as ActiveSection,
+      label: "History",
+      section: "history" as ActiveSection,
     },
     {
-      type: 'expandable' as const,
+      type: "expandable" as const,
       icon: FolderOpen,
-      label: 'Workspace',
+      label: "Workspace",
       isExpanded: isWorkspaceExpanded,
       items: [
-        { icon: Home, label: 'Overview', section: 'workspace-overview' as ActiveSection },
-        { icon: FolderOpen, label: 'Projects', section: 'workspace-projects' as ActiveSection },
-        { icon: Users, label: 'Team', section: 'workspace-team' as ActiveSection },
-        { icon: Bot, label: 'AI Tools', section: 'workspace-ai-tools' as ActiveSection },
-        { icon: FileText, label: 'Files', section: 'workspace-files' as ActiveSection },
-        { icon: BarChart3, label: 'Analytics', section: 'workspace-analytics' as ActiveSection },
+        {
+          icon: Home,
+          label: "Overview",
+          section: "workspace-overview" as ActiveSection,
+        },
+        {
+          icon: FolderOpen,
+          label: "Projects",
+          section: "workspace-projects" as ActiveSection,
+        },
+        {
+          icon: Users,
+          label: "Team",
+          section: "workspace-team" as ActiveSection,
+        },
+        {
+          icon: Bot,
+          label: "AI Tools",
+          section: "workspace-ai-tools" as ActiveSection,
+        },
+        {
+          icon: FileText,
+          label: "Files",
+          section: "workspace-files" as ActiveSection,
+        },
+        {
+          icon: BarChart3,
+          label: "Analytics",
+          section: "workspace-analytics" as ActiveSection,
+        },
       ],
     },
     {
-      type: 'expandable' as const,
+      type: "expandable" as const,
       icon: Settings,
-      label: 'Settings',
+      label: "Settings",
       isExpanded: isSettingsExpanded,
       items: [
-        { icon: User, label: 'Account', section: 'settings-account' as ActiveSection },
-        { icon: FolderOpen, label: 'Workspace', section: 'settings-workspace' as ActiveSection },
-        { icon: CreditCard, label: 'Subscription', section: 'settings-subscription' as ActiveSection },
-        { icon: Palette, label: 'Preferences', section: 'settings-preferences' as ActiveSection },
+        {
+          icon: User,
+          label: "Account",
+          section: "settings-account" as ActiveSection,
+        },
+        {
+          icon: FolderOpen,
+          label: "Workspace",
+          section: "settings-workspace" as ActiveSection,
+        },
+        {
+          icon: CreditCard,
+          label: "Subscription",
+          section: "settings-subscription" as ActiveSection,
+        },
+        {
+          icon: Palette,
+          label: "Preferences",
+          section: "settings-preferences" as ActiveSection,
+        },
       ],
     },
   ];
@@ -84,7 +132,7 @@ export function Sidebar({ activeSection, onSectionChange, onNewChat }: SidebarPr
         <div className="p-4">
           <nav className="space-y-2">
             {sidebarItems.map((item, index) => {
-              if (item.type === 'button') {
+              if (item.type === "button") {
                 return (
                   <Button
                     key={index}
@@ -98,11 +146,13 @@ export function Sidebar({ activeSection, onSectionChange, onNewChat }: SidebarPr
                 );
               }
 
-              if (item.type === 'item') {
+              if (item.type === "item") {
                 return (
                   <Button
                     key={index}
-                    variant={activeSection === item.section ? 'secondary' : 'ghost'}
+                    variant={
+                      activeSection === item.section ? "secondary" : "ghost"
+                    }
                     className="w-full justify-start"
                     onClick={() => onSectionChange(item.section)}
                   >
@@ -112,7 +162,7 @@ export function Sidebar({ activeSection, onSectionChange, onNewChat }: SidebarPr
                 );
               }
 
-              if (item.type === 'expandable') {
+              if (item.type === "expandable") {
                 return (
                   <Collapsible key={index} open={item.isExpanded}>
                     <CollapsibleTrigger asChild>
@@ -141,7 +191,11 @@ export function Sidebar({ activeSection, onSectionChange, onNewChat }: SidebarPr
                       {item.items.map((subItem, subIndex) => (
                         <Button
                           key={subIndex}
-                          variant={activeSection === subItem.section ? 'secondary' : 'ghost'}
+                          variant={
+                            activeSection === subItem.section
+                              ? "secondary"
+                              : "ghost"
+                          }
                           className="w-full justify-start pl-10"
                           onClick={() => onSectionChange(subItem.section)}
                         >
