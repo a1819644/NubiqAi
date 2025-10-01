@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+// Import UI components and custom hooks
 import { Header } from "./components/Header";
 import { Sidebar } from "./components/Sidebar";
 import { ChatInterface } from "./components/ChatInterface";
@@ -8,6 +9,7 @@ import { Settings } from "./components/Settings";
 import { Toaster } from "./components/ui/sonner";
 import { useDarkMode } from "./hooks/useDarkMode";
 
+// Type definition for user information
 export type User = {
   firstName: string;
   lastName: string;
@@ -18,6 +20,7 @@ export type User = {
   isAuthenticated: boolean;
 };
 
+// Type definition for a chat message
 export type Message = {
   id: string;
   content: string;
@@ -27,6 +30,7 @@ export type Message = {
   notes?: string;
 };
 
+// Type definition for a chat conversation
 export type Chat = {
   id: string;
   title: string;
@@ -35,6 +39,7 @@ export type Chat = {
   archived: boolean;
 };
 
+// Enum-like type for dashboard sections
 export type ActiveSection =
   | "chat"
   | "history"
@@ -50,9 +55,13 @@ export type ActiveSection =
   | "settings-preferences";
 
 export default function App() {
+  // Dark mode state and toggle function
   const { isDarkMode, toggleDarkMode } = useDarkMode();
 
+  // State for the currently active section in the dashboard
   const [activeSection, setActiveSection] = useState<ActiveSection>("chat");
+
+  // State for user information and authentication status
   const [user, setUser] = useState<User>({
     firstName: "",
     lastName: "",
@@ -63,6 +72,7 @@ export default function App() {
     isAuthenticated: false,
   });
 
+  // State for all chat conversations
   const [chats, setChats] = useState<Chat[]>([
     {
       id: "1",
@@ -101,12 +111,15 @@ export default function App() {
     },
   ]);
 
+  // State for the currently selected chat
   const [activeChat, setActiveChat] = useState<Chat | null>(chats[0]);
 
+  // Handler for user sign-in, sets user info and authentication
   const handleSignIn = (userData: Omit<User, "isAuthenticated">) => {
     setUser({ ...userData, isAuthenticated: true });
   };
 
+  // Handler for user sign-out, resets user info
   const handleSignOut = () => {
     setUser({
       firstName: "",
@@ -119,6 +132,7 @@ export default function App() {
     });
   };
 
+  // Handler for creating a new chat and making it active
   const handleNewChat = () => {
     const newChat: Chat = {
       id: Date.now().toString(),
@@ -132,9 +146,11 @@ export default function App() {
     setActiveSection("chat");
   };
 
+  // Renders the main content area based on the active section
   const renderMainContent = () => {
     switch (activeSection) {
       case "chat":
+        // Chat interface for the active chat
         return (
           <ChatInterface
             activeChat={activeChat}
@@ -149,6 +165,7 @@ export default function App() {
           />
         );
       case "history":
+        // Chat history section
         return (
           <History
             chats={chats}
@@ -157,7 +174,7 @@ export default function App() {
               setActiveSection("chat");
             }}
             onDeleteChat={(chatId) => {
-              // --- PERBAIKAN LOGIKA ADA DI SINI ---
+              // Remove chat and update active chat if needed
               setChats((prev) => {
                 const newChats = prev.filter((chat) => chat.id !== chatId);
                 if (activeChat?.id === chatId) {
@@ -165,9 +182,9 @@ export default function App() {
                 }
                 return newChats;
               });
-              // --- AKHIR PERBAIKAN ---
             }}
             onArchiveChat={(chatId) => {
+              // Toggle archive status for a chat
               setChats((prev) =>
                 prev.map((chat) =>
                   chat.id === chatId
@@ -178,37 +195,42 @@ export default function App() {
             }}
           />
         );
-      case "workspace-overview":
-      case "workspace-projects":
-      case "workspace-team":
-      case "workspace-ai-tools":
-      case "workspace-files":
-      case "workspace-analytics":
-        return (
-          <Workspace section={activeSection.replace("workspace-", "") as any} />
-        );
-      case "settings-account":
-      case "settings-workspace":
-      case "settings-subscription":
-      case "settings-preferences":
-        return (
-          <Settings
-            section={activeSection.replace("settings-", "") as any}
-            user={user}
-            onUpdateUser={setUser}
-            isDarkMode={isDarkMode}
-            onToggleDarkMode={toggleDarkMode}
-          />
-        );
+      // case "workspace-overview":
+      // case "workspace-projects":
+      // case "workspace-team":
+      // case "workspace-ai-tools":
+      // case "workspace-files":
+      // case "workspace-analytics":
+      //   // Workspace section (overview, projects, etc.)
+      //   return (
+      //     <Workspace section={activeSection.replace("workspace-", "") as any} />
+      //   );
+      // case "settings-account":
+      // case "settings-workspace":
+      // case "settings-subscription":
+      // case "settings-preferences":
+      //   // Settings section (account, workspace, etc.)
+      //   return (
+      //     <Settings
+      //       section={activeSection.replace("settings-", "") as any}
+      //       user={user}
+      //       onUpdateUser={setUser}
+      //       isDarkMode={isDarkMode}
+      //       onToggleDarkMode={toggleDarkMode}
+      //     />
+      //   );
       default:
+        // Default to chat interface
         return (
           <ChatInterface activeChat={activeChat} onUpdateChat={() => {}} />
         );
     }
   };
 
+  // Main layout rendering
   return (
     <div className="h-screen flex flex-col bg-background text-foreground">
+      {/* Header with user info and dark mode toggle */}
       <Header
         user={user}
         onSignIn={handleSignIn}
@@ -217,6 +239,7 @@ export default function App() {
         onToggleDarkMode={toggleDarkMode}
       />
       <div className="flex flex-1 overflow-hidden">
+        {/* Sidebar for navigation and new chat */}
         <div className="w-64 bg-sidebar transition-colors">
           <Sidebar
             activeSection={activeSection}
@@ -224,8 +247,10 @@ export default function App() {
             onNewChat={handleNewChat}
           />
         </div>
+        {/* Main content area */}
         <main className="flex-1 overflow-hidden">{renderMainContent()}</main>
       </div>
+      {/* Toaster for notifications */}
       <Toaster />
     </div>
   );
