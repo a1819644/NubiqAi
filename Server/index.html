@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ask AI</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f6f9;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 40px;
+      min-height: 100vh;
+    }
+
+    .container {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+      padding: 20px;
+      width: 100%;
+      max-width: 600px;
+    }
+
+    h1 {
+      text-align: center;
+      color: #333;
+      margin-bottom: 20px;
+    }
+
+    .input-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    input {
+      flex: 1;
+      padding: 12px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+
+    button {
+      padding: 12px 18px;
+      border: none;
+      border-radius: 8px;
+      background: #4a90e2;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    button:hover {
+      background: #357abd;
+    }
+
+    #result {
+      background: #f9fafb;
+      padding: 15px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 14px;
+      white-space: pre-wrap;
+      max-height: 400px;
+      overflow-y: auto;
+      border: 1px solid #eee;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Ask AI</h1>
+    <div class="input-group">
+      <input id="prompt" placeholder="Type a prompt..." />
+      <button onclick="askAI()">Ask</button>
+    </div>
+    <pre id="result">Your answer will appear here...</pre>
+  </div>
+
+  <script>
+    async function askAI() {
+      const prompt = document.getElementById('prompt').value;
+      const resultEl = document.getElementById('result');
+      resultEl.innerText = "Thinking... ⏳";
+
+      try {
+        const res = await fetch('http://localhost:8000/api/ask-ai', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
+        const data = await res.json();
+        // ✅ Show only the AI's response
+        resultEl.innerText = JSON.stringify(data, null, 2);
+      } catch (err) {
+        resultEl.innerText = "❌ Error: " + err.message;
+      }
+    }
+  </script>
+</body>
+</html>

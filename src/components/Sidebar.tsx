@@ -57,72 +57,72 @@ export function Sidebar({
       label: "History",
       section: "history" as ActiveSection,
     },
-    {
-      type: "expandable" as const,
-      icon: FolderOpen,
-      label: "Workspace",
-      isExpanded: isWorkspaceExpanded,
-      items: [
-        {
-          icon: Home,
-          label: "Overview",
-          section: "workspace-overview" as ActiveSection,
-        },
-        {
-          icon: FolderOpen,
-          label: "Projects",
-          section: "workspace-projects" as ActiveSection,
-        },
-        {
-          icon: Users,
-          label: "Team",
-          section: "workspace-team" as ActiveSection,
-        },
-        {
-          icon: Bot,
-          label: "AI Tools",
-          section: "workspace-ai-tools" as ActiveSection,
-        },
-        {
-          icon: FileText,
-          label: "Files",
-          section: "workspace-files" as ActiveSection,
-        },
-        {
-          icon: BarChart3,
-          label: "Analytics",
-          section: "workspace-analytics" as ActiveSection,
-        },
-      ],
-    },
-    {
-      type: "expandable" as const,
-      icon: Settings,
-      label: "Settings",
-      isExpanded: isSettingsExpanded,
-      items: [
-        {
-          icon: User,
-          label: "Account",
-          section: "settings-account" as ActiveSection,
-        },
-        {
-          icon: FolderOpen,
-          label: "Workspace",
-          section: "settings-workspace" as ActiveSection,
-        },
-        {
-          icon: CreditCard,
-          label: "Subscription",
-          section: "settings-subscription" as ActiveSection,
-        },
-        {
-          icon: Palette,
-          label: "Preferences",
-          section: "settings-preferences" as ActiveSection,
-        },
-      ],
-    },
+    // {
+    //   type: "expandable" as const,
+    //   icon: FolderOpen,
+    //   label: "Workspace",
+    //   isExpanded: isWorkspaceExpanded,
+    //   items: [
+    //     {
+    //       icon: Home,
+    //       label: "Overview",
+    //       section: "workspace-overview" as ActiveSection,
+    //     },
+    //     {
+    //       icon: FolderOpen,
+    //       label: "Projects",
+    //       section: "workspace-projects" as ActiveSection,
+    //     },
+    //     {
+    //       icon: Users,
+    //       label: "Team",
+    //       section: "workspace-team" as ActiveSection,
+    //     },
+    //     {
+    //       icon: Bot,
+    //       label: "AI Tools",
+    //       section: "workspace-ai-tools" as ActiveSection,
+    //     },
+    //     {
+    //       icon: FileText,
+    //       label: "Files",
+    //       section: "workspace-files" as ActiveSection,
+    //     },
+    //     {
+    //       icon: BarChart3,
+    //       label: "Analytics",
+    //       section: "workspace-analytics" as ActiveSection,
+    //     },
+    //   ],
+    // },
+    // {
+    //   type: "expandable" as const,
+    //   icon: Settings,
+    //   label: "Settings",
+    //   isExpanded: isSettingsExpanded,
+    //   items: [
+    //     {
+    //       icon: User,
+    //       label: "Account",
+    //       section: "settings-account" as ActiveSection,
+    //     },
+    //     {
+    //       icon: FolderOpen,
+    //       label: "Workspace",
+    //       section: "settings-workspace" as ActiveSection,
+    //     },
+    //     {
+    //       icon: CreditCard,
+    //       label: "Subscription",
+    //       section: "settings-subscription" as ActiveSection,
+    //     },
+    //     {
+    //       icon: Palette,
+    //       label: "Preferences",
+    //       section: "settings-preferences" as ActiveSection,
+    //     },
+    //   ],
+    // },
   ];
 
   return (
