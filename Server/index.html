@@ -96,7 +96,6 @@
         });
         const data = await res.json();
         // ✅ Show only the AI's response
-   
         resultEl.innerText = JSON.stringify(data, null, 2);
       } catch (err) {
         resultEl.innerText = "❌ Error: " + err.message;
