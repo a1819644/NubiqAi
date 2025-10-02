@@ -1,18 +1,18 @@
-import React, { useState } from 'react';
-import { MessageSquare, Trash2, Archive, Search, Filter } from 'lucide-react';
-import { Button } from './ui/button';
-import { Input } from './ui/input';
-import { Badge } from './ui/badge';
-import { ScrollArea } from './ui/scroll-area';
-import { 
-  DropdownMenu, 
-  DropdownMenuContent, 
-  DropdownMenuItem, 
-  DropdownMenuTrigger 
-} from './ui/dropdown-menu';
-import { cn } from './ui/utils';
-import { toast } from 'sonner';
-import type { Chat } from '../App';
+import React, { useState } from "react";
+import { MessageSquare, Trash2, Archive, Search, Filter } from "lucide-react";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
+import { Badge } from "./ui/badge";
+import { ScrollArea } from "./ui/scroll-area";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+import { cn } from "./ui/utils";
+import { toast } from "sonner";
+import type { Chat } from "../App";
 
 interface HistoryProps {
   chats: Chat[];
@@ -21,17 +21,28 @@ interface HistoryProps {
   onArchiveChat: (chatId: string) => void;
 }
 
-export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: HistoryProps) {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [filterType, setFilterType] = useState<'all' | 'active' | 'archived'>('all');
+export function History({
+  chats,
+  onSelectChat,
+  onDeleteChat,
+  onArchiveChat,
+}: HistoryProps) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterType, setFilterType] = useState<"all" | "active" | "archived">(
+    "all"
+  );
 
-  const filteredChats = chats.filter(chat => {
-    const matchesSearch = chat.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      chat.messages.some(msg => msg.content.toLowerCase().includes(searchQuery.toLowerCase()));
-    
-    const matchesFilter = filterType === 'all' || 
-      (filterType === 'active' && !chat.archived) ||
-      (filterType === 'archived' && chat.archived);
+  const filteredChats = chats.filter((chat) => {
+    const matchesSearch =
+      chat.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      chat.messages.some((msg) =>
+        msg.content.toLowerCase().includes(searchQuery.toLowerCase())
+      );
+
+    const matchesFilter =
+      filterType === "all" ||
+      (filterType === "active" && !chat.archived) ||
+      (filterType === "archived" && chat.archived);
 
     return matchesSearch && matchesFilter;
   });
@@ -41,30 +52,35 @@ export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: Hi
     toast.success(`Deleted "${chatTitle}"`);
   };
 
-  const handleArchiveChat = (chatId: string, chatTitle: string, isArchived: boolean) => {
+  const handleArchiveChat = (
+    chatId: string,
+    chatTitle: string,
+    isArchived: boolean
+  ) => {
     onArchiveChat(chatId);
-    toast.success(`${isArchived ? 'Unarchived' : 'Archived'} "${chatTitle}"`);
+    toast.success(`${isArchived ? "Unarchived" : "Archived"} "${chatTitle}"`);
   };
 
   const formatDate = (date: Date) => {
     const now = new Date();
     const diff = now.getTime() - date.getTime();
     const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-    
-    if (days === 0) return 'Today';
-    if (days === 1) return 'Yesterday';
+
+    if (days === 0) return "Today";
+    if (days === 1) return "Yesterday";
     if (days < 7) return `${days} days ago`;
     return date.toLocaleDateString();
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full">
+    <div className="flex flex-col h-full">
       {/* Header */}
       <div className="border-b p-4">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold">Chat History</h2>
           <Badge variant="secondary">
-            {filteredChats.length} {filteredChats.length === 1 ? 'chat' : 'chats'}
+            {filteredChats.length}{" "}
+            {filteredChats.length === 1 ? "chat" : "chats"}
           </Badge>
         </div>
 
@@ -79,7 +95,7 @@ export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: Hi
               className="pl-10"
             />
           </div>
-          
+
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm">
@@ -88,13 +104,13 @@ export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: Hi
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={() => setFilterType('all')}>
+              <DropdownMenuItem onClick={() => setFilterType("all")}>
                 All Chats
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => setFilterType('active')}>
+              <DropdownMenuItem onClick={() => setFilterType("active")}>
                 Active
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => setFilterType('archived')}>
+              <DropdownMenuItem onClick={() => setFilterType("archived")}>
                 Archived
               </DropdownMenuItem>
             </DropdownMenuContent>
@@ -103,14 +119,16 @@ export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: Hi
       </div>
 
       {/* Chat List */}
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1 h-0">
         <div className="p-4 space-y-2">
           {filteredChats.length === 0 ? (
             <div className="text-center py-8">
               <MessageSquare className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
               <h3 className="font-medium mb-2">No chats found</h3>
               <p className="text-sm text-muted-foreground">
-                {searchQuery ? 'Try adjusting your search terms' : 'Start a new chat to see it here'}
+                {searchQuery
+                  ? "Try adjusting your search terms"
+                  : "Start a new chat to see it here"}
               </p>
             </div>
           ) : (
@@ -133,14 +151,13 @@ export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: Hi
                         </Badge>
                       )}
                     </div>
-                    
+
                     <p className="text-sm text-muted-foreground line-clamp-2 mb-2">
-                      {chat.messages.length > 0 
+                      {chat.messages.length > 0
                         ? chat.messages[chat.messages.length - 1].content
-                        : 'No messages'
-                      }
+                        : "No messages"}
                     </p>
-                    
+
                     <div className="flex items-center justify-between text-xs text-muted-foreground">
                       <span>{formatDate(chat.updatedAt)}</span>
                       <span>{chat.messages.length} messages</span>
@@ -150,7 +167,11 @@ export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: Hi
                   <div className="opacity-0 group-hover:opacity-100 transition-opacity ml-2">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="sm" onClick={(e) => e.stopPropagation()}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={(e) => e.stopPropagation()}
+                        >
                           <span className="sr-only">More options</span>
                           <div className="w-1 h-1 bg-current rounded-full" />
                           <div className="w-1 h-1 bg-current rounded-full" />
@@ -161,11 +182,15 @@ export function History({ chats, onSelectChat, onDeleteChat, onArchiveChat }: Hi
                         <DropdownMenuItem
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleArchiveChat(chat.id, chat.title, chat.archived);
+                            handleArchiveChat(
+                              chat.id,
+                              chat.title,
+                              chat.archived
+                            );
                           }}
                         >
                           <Archive className="w-4 h-4 mr-2" />
-                          {chat.archived ? 'Unarchive' : 'Archive'}
+                          {chat.archived ? "Unarchive" : "Archive"}
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onClick={(e) => {

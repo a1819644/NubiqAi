@@ -126,9 +126,9 @@ export function Sidebar({
   ];
 
   return (
-    <div className="w-64 border-r bg-sidebar">
-      <div className="flex flex-col h-full">
-        <div className="p-4">
+    <div className="w-64 border-r bg-sidebar flex flex-col h-full">
+      <div className="flex-1 overflow-y-auto">
+        <div className="p-4 ">
           <nav className="space-y-2">
             {sidebarItems.map((item, index) => {
               if (item.type === "button") {
