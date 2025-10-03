@@ -1,104 +1,304 @@
-require('dotenv').config(); // Load .env
+// server.ts (TypeScript)
+require('dotenv').config();
 import express from 'express';
 import cors from 'cors';
-
-import bodyParser from 'body-parser';
 import * as admin from 'firebase-admin';
-import { GoogleGenAI } from "@google/genai";
-
-// Initialize Firebase Admin SDK
-try {
-  const serviceAccount = require('./serviceAccountKey.json');
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  console.log('Firebase Admin SDK initialized successfully.');
-} catch (error) {
-  console.warn('Firebase Admin SDK initialization failed. This is expected if serviceAccountKey.json is missing.');
-}
+import { GoogleGenAI } from '@google/genai';
+import type { Part } from '@google/genai';
 
 const app = express();
-const port = 8000;
+const port = Number(process.env.PORT ?? 8000);
 
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
-// Safely initialize Gemini client
+// Firebase init (optional)
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const serviceAccount = require('./serviceAccountKey.json');
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+  console.log('Firebase Admin SDK initialized.');
+} catch (err) {
+  console.warn('Firebase Admin init skipped (serviceAccountKey.json missing or invalid).');
+}
+
+// init Gemini client safely
 let ai: GoogleGenAI | undefined;
 try {
   if (process.env.GEMINI_API_KEY) {
     ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    console.log('Gemini API client initialized successfully.');
+    console.log('GoogleGenAI client initialized.');
   } else {
-    console.warn('GEMINI_API_KEY not found in .env file. Gemini features will be unavailable.');
+    console.warn('GEMINI_API_KEY missing from .env; Gemini client not initialized.');
   }
-} catch (error) {
-  console.error("Failed to initialize Gemini API client:", error);
+} catch (err) {
+  console.error('Failed to initialize GoogleGenAI client:', err);
 }
 
-// Basic routes
-app.get('/api', (req, res) => {
-  res.json({ message: 'Hello from the backend!' });
-});
+// Home / health
+app.get('/api', (req, res) => res.json({ ok: true }));
 
-app.get('/api/greet', (req, res) => {
-  res.json({ message: 'This is a small response.' });
-});
-
-app.get('/api/random-todo', async (req, res) => {
-  try {
-    const response = await fetch('https://jsonplaceholder.typicode.com/todos/1');
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    console.error('Error fetching todo:', error);
-    res.status(500).json({ message: 'Failed to fetch data' });
-  }
-});
-
-app.get('/api/firestore-test', async (req, res) => {
-  if (!admin.apps.length) return res.status(500).json({ message: 'Firebase not initialized.' });
-  try {
-    const db = admin.firestore();
-    const docRef = db.collection('test-collection').doc('test-doc');
-    await docRef.set({ message: 'Hello from the server!', timestamp: admin.firestore.FieldValue.serverTimestamp() });
-    const doc = await docRef.get();
-    if (!doc.exists) return res.status(404).json({ message: 'Test document not found after writing.' });
-    res.json({ message: 'Successfully wrote and read from Firestore!', data: doc.data() });
-  } catch (error) {
-    console.error('Error with Firestore:', error);
-    res.status(500).json({ message: 'Failed to interact with Firestore.' });
-  }
-});
-
-// Gemini AI route
-
-//  to do : we need to handle the response from Gemini properly and add the model thinking reason temprature
+/**
+ * POST /api/ask-ai
+ * body: { prompt: string, type?: 'text' | 'image', model?: string }
+ */
 app.post('/api/ask-ai', async (req, res) => {
-  if (!ai) return res.status(500).json({ error: "Gemini client not initialized" });
+  if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
 
   try {
-    const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+    const { prompt, type = 'text', model } = req.body;
+    if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt (string) is required' });
 
-    const response: any = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [prompt],
+    const textModel = model ?? 'gemini-2.5-flash';
+    const imageModel = model ?? 'gemini-2.5-flash-image-preview';
+
+    if (type === 'image') {
+      const response = await ai.models.generateContent({
+        model: imageModel,
+        contents: [prompt],
+      });
+
+      const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+      let imageBase64: string | null = null;
+      let imageUri: string | null = null;
+      let altText: string | null = null;
+
+      for (const part of parts) {
+        if ((part as any).inlineData?.data) imageBase64 = (part as any).inlineData.data;
+        if ((part as any).fileData?.fileUri) imageUri = (part as any).fileData.fileUri;
+        if ((part as any).text) altText = (part as any).text ?? altText;
+      }
+
+      return res.json({ success: true, imageBase64, imageUri, altText, raw: response });
+    }
+
+    // TEXT
+    const response = await ai.models.generateContent({ model: textModel, contents: [prompt] });
+    const parts = response?.candidates?.[0]?.content?.parts ?? [];
+    const text = parts.map((p: any) => p.text ?? '').join('');
+
+    return res.json({ success: true, text, raw: response });
+
+  } catch (err: any) {
+    console.error('ask-ai error:', err);
+    return res.status(500).json({ success: false, error: err?.message ?? String(err) });
+  }
+});
+
+/**
+ * POST /api/process-document
+ * body: { fileBase64?: string, filePath?: string, mimeType?: string, prompt?: string }
+ */
+app.post('/api/process-document', async (req, res) => {
+  if (!ai) return res.status(500).json({ error: 'Gemini process-document client not initialized' });
+
+  try {
+    const { fileBase64, filePath, mimeType: clientMime, prompt } = req.body;
+
+    let base64Data = '';
+    let mimeType = clientMime || 'application/pdf';
+
+    if (fileBase64 && typeof fileBase64 === 'string') {
+      base64Data = fileBase64;
+    } else if (filePath && typeof filePath === 'string') {
+      const fs = await import('fs');
+      const buffer = fs.readFileSync(filePath);
+      base64Data = buffer.toString('base64');
+      if (!clientMime) {
+        if (filePath.endsWith('.pdf')) mimeType = 'application/pdf';
+        else if (filePath.endsWith('.docx')) mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        else if (filePath.endsWith('.txt')) mimeType = 'text/plain';
+      }
+    } else {
+      return res.status(400).json({ error: 'fileBase64 or filePath is required' });
+    }
+
+    // Check file size (base64 encoded size estimation)
+    const estimatedSizeMB = (base64Data.length * 0.75) / (1024 * 1024); // Convert from base64 to actual size
+    console.log(`Processing document: ~${estimatedSizeMB.toFixed(1)}MB`);
+    
+    if (estimatedSizeMB > 20) {
+      console.warn(`Large file detected: ${estimatedSizeMB.toFixed(1)}MB - processing may be slow`);
+    }
+
+    // Use Gemini for document processing
+    const defaultPrompt = 'Extract all text content from this document. Provide a clean, well-formatted extraction of the text.';
+    const userPrompt = prompt && typeof prompt === 'string' && prompt.trim() 
+      ? prompt.trim() 
+      : defaultPrompt;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        {
+          parts: [
+            { text: userPrompt },
+            {
+              inlineData: {
+                data: base64Data,
+                mimeType: mimeType,
+              },
+            },
+          ],
+        },
+      ],
     });
 
-    // Log everything Gemini returns
-    console.log("Full Gemini response:", JSON.stringify(response, null, 2));
+    const extractedText = response?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
 
-    // Temporarily just return the raw response to see the structure
-    res.json({ success: true, rawResponse: response });
-  } catch (error: any) {
-    console.error('Error calling Gemini API:', error);
-    res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, extractedText, raw: response });
+
+  } catch (err: any) {
+    console.error('process-document error:', err);
+    
+    // Provide more specific error messages for common large file issues
+    let errorMessage = err?.message ?? String(err);
+    if (errorMessage.includes('payload') || errorMessage.includes('too large')) {
+      errorMessage = 'File too large. Please try a smaller file (under 20MB).';
+    } else if (errorMessage.includes('timeout') || errorMessage.includes('deadline')) {
+      errorMessage = 'Processing timeout. Large files may take too long to process.';
+    } else if (errorMessage.includes('quota') || errorMessage.includes('limit')) {
+      errorMessage = 'API quota exceeded. Please try again later or use a smaller file.';
+    }
+    
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
+/**
+ * POST /api/edit-image
+ * body: { imageBase64: string, editPrompt: string, model?: string }
+ */
+app.post('/api/edit-image', async (req, res) => {
+  if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
+
+  try {
+    const { imageBase64, editPrompt, model } = req.body;
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      return res.status(400).json({ error: 'imageBase64 (string) is required' });
+    }
+    if (!editPrompt || typeof editPrompt !== 'string') {
+      return res.status(400).json({ error: 'editPrompt (string) is required' });
+    }
+
+    const imageModel = model ?? 'gemini-2.5-flash-image-preview';
+
+    // Create a prompt that combines the edit instruction with the image
+    const combinedPrompt = `Edit this image based on the following instruction: ${editPrompt}. Generate a new version of the image with the requested modifications.`;
+
+    const response = await ai.models.generateContent({
+      model: imageModel,
+      contents: [
+        {
+          parts: [
+            { text: combinedPrompt },
+            {
+              inlineData: {
+                data: imageBase64,
+                mimeType: 'image/png',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+    let newImageBase64: string | null = null;
+    let imageUri: string | null = null;
+    let altText: string | null = null;
+
+    for (const part of parts) {
+      if ((part as any).inlineData?.data) newImageBase64 = (part as any).inlineData.data;
+      if ((part as any).fileData?.fileUri) imageUri = (part as any).fileData.fileUri;
+      if ((part as any).text) altText = (part as any).text ?? altText;
+    }
+
+    return res.json({ success: true, imageBase64: newImageBase64, imageUri, altText, raw: response });
+
+  } catch (err: any) {
+    console.error('edit-image error:', err);
+    return res.status(500).json({ success: false, error: err?.message ?? String(err) });
+  }
+});
+
+/**
+ * POST /api/edit-image-with-mask
+ * body: { imageBase64: string, maskBase64: string, editPrompt: string, model?: string }
+ */
+app.post('/api/edit-image-with-mask', async (req, res) => {
+  if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
+
+  try {
+    const { imageBase64, maskBase64, editPrompt, model } = req.body;
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      return res.status(400).json({ error: 'imageBase64 (string) is required' });
+    }
+    if (!maskBase64 || typeof maskBase64 !== 'string') {
+      return res.status(400).json({ error: 'maskBase64 (string) is required' });
+    }
+    if (!editPrompt || typeof editPrompt !== 'string') {
+      return res.status(400).json({ error: 'editPrompt (string) is required' });
+    }
+
+    const imageModel = model ?? 'gemini-2.5-flash-image';
+
+    // Create a detailed prompt that explains the mask-based editing
+    const combinedPrompt = `You are editing an image with marked areas. The first image is the original, and the second image shows the marked areas (colored markings) that need to be edited.
+
+Instructions:
+- Focus your edits ONLY on the marked/colored areas in the mask image
+- Leave unmarked areas unchanged
+- Apply this edit to the marked areas: ${editPrompt}
+- Generate a new version of the original image with only the marked areas modified
+
+Original image and marking mask are provided below.`;
+
+    const response = await ai.models.generateContent({
+      model: imageModel,
+      contents: [
+        {
+          parts: [
+            { text: combinedPrompt },
+            {
+              inlineData: {
+                data: imageBase64,
+                mimeType: 'image/png',
+              },
+            },
+            {
+              inlineData: {
+                data: maskBase64,
+                mimeType: 'image/png',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+    let newImageBase64: string | null = null;
+    let imageUri: string | null = null;
+    let altText: string | null = null;
+
+    for (const part of parts) {
+      if ((part as any).inlineData?.data) newImageBase64 = (part as any).inlineData.data;
+      if ((part as any).fileData?.fileUri) imageUri = (part as any).fileData.fileUri;
+      if ((part as any).text) altText = (part as any).text ?? altText;
+    }
+
+    return res.json({ success: true, imageBase64: newImageBase64, imageUri, altText, raw: response });
+
+  } catch (err: any) {
+    console.error('edit-image-with-mask error:', err);
+    return res.status(500).json({ success: false, error: err?.message ?? String(err) });
+  }
+});
 
 app.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
+  console.log(`Server listening on http://localhost:${port}`);
 });
