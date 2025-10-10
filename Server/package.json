@@ -12,6 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "@google/genai": "^1.21.0",
+    "@pinecone-database/pinecone": "^6.1.2",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",

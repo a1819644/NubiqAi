@@ -90,6 +90,7 @@ export default function App() {
         return (
           <ChatInterface
             activeChat={activeChat}
+            user={user} 
             onUpdateChat={(updatedChat) => {
               setActiveChat(updatedChat);
               setChats((prev) =>

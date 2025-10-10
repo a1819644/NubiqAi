@@ -169,6 +169,8 @@ class ApiService {
   async askAI(data: {
     message: string;
     image?: File;
+    userId?: string; // Add user ID for memory support
+    useMemory?: boolean; // Enable/disable memory
   }): Promise<{ success: boolean; text?: string; error?: string }> {
     if (data.image) {
       // For images, use FormData (if backend supports it)
@@ -176,6 +178,8 @@ class ApiService {
       formData.append('prompt', data.message);
       formData.append('image', data.image);
       formData.append('type', 'image');
+      if (data.userId) formData.append('userId', data.userId);
+      if (data.useMemory !== undefined) formData.append('useMemory', String(data.useMemory));
       
       return this.request('/ask-ai', {
         method: 'POST',
@@ -183,12 +187,14 @@ class ApiService {
         headers: {}, // Remove Content-Type to let browser set boundary for FormData
       });
     } else {
-      // For text only, use JSON
+      // For text only, use JSON with memory support
       return this.request('/ask-ai', {
         method: 'POST',
         body: JSON.stringify({
           prompt: data.message,
-          type: 'text'
+          type: 'text',
+          userId: data.userId,
+          useMemory: data.useMemory !== false // Default to true if not specified
         }),
       });
     }
@@ -321,6 +327,114 @@ class ApiService {
       method: 'PUT',
       body: JSON.stringify(data),
     });
+  }
+
+  // Memory management
+  async storeMemory(data: {
+    content: string;
+    type?: 'conversation' | 'document' | 'note';
+    source?: string;
+    userId?: string;
+    tags?: string[];
+  }): Promise<ApiResponse<{ memoryId: string }>> {
+    return this.request('/store-memory', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async storeMemories(data: {
+    memories: Array<{
+      content: string;
+      type?: string;
+      source?: string;
+      userId?: string;
+      tags?: string[];
+    }>;
+  }): Promise<ApiResponse<{ memoryIds: string[] }>> {
+    return this.request('/store-memories', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async searchMemories(data: {
+    query: string;
+    topK?: number;
+    threshold?: number;
+    userId?: string;
+    type?: string;
+  }): Promise<ApiResponse<{
+    query: string;
+    results: Array<{
+      id: string;
+      content: string;
+      score: number;
+      metadata: {
+        timestamp: number;
+        type: 'conversation' | 'document' | 'note';
+        source?: string;
+        userId?: string;
+        tags?: string[];
+      };
+    }>;
+    count: number;
+  }>> {
+    return this.request('/search-memory', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteMemory(memoryId: string): Promise<ApiResponse<any>> {
+    return this.request(`/memory/${memoryId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async getMemoryStats(): Promise<ApiResponse<{
+    stats: {
+      totalVectors: number;
+      indexDimension: number;
+    };
+  }>> {
+    return this.request('/memory-stats');
+  }
+
+  // Enhanced ask-ai with memory support
+  async askAiWithMemory(data: {
+    prompt: string;
+    type?: 'text' | 'image';
+    model?: string;
+    useMemory?: boolean;
+    userId?: string;
+  }): Promise<any> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+    try {
+      const resp = await fetch(`${this.baseURL}/ask-ai`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP error! status: ${resp.status} ${txt}`);
+      }
+      const result = await resp.json();
+      return result;
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      if (err && (err.name === 'AbortError' || err.message?.toLowerCase?.().includes('aborted') || err.message?.toLowerCase?.().includes('timeout'))) {
+        return { success: false, error: 'Request timed out.' };
+      }
+      console.error('askAiWithMemory failed:', err);
+      return { success: false, error: err?.message || String(err) };
+    }
   }
 
   // Workspace endpoints - commented out since workspace is disabled

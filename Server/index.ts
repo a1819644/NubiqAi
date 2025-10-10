@@ -4,6 +4,7 @@ import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
 import type { Part } from '@google/genai';
+import { getEmbeddingService, MemoryItem, SearchResult } from './services/embeddingService';
 
 const app = express();
 const port = Number(process.env.PORT ?? 8000);
@@ -41,22 +42,70 @@ app.get('/api', (req, res) => res.json({ ok: true }));
 
 /**
  * POST /api/ask-ai
- * body: { prompt: string, type?: 'text' | 'image', model?: string }
+ * body: { prompt: string, type?: 'text' | 'image', model?: string, useMemory?: boolean, userId?: string }
  */
 app.post('/api/ask-ai', async (req, res) => {
   if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
 
   try {
-    const { prompt, type = 'text', model } = req.body;
+    const { prompt, type = 'text', model, useMemory = true, userId } = req.body;
     if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt (string) is required' });
 
+    // For testing purposes, use anoop123 if no userId provided
+    const effectiveUserId = userId || 'anoop123';
+    
+    console.log(`💬 Chat request - User: ${effectiveUserId} (original: ${userId}), Memory: ${useMemory}, Prompt: "${prompt.substring(0, 50)}..."`);
+
+    let enhancedPrompt = prompt;
+
+    // Search for relevant memories if useMemory is enabled
+    if (useMemory && type === 'text') {
+      try {
+        const embeddingService = getEmbeddingService();
+        console.log(`🔍 Searching memories for user: ${userId || 'anonymous'}`);
+        console.log(`🔍 Search query: "${prompt}"`);
+        
+        const memories = await embeddingService.searchMemories(prompt, {
+          topK: 5, // Increased from 3
+          threshold: 0.3, // Lowered from 0.5 to find more matches
+          userId: effectiveUserId
+        });
+
+        console.log(`📝 Found ${memories.length} memories with threshold 0.3+`);
+        
+        if (memories.length > 0) {
+          memories.forEach((memory, index) => {
+            console.log(`Memory ${index + 1} (score: ${memory.score.toFixed(3)}): ${memory.content.substring(0, 100)}...`);
+          });
+          
+          const memoryContext = memories
+            .map((memory, index) => `Memory ${index + 1}: ${memory.content}`)
+            .join('\n\n');
+          
+          enhancedPrompt = `Context from previous conversations and stored knowledge:
+${memoryContext}
+
+Current question: ${prompt}
+
+Please provide a response that takes into account the relevant context above, but focus primarily on answering the current question.`;
+          
+          console.log(`✅ Enhanced prompt with ${memories.length} relevant memories for user ${effectiveUserId}`);
+        } else {
+          console.log(`❌ No memories found above threshold 0.3 for user ${effectiveUserId}`);
+        }
+      } catch (memoryError) {
+        console.warn('Memory search failed, proceeding without memory context:', memoryError);
+        // Continue with original prompt if memory search fails
+      }
+    }
+
     const textModel = model ?? 'gemini-2.5-flash';
-    const imageModel = model ?? 'gemini-2.5-flash-image-preview';
+    const imageModel = model ?? 'gemini-2.5-flash-image';
 
     if (type === 'image') {
       const response = await ai.models.generateContent({
         model: imageModel,
-        contents: [prompt],
+        contents: [enhancedPrompt],
       });
 
       const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
@@ -74,9 +123,44 @@ app.post('/api/ask-ai', async (req, res) => {
     }
 
     // TEXT
-    const response = await ai.models.generateContent({ model: textModel, contents: [prompt] });
+    const response = await ai.models.generateContent({ model: textModel, contents: [enhancedPrompt] });
     const parts = response?.candidates?.[0]?.content?.parts ?? [];
     const text = parts.map((p: any) => p.text ?? '').join('');
+
+    // Optionally store this conversation in memory for future reference
+    if (useMemory && text && effectiveUserId) {
+      try {
+        console.log(`💾 Storing conversation for user ${effectiveUserId}`);
+        const embeddingService = getEmbeddingService();
+        const conversationMemory: MemoryItem = {
+          id: `conversation_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          content: `User asked: "${prompt}"\nAI responded: "${text}"`,
+          metadata: {
+            timestamp: Date.now(),
+            type: 'conversation',
+            source: 'chat',
+            userId: effectiveUserId,
+            tags: ['ai-conversation']
+          }
+        };
+        
+        console.log(`💾 About to store conversation memory: ${conversationMemory.id}`);
+        
+        // Store asynchronously but with better error handling
+        embeddingService.storeMemory(conversationMemory)
+          .then(() => {
+            console.log(`✅ Successfully stored conversation memory: ${conversationMemory.id}`);
+          })
+          .catch(err => {
+            console.error('❌ Failed to store conversation memory:', err);
+            console.error('Memory content:', conversationMemory.content.substring(0, 100));
+          });
+      } catch (memoryError) {
+        console.error('❌ Exception in conversation storage:', memoryError);
+      }
+    } else {
+      console.log(`⚠️ Conversation NOT stored - useMemory: ${useMemory}, text: ${!!text}, effectiveUserId: ${effectiveUserId}, originalUserId: ${userId}`);
+    }
 
     return res.json({ success: true, text, raw: response });
 
@@ -146,6 +230,34 @@ app.post('/api/process-document', async (req, res) => {
     });
 
     const extractedText = response?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+
+    // Optionally store the processed document in memory
+    const { storeInMemory = false, userId } = req.body;
+    if (storeInMemory && extractedText && userId) {
+      try {
+        const embeddingService = getEmbeddingService();
+        const documentMemory: MemoryItem = {
+          id: `document_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          content: extractedText,
+          metadata: {
+            timestamp: Date.now(),
+            type: 'document',
+            source: filePath || 'uploaded-file',
+            userId,
+            tags: ['processed-document', mimeType]
+          }
+        };
+        
+        // Store asynchronously without blocking the response
+        embeddingService.storeMemory(documentMemory).catch(err => 
+          console.error('Failed to store document memory:', err)
+        );
+        
+        console.log('Document content stored in memory for future reference');
+      } catch (memoryError) {
+        console.warn('Failed to store document in memory:', memoryError);
+      }
+    }
 
     return res.json({ success: true, extractedText, raw: response });
 
@@ -294,6 +406,229 @@ Original image and marking mask are provided below.`;
   } catch (err: any) {
     console.error('edit-image-with-mask error:', err);
     return res.status(500).json({ success: false, error: err?.message ?? String(err) });
+  }
+});
+
+/**
+ * POST /api/store-memory
+ * body: { content: string, type?: 'conversation' | 'document' | 'note', source?: string, userId?: string, tags?: string[] }
+ */
+app.post('/api/store-memory', async (req, res) => {
+  try {
+    const { content, type = 'note', source, userId, tags } = req.body;
+
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({ error: 'content (string) is required' });
+    }
+
+    const embeddingService = getEmbeddingService();
+    
+    const memoryItem: MemoryItem = {
+      id: `memory_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      content,
+      metadata: {
+        timestamp: Date.now(),
+        type,
+        source,
+        userId,
+        tags
+      }
+    };
+
+    await embeddingService.storeMemory(memoryItem);
+
+    return res.json({ 
+      success: true, 
+      message: 'Memory stored successfully',
+      memoryId: memoryItem.id 
+    });
+
+  } catch (err: any) {
+    console.error('store-memory error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * POST /api/store-memories
+ * body: { memories: Array<{ content: string, type?: string, source?: string, userId?: string, tags?: string[] }> }
+ */
+app.post('/api/store-memories', async (req, res) => {
+  try {
+    const { memories } = req.body;
+
+    if (!Array.isArray(memories) || memories.length === 0) {
+      return res.status(400).json({ error: 'memories (array) is required and cannot be empty' });
+    }
+
+    const embeddingService = getEmbeddingService();
+    
+    const memoryItems: MemoryItem[] = memories.map((memory, index) => ({
+      id: `batch_${Date.now()}_${index}_${Math.random().toString(36).substr(2, 9)}`,
+      content: memory.content,
+      metadata: {
+        timestamp: Date.now(),
+        type: memory.type || 'note',
+        source: memory.source,
+        userId: memory.userId,
+        tags: memory.tags
+      }
+    }));
+
+    await embeddingService.storeMemories(memoryItems);
+
+    return res.json({ 
+      success: true, 
+      message: `${memoryItems.length} memories stored successfully`,
+      memoryIds: memoryItems.map(item => item.id)
+    });
+
+  } catch (err: any) {
+    console.error('store-memories error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * POST /api/search-memory
+ * body: { query: string, topK?: number, threshold?: number, userId?: string, type?: string }
+ */
+app.post('/api/search-memory', async (req, res) => {
+  try {
+    const { query, topK = 5, threshold = 0.7, userId, type } = req.body;
+
+    if (!query || typeof query !== 'string') {
+      return res.status(400).json({ error: 'query (string) is required' });
+    }
+
+    const embeddingService = getEmbeddingService();
+    
+    // Build filter based on optional parameters
+    const filter: Record<string, any> = {};
+    if (type) filter.type = type;
+
+    const results = await embeddingService.searchMemories(query, {
+      topK,
+      threshold,
+      filter: Object.keys(filter).length > 0 ? filter : undefined,
+      userId
+    });
+
+    return res.json({ 
+      success: true, 
+      query,
+      results,
+      count: results.length
+    });
+
+  } catch (err: any) {
+    console.error('search-memory error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * DELETE /api/memory/:id
+ * Delete a specific memory by ID
+ */
+app.delete('/api/memory/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ error: 'Memory ID is required' });
+    }
+
+    const embeddingService = getEmbeddingService();
+    await embeddingService.deleteMemory(id);
+
+    return res.json({ 
+      success: true, 
+      message: 'Memory deleted successfully' 
+    });
+
+  } catch (err: any) {
+    console.error('delete-memory error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * GET /api/memory-stats
+ * Get memory statistics
+ */
+app.get('/api/memory-stats', async (req, res) => {
+  try {
+    const embeddingService = getEmbeddingService();
+    const stats = await embeddingService.getMemoryStats();
+
+    return res.json({ 
+      success: true, 
+      stats 
+    });
+
+  } catch (err: any) {
+    console.error('memory-stats error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * GET /api/debug-memories/:userId
+ * Debug endpoint to list all memories for a user
+ */
+app.get('/api/debug-memories/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const embeddingService = getEmbeddingService();
+    
+    // Search with very broad query and low threshold to get all memories
+    const results = await embeddingService.searchMemories('user conversation memory', {
+      topK: 50,
+      threshold: 0.0, // Get everything
+      userId
+    });
+
+    return res.json({ 
+      success: true, 
+      userId,
+      totalMemories: results.length,
+      memories: results.map(memory => ({
+        id: memory.id,
+        type: memory.metadata.type,
+        timestamp: new Date(memory.metadata.timestamp).toISOString(),
+        content: memory.content.substring(0, 200) + (memory.content.length > 200 ? '...' : ''),
+        score: memory.score,
+        tags: memory.metadata.tags
+      }))
+    });
+
+  } catch (err: any) {
+    console.error('debug-memories error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
   }
 });
 

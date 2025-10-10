@@ -4,7 +4,7 @@ import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Badge } from "./ui/badge";
 import { toast } from "sonner";
-import type { ChatHistory as Chat, ChatMessage as Message } from "../types"; // UPDATED: Use centralized types
+import type { ChatHistory as Chat, ChatMessage as Message, User } from "../types"; // UPDATED: Use centralized types
 import { apiService, handleApiError } from "../services/api";
 import {
   Dialog,
@@ -23,11 +23,13 @@ const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTY
 interface ChatInterfaceProps {
   activeChat: Chat | null;
   onUpdateChat: (chat: Chat) => void;
+  user?: User | null; // Add user prop for memory support
 }
 
 export function ChatInterface({
   activeChat,
   onUpdateChat,
+  user,
 }: ChatInterfaceProps) {
   // Small inline helper to show truncated text with Show more/less
   const ExpandableText = ({ text, maxLength }: { text: string; maxLength: number }) => {
@@ -235,10 +237,12 @@ export function ChatInterface({
       // Find image file if any
       const imageFile = files.find(file => file.type.startsWith('image/'));
       
-      // Call the backend API
+      // Call the backend API with memory support
       const response = await apiService.askAI({
         message: text,
-        image: imageFile
+        image: imageFile,
+        userId: user?.id, // Pass user ID for memory
+        useMemory: true // Enable memory by default
       });
 
       if (response.success && response.text) {
