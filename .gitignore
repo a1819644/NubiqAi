@@ -1,7 +1,127 @@
-node_modules
-dist
+# Environment variables and secrets
 .env
-.DS_Store
-.VSCode/
-# Firebase service account key
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+.env.*
+
+# API Keys and Service Account Files
+*.key
+*.pem
+serviceAccountKey.json
+*serviceAccount*.json
+*-key.json
 /Server/serviceAccountKey.json
+
+# Node.js dependencies and cache
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.npm
+.yarn-integrity
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+.nuxt/
+
+# Development and IDE files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+.vscode/
+.VSCode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Runtime and temporary files
+*.pid
+*.seed
+*.pid.lock
+tmp/
+temp/
+.cache/
+.parcel-cache/
+
+# Coverage and test outputs
+coverage/
+.nyc_output/
+*.lcov
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Optional cache directories
+.eslintcache
+.stylelintcache
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup and temporary files
+*.backup
+*.bak
+*.tmp
+
+# Pinecone and AI-related files
+*.vector
+*.index
+pinecone-backup/
+*.model
+*.weights
+models/
+checkpoints/
+
+# Firebase
+.firebase/
+.firebaserc
+firebase-debug.log*
+firebase-debug.*.log*
+
+# Package files
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Test files with sensitive data
+test-data/
+test-keys/
+test-secrets/
+
+# Configuration files that might contain secrets
+config/production.json
+config/staging.json
+config/local.json
+
+# User-specific and private files
+user-data/
+personal/
+private/
+*.local
+local.*
+
+# Security scan results
+security-report.*
+vulnerability-report.*
