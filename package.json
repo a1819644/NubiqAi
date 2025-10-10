@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "dependencies": {
-    "@google/genai": "^1.21.0",
     "@radix-ui/react-accordion": "^1.2.3",
     "@radix-ui/react-alert-dialog": "^1.1.6",
     "@radix-ui/react-aspect-ratio": "^1.1.2",
@@ -33,10 +32,10 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "*",
     "cmdk": "^1.1.1",
+    "firebase": "^12.3.0",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.487.0",
     "next-themes": "^0.4.6",
-    "node-fetch": "^3.3.2",
     "path": "*",
     "react": "^18.3.1",
     "react-day-picker": "^8.10.1",
@@ -55,9 +54,10 @@
     "@vitejs/plugin-react": "^5.0.3",
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.6",
+    "prettier": "3.6.2",
     "tailwindcss": "^3.4.14",
     "tailwindcss-animate": "^1.0.7",
-    "vite": "^5.4.20"
+    "vite": "^5.3.5"
   },
   "type": "module",
   "scripts": {
