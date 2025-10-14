@@ -10,10 +10,9 @@ export function useIsMobile() {
   React.useEffect(() => {
     const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`);
     
-    // --- PERBAIKAN LOGIKA DI SINI ---
-    // Gunakan event.matches dari event object yang disediakan
+    // Gunakan event.matches dari objek event yang disediakan
     const onChange = (event: MediaQueryListEvent) => {
-      setIsMobile(event.matches);
+      setIsMobile(event.matches); // Menggunakan nilai dari event
     };
 
     mql.addEventListener("change", onChange);

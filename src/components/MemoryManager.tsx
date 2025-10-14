@@ -155,7 +155,14 @@ export const MemoryManager: React.FC = () => {
   };
 
   const formatTimestamp = (timestamp: number) => {
-    return new Date(timestamp).toLocaleDateString('en-US', {
+    // --- TIDAK ADA PERUBAHAN LOGIKA BACKEND ---
+    // Perubahan ini hanya untuk memastikan format tampilan tanggal benar,
+    // baik API mengirim timestamp dalam detik maupun milidetik.
+    // Ini tidak mengubah cara data dikirim atau diterima dari backend.
+    // Angka 1000000000000 (timestamp untuk tahun 2001) digunakan sebagai
+    // cara cepat untuk mendeteksi apakah timestamp dalam detik atau milidetik.
+    const date = new Date(timestamp < 1000000000000 ? timestamp * 1000 : timestamp);
+    return date.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
