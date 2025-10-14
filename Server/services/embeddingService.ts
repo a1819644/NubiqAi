@@ -6,10 +6,14 @@ export interface MemoryItem {
   content: string;
   metadata: {
     timestamp: number;
-    type: 'conversation' | 'document' | 'note';
+    type: 'conversation' | 'document' | 'note' | 'conversation_summary';
     source?: string;
     userId?: string;
     tags?: string[];
+    sessionId?: string;
+    turnCount?: number;
+    timespanStart?: number;
+    timespanEnd?: number;
   };
 }
 

@@ -5,6 +5,8 @@ import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
 import type { Part } from '@google/genai';
 import { getEmbeddingService, MemoryItem, SearchResult } from './services/embeddingService';
+import { getHybridMemoryService } from './services/hybridMemoryService';
+import { extractDocumentTopics } from './services/conversationService';
 
 const app = express();
 const port = Number(process.env.PORT ?? 8000);
@@ -58,48 +60,50 @@ app.post('/api/ask-ai', async (req, res) => {
 
     let enhancedPrompt = prompt;
 
-    // Search for relevant memories if useMemory is enabled
+    // Use hybrid memory system for enhanced context
     if (useMemory && type === 'text') {
       try {
-        const embeddingService = getEmbeddingService();
-        console.log(`🔍 Searching memories for user: ${userId || 'anonymous'}`);
-        console.log(`🔍 Search query: "${prompt}"`);
+        const hybridMemoryService = getHybridMemoryService();
+        console.log(`🧠 Using hybrid memory system for user: ${effectiveUserId}`);
         
-        const memories = await embeddingService.searchMemories(prompt, {
-          topK: 5, // Increased from 3
-          threshold: 0.3, // Lowered from 0.5 to find more matches
-          userId: effectiveUserId
+        const memoryResult = await hybridMemoryService.searchMemory(effectiveUserId, prompt, {
+          maxLocalResults: 3,
+          maxLongTermResults: 2,
+          localWeight: 0.8, // Prefer recent local conversations
+          threshold: 0.3,
+          skipPineconeIfLocalFound: true, // Enable cost optimization
+          minLocalResultsForSkip: 2 // Skip Pinecone if 2+ local results
         });
 
-        console.log(`📝 Found ${memories.length} memories with threshold 0.3+`);
+        console.log(`🧠 Memory search results - Type: ${memoryResult.type}, Local: ${memoryResult.resultCount.local}, Long-term: ${memoryResult.resultCount.longTerm}`);
         
-        if (memories.length > 0) {
-          memories.forEach((memory, index) => {
-            console.log(`Memory ${index + 1} (score: ${memory.score.toFixed(3)}): ${memory.content.substring(0, 100)}...`);
-          });
-          
-          const memoryContext = memories
-            .map((memory, index) => `Memory ${index + 1}: ${memory.content}`)
-            .join('\n\n');
-          
-          enhancedPrompt = `Context from previous conversations and stored knowledge:
-${memoryContext}
+        // Log cost optimization info
+        if (memoryResult.optimization?.skippedPinecone) {
+          console.log(`💰 Cost optimization: ${memoryResult.optimization.reason}`);
+        }
+        
+        if (memoryResult.combinedContext && memoryResult.combinedContext !== 'No relevant conversation history found.') {
+          enhancedPrompt = `Context from conversation history and memories:
+
+${memoryResult.combinedContext}
+
+${'='.repeat(60)}
 
 Current question: ${prompt}
 
-Please provide a response that takes into account the relevant context above, but focus primarily on answering the current question.`;
+Please respond naturally, taking into account the relevant context above. Focus on answering the current question while being aware of our conversation history and any preferences or information I've shared.`;
           
-          console.log(`✅ Enhanced prompt with ${memories.length} relevant memories for user ${effectiveUserId}`);
+          console.log(`✅ Enhanced prompt with ${memoryResult.type} memory context`);
         } else {
-          console.log(`❌ No memories found above threshold 0.3 for user ${effectiveUserId}`);
+          console.log(`❌ No relevant memory context found for user ${effectiveUserId}`);
         }
       } catch (memoryError) {
-        console.warn('Memory search failed, proceeding without memory context:', memoryError);
+        console.warn('⚠️ Hybrid memory search failed, proceeding without memory context:', memoryError);
         // Continue with original prompt if memory search fails
       }
     }
 
-    const textModel = model ?? 'gemini-2.5-flash';
+    const textModel = model ?? 'gemini-2.5-pro';
     const imageModel = model ?? 'gemini-2.5-flash-image';
 
     if (type === 'image') {
@@ -127,36 +131,21 @@ Please provide a response that takes into account the relevant context above, bu
     const parts = response?.candidates?.[0]?.content?.parts ?? [];
     const text = parts.map((p: any) => p.text ?? '').join('');
 
-    // Optionally store this conversation in memory for future reference
+    // Store this conversation turn in local memory for future reference
     if (useMemory && text && effectiveUserId) {
       try {
-        console.log(`💾 Storing conversation for user ${effectiveUserId}`);
-        const embeddingService = getEmbeddingService();
-        const conversationMemory: MemoryItem = {
-          id: `conversation_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-          content: `User asked: "${prompt}"\nAI responded: "${text}"`,
-          metadata: {
-            timestamp: Date.now(),
-            type: 'conversation',
-            source: 'chat',
-            userId: effectiveUserId,
-            tags: ['ai-conversation']
-          }
-        };
+        console.log(`💾 Storing conversation turn in local memory for user ${effectiveUserId}`);
+        const hybridMemoryService = getHybridMemoryService();
         
-        console.log(`💾 About to store conversation memory: ${conversationMemory.id}`);
+        const conversationTurn = hybridMemoryService.storeConversationTurn(
+          effectiveUserId,
+          prompt,
+          text
+        );
         
-        // Store asynchronously but with better error handling
-        embeddingService.storeMemory(conversationMemory)
-          .then(() => {
-            console.log(`✅ Successfully stored conversation memory: ${conversationMemory.id}`);
-          })
-          .catch(err => {
-            console.error('❌ Failed to store conversation memory:', err);
-            console.error('Memory content:', conversationMemory.content.substring(0, 100));
-          });
+        console.log(`✅ Successfully stored conversation turn: ${conversationTurn.id}`);
       } catch (memoryError) {
-        console.error('❌ Exception in conversation storage:', memoryError);
+        console.error('❌ Failed to store conversation turn in local memory:', memoryError);
       }
     } else {
       console.log(`⚠️ Conversation NOT stored - useMemory: ${useMemory}, text: ${!!text}, effectiveUserId: ${effectiveUserId}, originalUserId: ${userId}`);
@@ -235,6 +224,10 @@ app.post('/api/process-document', async (req, res) => {
     const { storeInMemory = false, userId } = req.body;
     if (storeInMemory && extractedText && userId) {
       try {
+        // Extract topics from document content using AI
+        const documentTopics = await extractDocumentTopics(extractedText);
+        console.log(`📊 Extracted document topics: ${documentTopics.join(', ')}`);
+        
         const embeddingService = getEmbeddingService();
         const documentMemory: MemoryItem = {
           id: `document_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -244,7 +237,7 @@ app.post('/api/process-document', async (req, res) => {
             type: 'document',
             source: filePath || 'uploaded-file',
             userId,
-            tags: ['processed-document', mimeType]
+            tags: ['processed-document', mimeType, ...documentTopics]
           }
         };
         
@@ -625,6 +618,99 @@ app.get('/api/debug-memories/:userId', async (req, res) => {
 
   } catch (err: any) {
     console.error('debug-memories error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * GET /api/hybrid-memory-debug/:userId
+ * Debug endpoint for hybrid memory system
+ */
+app.get('/api/hybrid-memory-debug/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const hybridMemoryService = getHybridMemoryService();
+    const debugInfo = hybridMemoryService.getMemoryDebugInfo(userId);
+
+    return res.json({ 
+      success: true, 
+      debugInfo
+    });
+
+  } catch (err: any) {
+    console.error('hybrid-memory-debug error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * GET /api/recent-context/:userId
+ * Get recent conversation context for a user
+ */
+app.get('/api/recent-context/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { maxTurns = 10 } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const hybridMemoryService = getHybridMemoryService();
+    const recentContext = hybridMemoryService.getRecentContext(userId, Number(maxTurns));
+
+    return res.json({ 
+      success: true, 
+      userId,
+      recentContext
+    });
+
+  } catch (err: any) {
+    console.error('recent-context error:', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: err?.message ?? String(err) 
+    });
+  }
+});
+
+/**
+ * POST /api/hybrid-memory-search
+ * Search using hybrid memory system
+ */
+app.post('/api/hybrid-memory-search', async (req, res) => {
+  try {
+    const { userId, query, maxLocalResults = 5, maxLongTermResults = 3, threshold = 0.3 } = req.body;
+
+    if (!userId || !query) {
+      return res.status(400).json({ error: 'userId and query are required' });
+    }
+
+    const hybridMemoryService = getHybridMemoryService();
+    const memoryResult = await hybridMemoryService.searchMemory(userId, query, {
+      maxLocalResults,
+      maxLongTermResults,
+      threshold
+    });
+
+    return res.json({ 
+      success: true, 
+      memoryResult
+    });
+
+  } catch (err: any) {
+    console.error('hybrid-memory-search error:', err);
     return res.status(500).json({ 
       success: false, 
       error: err?.message ?? String(err) 

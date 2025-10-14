@@ -13,6 +13,12 @@ import {
   DialogDescription,
   DialogClose,
 } from "./ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./ui/tooltip";
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
 import { ImageMessage } from "../ImageMessage";
@@ -120,8 +126,10 @@ export function ChatInterface({
     text: string = input,
     files: File[] = attachedFiles,
     isVoice: boolean = false,
-    isContinuation: boolean = false // NEW PARAMETER FOR PREVENT DUPLICATIONS
+    isContinuation: boolean = false, // NEW PARAMETER FOR PREVENT DUPLICATIONS
+    forceTextMode: boolean = false // NEW PARAMETER TO FORCE TEXT MODE (SKIP IMAGE DETECTION)
   ) => {
+    console.log('handleSendMessage called with:', { text: text.substring(0, 50), isContinuation, forceTextMode });
     if (!activeChat) return;
     if (!text.trim() && files.length === 0 && !isVoice) return;
 
@@ -159,7 +167,9 @@ export function ChatInterface({
       const containsImageKeyword = imageKeywords.some(keyword => text.toLowerCase().includes(keyword));
       const isImagineCommand = text.trim().startsWith('/imagine');
 
-      if (containsImageKeyword && !isImagineCommand && !isImageModeActive) {
+      // Skip image confirmation if forceTextMode is true (e.g., when user clicked "No")
+      if (containsImageKeyword && !isImagineCommand && !isImageModeActive && !forceTextMode) {
+        console.log('Creating image confirmation dialog for:', text);
         setPendingImagePrompt(text); // SAVE REAL PROMPT FOR IMAGE MODE
         const confirmationId = `confirm-${Date.now()}`;
         const confirmationMessage: Message = {
@@ -237,9 +247,15 @@ export function ChatInterface({
       // Find image file if any
       const imageFile = files.find(file => file.type.startsWith('image/'));
       
+      // Modify the message if we're in force text mode to clarify image generation was declined
+      let messageToSend = text;
+      if (forceTextMode) {
+        messageToSend = `The user asked: "${text}" but declined image generation. Please provide a helpful text-based response instead of generating or offering to create images. Explain what you can do with text instead.`;
+      }
+      
       // Call the backend API with memory support
       const response = await apiService.askAI({
-        message: text,
+        message: messageToSend,
         image: imageFile,
         userId: user?.id, // Pass user ID for memory
         useMemory: true // Enable memory by default
@@ -314,10 +330,35 @@ export function ChatInterface({
           }
         } catch (err) {
           const errorMessage = handleApiError(err);
-          // Provide a more helpful message if it's a timeout
           let friendly = `Failed to process ${file.name}: ${errorMessage}`;
-          if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
+          
+          // Check for specific MIME type errors and provide helpful suggestions
+          if (errorMessage.includes('Unsupported MIME type') || errorMessage.includes('INVALID_ARGUMENT')) {
+            if (file.name.endsWith('.docx') || file.name.endsWith('.doc')) {
+              friendly = `📄 Word documents (.docx/.doc) aren't supported by the AI yet. 
+
+**Quick solutions:**
+• Save as PDF and upload the PDF instead
+• Copy and paste the text directly into chat
+• Save as .txt file and upload that
+
+Supported formats: PDF, TXT, MD, CSV, JSON files.`;
+            } else if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+              friendly = `📊 Excel files aren't supported yet. Try saving as CSV format instead.`;
+            } else {
+              friendly = `❌ File format not supported. 
+
+**Supported formats:** 
+• Documents: PDF, TXT, MD
+• Data: CSV, JSON
+• Images: PNG, JPG, GIF, WebP
+
+Please convert your file to one of these formats.`;
+            }
+          } else if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
             friendly += ' — processing timed out. Try a smaller file (under 4MB), or try again later.';
+          } else if (errorMessage.toLowerCase().includes('quota') || errorMessage.toLowerCase().includes('limit')) {
+            friendly += ' — API quota exceeded. Please try again later or use a smaller file.';
           }
 
           const errorMsg: Message = {
@@ -661,8 +702,44 @@ export function ChatInterface({
     } else {
       // If ‘No’ is clicked, also clear the saved prompt and provide a notification.
       if (pendingImagePrompt) {
+        toast.info("Switching to text AI instead of image generation.");
+        // Call AI API directly to avoid going through handleSendMessage which might create duplicates
+        const processDirectResponse = async () => {
+          setIsLoading(true);
+          try {
+            const messageToSend = `The user asked: "${pendingImagePrompt}" but declined image generation. Please provide a helpful text-based response instead of generating or offering to create images. Explain what you can do with text instead.`;
+            
+            const response = await apiService.askAI({
+              message: messageToSend,
+              userId: user?.id,
+              useMemory: true
+            });
+
+            if (response.success && response.text) {
+              const aiMessage: Message = {
+                id: (Date.now() + 1).toString(),
+                content: response.text,
+                role: "assistant",
+                timestamp: new Date(),
+              };
+
+              const updatedChat = {
+                ...chatWithoutConfirmation,
+                messages: [...chatWithoutConfirmation.messages, aiMessage],
+              };
+
+              onUpdateChat(updatedChat);
+            }
+          } catch (error) {
+            console.error('Error in direct text response:', error);
+            toast.error('Failed to get AI response');
+          } finally {
+            setIsLoading(false);
+          }
+        };
+        
+        processDirectResponse();
         setPendingImagePrompt(null); // Clear the saved prompt
-        toast.info("Image generation cancelled.");
       }
     }
   };
@@ -915,15 +992,27 @@ export function ChatInterface({
               rows={1}
             />
             <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                className="h-8 w-8 p-0 text-muted-foreground hover:bg-accent"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <Paperclip className="h-4 w-4 text-gray-500" />
-              </Button>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-8 w-8 p-0 text-muted-foreground hover:bg-accent"
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      <Paperclip className="h-4 w-4 text-gray-500" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>Attach files</p>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      Supported: PDF, TXT, MD, CSV, JSON, Images
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
               <Button
                 type="button"
                 size="sm"
@@ -976,7 +1065,7 @@ export function ChatInterface({
           multiple
           className="hidden"
           onChange={handleFileAttach}
-          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json"
+          accept="image/*,.pdf,.txt,.md,.csv,.json"
         />
       </div>
       {/* Image viewer modal */}
