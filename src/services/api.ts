@@ -170,6 +170,9 @@ class ApiService {
     message: string;
     image?: File;
     userId?: string; // Add user ID for memory support
+    userName?: string; // 🎯 NEW! User name for auto-profile creation
+    chatId?: string; // 🎯 NEW! Chat ID for chat-scoped memory
+    messageCount?: number; // 🎯 NEW! Message count to detect new vs continuing chat
     useMemory?: boolean; // Enable/disable memory
   }): Promise<{ success: boolean; text?: string; error?: string }> {
     if (data.image) {
@@ -179,6 +182,9 @@ class ApiService {
       formData.append('image', data.image);
       formData.append('type', 'image');
       if (data.userId) formData.append('userId', data.userId);
+      if (data.userName) formData.append('userName', data.userName); // 🎯 NEW!
+      if (data.chatId) formData.append('chatId', data.chatId); // 🎯 NEW!
+      if (data.messageCount !== undefined) formData.append('messageCount', String(data.messageCount)); // 🎯 NEW!
       if (data.useMemory !== undefined) formData.append('useMemory', String(data.useMemory));
       
       return this.request('/ask-ai', {
@@ -187,13 +193,16 @@ class ApiService {
         headers: {}, // Remove Content-Type to let browser set boundary for FormData
       });
     } else {
-      // For text only, use JSON with memory support
+      // For text only, use JSON with memory support + chat-scoping
       return this.request('/ask-ai', {
         method: 'POST',
         body: JSON.stringify({
           prompt: data.message,
           type: 'text',
           userId: data.userId,
+          userName: data.userName,                // 🎯 NEW! For auto-profile creation
+          chatId: data.chatId,                    // 🎯 NEW! For chat-scoped memory
+          messageCount: data.messageCount,        // 🎯 NEW! Detect new vs continuing
           useMemory: data.useMemory !== false // Default to true if not specified
         }),
       });
@@ -453,6 +462,17 @@ class ApiService {
   //     body: JSON.stringify(settings),
   //   });
   // }
+
+  /**
+   * End chat session - triggers batch persistence to Pinecone
+   * Call this when user switches to a new chat
+   */
+  async endChat(data: { userId: string; chatId: string }): Promise<{ success: boolean }> {
+    return this.request('/end-chat', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
 }
 
 // Create singleton instance

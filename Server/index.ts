@@ -7,6 +7,7 @@ import type { Part } from '@google/genai';
 import { getEmbeddingService, MemoryItem, SearchResult } from './services/embeddingService';
 import { getHybridMemoryService } from './services/hybridMemoryService';
 import { extractDocumentTopics } from './services/conversationService';
+import * as userProfileService from './services/userProfileService';
 
 const app = express();
 const port = Number(process.env.PORT ?? 8000);
@@ -50,56 +51,164 @@ app.post('/api/ask-ai', async (req, res) => {
   if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
 
   try {
-    const { prompt, type = 'text', model, useMemory = true, userId } = req.body;
+    const { prompt, type = 'text', model, useMemory = true, userId, chatId, messageCount, userName } = req.body;
     if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt (string) is required' });
 
     // For testing purposes, use anoop123 if no userId provided
     const effectiveUserId = userId || 'anoop123';
+    const effectiveChatId = chatId; // 🎯 NEW! Get chatId from request
+    const effectiveMessageCount = messageCount !== undefined ? messageCount : undefined; // 🎯 NEW! Track message count
     
-    console.log(`💬 Chat request - User: ${effectiveUserId} (original: ${userId}), Memory: ${useMemory}, Prompt: "${prompt.substring(0, 50)}..."`);
+    // 🎯 AUTO-CREATE PROFILE: If user doesn't have a profile yet, create one with their name
+    if (effectiveUserId && userName) {
+      const existingProfile = userProfileService.getUserProfile(effectiveUserId);
+      if (!existingProfile) {
+        userProfileService.upsertUserProfile(effectiveUserId, {
+          name: userName
+        });
+        console.log(`✅ Auto-created profile for ${effectiveUserId} (name: ${userName})`);
+      }
+    }
+    
+    console.log(`💬 Chat request - User: ${effectiveUserId}, Chat: ${effectiveChatId || 'none'}, Message#: ${effectiveMessageCount !== undefined ? effectiveMessageCount + 1 : '?'}, Memory: ${useMemory}, Prompt: "${prompt.substring(0, 50)}..."`);
 
     let enhancedPrompt = prompt;
 
-    // Use hybrid memory system for enhanced context
-    if (useMemory && type === 'text') {
-      try {
-        const hybridMemoryService = getHybridMemoryService();
-        console.log(`🧠 Using hybrid memory system for user: ${effectiveUserId}`);
-        
-        const memoryResult = await hybridMemoryService.searchMemory(effectiveUserId, prompt, {
-          maxLocalResults: 3,
-          maxLongTermResults: 2,
-          localWeight: 0.8, // Prefer recent local conversations
-          threshold: 0.3,
-          skipPineconeIfLocalFound: true, // Enable cost optimization
-          minLocalResultsForSkip: 2 // Skip Pinecone if 2+ local results
-        });
-
-        console.log(`🧠 Memory search results - Type: ${memoryResult.type}, Local: ${memoryResult.resultCount.local}, Long-term: ${memoryResult.resultCount.longTerm}`);
-        
-        // Log cost optimization info
-        if (memoryResult.optimization?.skippedPinecone) {
-          console.log(`💰 Cost optimization: ${memoryResult.optimization.reason}`);
+    // Smart memory search decision - determine search depth based on query complexity
+    const determineSearchStrategy = (query: string, messageCount: number): 'full' | 'profile-only' | 'skip' => {
+      const queryLower = query.toLowerCase().trim();
+      
+      // 1. For greetings, use profile-only (so AI can greet by name!)
+      const greetingPatterns = [
+        /^(hi|hello|hey|sup|yo|greetings|morning|afternoon|evening)$/i,
+        /^(hi|hello|hey|sup|yo|greetings|morning|afternoon|evening)\s/i, // With extra text
+      ];
+      if (greetingPatterns.some(pattern => pattern.test(queryLower))) {
+        // Use profile for first few messages (greeting) - messageCount can be 0, 1, or 2
+        if (messageCount <= 2) {
+          return 'profile-only';
         }
-        
-        if (memoryResult.combinedContext && memoryResult.combinedContext !== 'No relevant conversation history found.') {
-          enhancedPrompt = `Context from conversation history and memories:
+        // Skip for subsequent greetings
+        return 'skip';
+      }
+      
+      // 2. Skip simple acknowledgments
+      const skipPatterns = [
+        /^(thanks|thank you|thx|ty)$/i,
+        /^(yes|no|yep|nope|yeah|nah)$/i
+      ];
+      if (skipPatterns.some(pattern => pattern.test(queryLower))) {
+        return 'skip';
+      }
+      
+      // 3. ALWAYS do full search if user explicitly references memory/past
+      const memoryKeywords = [
+        'remember', 'recall', 'earlier', 'before', 'previous',
+        'last time', 'we discussed', 'you said', 'you told',
+        'conversation', 'history', 'ago', 'yesterday'
+      ];
+      if (memoryKeywords.some(kw => queryLower.includes(kw))) {
+        return 'full';
+      }
+      
+      // 4. For short personal questions (name, preferences, etc), use profile only
+      const personalKeywords = [
+        'my name', 'who am i', 'what\'s my', 'whats my',
+        'do you know me', 'about me', 'i work', 'i like',
+        'my preference', 'my favorite', 'my role'
+      ];
+      if (query.length < 30 && personalKeywords.some(kw => queryLower.includes(kw))) {
+        return 'profile-only';
+      }
+      
+      // 5. For longer queries or complex questions, do full search
+      if (query.length >= 30) {
+        return 'full';
+      }
+      
+      // 6. Medium queries - use profile only (lightweight)
+      return 'profile-only';
+    };
 
-${memoryResult.combinedContext}
+    // Use memory system based on search strategy
+    if (useMemory && type === 'text') {
+      const strategy = determineSearchStrategy(prompt, effectiveMessageCount || 0);
+      
+      if (strategy === 'skip') {
+        console.log('⏭️ Skipping memory - simple greeting/acknowledgment');
+      } else if (strategy === 'profile-only') {
+        // Lightweight: Only use user profile (no expensive searches)
+        console.log('👤 Using profile-only memory (lightweight) for user:', effectiveUserId);
+        try {
+          const profileContext = userProfileService.generateProfileContext(effectiveUserId);
+          
+          if (profileContext) {
+            enhancedPrompt = `SYSTEM: You are Nubiq AI assistant with persistent memory. You have access to the user's profile information below. USE IT naturally in your responses. DO NOT say "my memory resets" - you HAVE real memory about this user.
 
 ${'='.repeat(60)}
+USER PROFILE:
+${profileContext}
+${'='.repeat(60)}
 
-Current question: ${prompt}
+CURRENT USER QUESTION:
+${prompt}
 
-Please respond naturally, taking into account the relevant context above. Focus on answering the current question while being aware of our conversation history and any preferences or information I've shared.`;
-          
-          console.log(`✅ Enhanced prompt with ${memoryResult.type} memory context`);
-        } else {
-          console.log(`❌ No relevant memory context found for user ${effectiveUserId}`);
+Respond naturally using the profile information above. Be conversational and confident in your memory of this user.`;
+            
+            console.log('✅ Enhanced prompt with user profile context');
+          } else {
+            console.log('❌ No user profile found for', effectiveUserId);
+          }
+        } catch (error) {
+          console.warn('⚠️ Profile lookup failed:', error);
         }
-      } catch (memoryError) {
-        console.warn('⚠️ Hybrid memory search failed, proceeding without memory context:', memoryError);
-        // Continue with original prompt if memory search fails
+      } else {
+        // Full search: Use hybrid memory (local + Pinecone + profile)
+        try {
+          const hybridMemoryService = getHybridMemoryService();
+          console.log(`🧠 Using full hybrid memory search for user: ${effectiveUserId}${effectiveChatId ? `, chat: ${effectiveChatId}` : ''}`);
+          
+          const memoryResult = await hybridMemoryService.searchMemory(
+            effectiveUserId, 
+            prompt,
+            effectiveChatId,
+            effectiveMessageCount,
+            {
+              maxLocalResults: 3,
+              maxLongTermResults: 2,
+              localWeight: 0.8,
+              threshold: 0.3,
+              skipPineconeIfLocalFound: true,
+              minLocalResultsForSkip: 2
+            }
+          );
+
+          console.log(`🧠 Memory search results - Type: ${memoryResult.type}, Local: ${memoryResult.resultCount.local}, Long-term: ${memoryResult.resultCount.longTerm}`);
+          
+          if (memoryResult.optimization?.skippedPinecone) {
+            console.log(`💰 Cost optimization: ${memoryResult.optimization.reason}`);
+          }
+          
+          if (memoryResult.combinedContext && memoryResult.combinedContext !== 'No relevant conversation history found.') {
+            enhancedPrompt = `SYSTEM: You are Nubiq AI assistant with persistent memory. You have access to conversation history and user profile information below. When this context is relevant, USE IT naturally in your responses. If the user asks about past conversations or personal info, reference the context. DO NOT say "my memory resets" or "for privacy" - you HAVE real memory.
+
+${'='.repeat(60)}
+CONVERSATION HISTORY & USER PROFILE:
+${memoryResult.combinedContext}
+${'='.repeat(60)}
+
+CURRENT USER QUESTION:
+${prompt}
+
+Respond naturally using the context above when relevant. Be conversational and confident in your memory.`;
+            
+            console.log(`✅ Enhanced prompt with ${memoryResult.type} memory context`);
+          } else {
+            console.log(`❌ No relevant memory context found for user ${effectiveUserId}`);
+          }
+        } catch (memoryError) {
+          console.warn('⚠️ Hybrid memory search failed, proceeding without memory context:', memoryError);
+        }
       }
     }
 
@@ -127,31 +236,48 @@ Please respond naturally, taking into account the relevant context above. Focus 
     }
 
     // TEXT
-    const response = await ai.models.generateContent({ model: textModel, contents: [enhancedPrompt] });
+    const response = await ai.models.generateContent({ 
+      model: textModel, 
+      contents: [enhancedPrompt] 
+    });
     const parts = response?.candidates?.[0]?.content?.parts ?? [];
     const text = parts.map((p: any) => p.text ?? '').join('');
 
-    // Store this conversation turn in local memory for future reference
+    console.log(`✅ AI response generated (${text.length} chars) - sending to user immediately...`);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 🚀 CRITICAL: Send response to user FIRST (don't make them wait!)
+    // ═══════════════════════════════════════════════════════════════════════
+    const jsonResponse = { success: true, text, raw: response };
+    res.json(jsonResponse);
+    console.log(`📤 Response sent to user!`);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 💾 LIGHTWEIGHT: Store in local memory only (no Pinecone, super fast!)
+    // Pinecone upload happens only when user switches chats (see /api/end-chat endpoint)
+    // ═══════════════════════════════════════════════════════════════════════
     if (useMemory && text && effectiveUserId) {
-      try {
-        console.log(`💾 Storing conversation turn in local memory for user ${effectiveUserId}`);
-        const hybridMemoryService = getHybridMemoryService();
-        
-        const conversationTurn = hybridMemoryService.storeConversationTurn(
-          effectiveUserId,
-          prompt,
-          text
-        );
-        
-        console.log(`✅ Successfully stored conversation turn: ${conversationTurn.id}`);
-      } catch (memoryError) {
-        console.error('❌ Failed to store conversation turn in local memory:', memoryError);
-      }
-    } else {
-      console.log(`⚠️ Conversation NOT stored - useMemory: ${useMemory}, text: ${!!text}, effectiveUserId: ${effectiveUserId}, originalUserId: ${userId}`);
+      setImmediate(() => {
+        try {
+          const hybridMemoryService = getHybridMemoryService();
+          
+          // Store in local memory only (in-memory, instant)
+          const conversationTurn = hybridMemoryService.storeConversationTurn(
+            effectiveUserId,
+            prompt,
+            text,
+            effectiveChatId
+          );
+          
+          console.log(`💬 [BACKGROUND] Stored turn in session (chat: ${effectiveChatId}): "${prompt.substring(0, 50)}..."`);
+        } catch (memoryError) {
+          console.error('❌ [BACKGROUND] Failed to store conversation turn:', memoryError);
+        }
+      });
     }
 
-    return res.json({ success: true, text, raw: response });
+    // Return is not needed as response already sent
+    return;
 
   } catch (err: any) {
     console.error('ask-ai error:', err);
@@ -698,11 +824,19 @@ app.post('/api/hybrid-memory-search', async (req, res) => {
     }
 
     const hybridMemoryService = getHybridMemoryService();
-    const memoryResult = await hybridMemoryService.searchMemory(userId, query, {
-      maxLocalResults,
-      maxLongTermResults,
-      threshold
-    });
+    
+    // 🎯 For debug endpoint, search all chats (isNewChat = true)
+    const memoryResult = await hybridMemoryService.searchMemory(
+      userId, 
+      query,
+      undefined,  // chatId = undefined (search all chats)
+      0,          // messageCount = 0 (treat as new chat for comprehensive search)
+      {
+        maxLocalResults,
+        maxLongTermResults,
+        threshold
+      }
+    );
 
     return res.json({ 
       success: true, 
@@ -718,6 +852,121 @@ app.post('/api/hybrid-memory-search', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/set-user-profile
+ * Manually set user profile for testing
+ */
+app.post('/api/set-user-profile', async (req, res) => {
+  try {
+    const { userId, name, role, interests, preferences, background } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+
+    const profileData: any = {};
+    if (name) profileData.name = name;
+    if (role) profileData.role = role;
+    if (interests) profileData.interests = interests;
+    if (preferences) profileData.preferences = preferences;
+    if (background) profileData.background = background;
+
+    const profile = userProfileService.upsertUserProfile(userId, profileData);
+
+    return res.json({
+      success: true,
+      profile
+    });
+
+  } catch (err: any) {
+    console.error('set-user-profile error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message ?? String(err)
+    });
+  }
+});
+
+/**
+ * GET /api/get-user-profile/:userId
+ * Get user profile
+ */
+app.get('/api/get-user-profile/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const profile = userProfileService.getUserProfile(userId);
+
+    if (!profile) {
+      return res.status(404).json({
+        success: false,
+        error: 'Profile not found'
+      });
+    }
+
+    return res.json({
+      success: true,
+      profile
+    });
+
+  } catch (err: any) {
+    console.error('get-user-profile error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message ?? String(err)
+    });
+  }
+});
+
+/**
+ * POST /api/end-chat
+ * Called when user switches chats - persists current chat to Pinecone
+ * This is where we do the heavy lifting (embeddings, vector storage)
+ */
+app.post('/api/end-chat', async (req, res) => {
+  try {
+    const { userId, chatId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+
+    if (!chatId) {
+      return res.status(400).json({ success: false, error: 'chatId is required' });
+    }
+
+    console.log(`\n🔚 End chat request - User: ${userId}, Chat: ${chatId}`);
+
+    // Persist this chat session to Pinecone in the background
+    setImmediate(async () => {
+      try {
+        console.log(`💾 [BACKGROUND] Persisting chat ${chatId} to Pinecone...`);
+        const hybridMemoryService = getHybridMemoryService();
+        
+        // This will summarize and upload to Pinecone
+        await hybridMemoryService.persistChatSession(userId, chatId);
+        
+        console.log(`✅ [BACKGROUND] Chat ${chatId} persisted to Pinecone successfully\n`);
+      } catch (error) {
+        console.error(`❌ [BACKGROUND] Failed to persist chat ${chatId}:`, error);
+      }
+    });
+
+    // Respond immediately (don't make user wait for Pinecone upload)
+    return res.json({
+      success: true,
+      message: 'Chat session will be persisted in background'
+    });
+
+  } catch (err: any) {
+    console.error('end-chat error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message ?? String(err)
+    });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
+  console.log(`✅ User profiles will be created dynamically from user data`);
 });
