@@ -122,13 +122,20 @@ export function ChatInterface({
     if (abortControllerRef.current) {
       // Set a flag on the controller to indicate it was an intentional stop
       (abortControllerRef.current as any).wasAborted = true;
+      const wasImageEdit = (abortControllerRef.current as any).isImageEdit;
+      const controllerToAbort = abortControllerRef.current;
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
       setIsLoading(false);
       toast.info("AI response stopped.");
       // Remove any pending loading indicators from the chat
       if (activeChat) {
-        onUpdateChat({ ...activeChat, messages: activeChat.messages.filter(m => !m.attachments?.includes('__processing_file__') && !m.attachments?.includes('__generating_image__')) });
+        if (wasImageEdit) setIsEditing(false); // Immediately reset editing state on cancel
+        onUpdateChat({ ...activeChat, messages: activeChat.messages.filter(m => !m.attachments?.includes('__processing_file__') && !m.attachments?.includes('__generating_image__') && !m.attachments?.includes('__editing_image__')) });
+      }
+      // If the aborted request was an image edit, reopen the viewer
+      if (wasImageEdit) {
+        setViewerOpen(true);
       }
     }
   };
@@ -206,6 +213,9 @@ export function ChatInterface({
       const imagineMatch = text.trim().match(/^\/imagine\s+(.+)$/i);
       if (imagineMatch || isImageModeActive) {
         const prompt = imagineMatch ? imagineMatch[1].trim() : text.trim();
+        
+        // Ensure global loading is active for image generation
+        setIsLoading(true);
 
         // Insert a placeholder AI message to show a skeleton while image generates
         const placeholderMessage: Message = {
@@ -260,7 +270,6 @@ export function ChatInterface({
 
           onUpdateChat(finalChat);
           setIsImageModeActive(false); // Deactivate image mode after sending
-          setIsLoading(false);
           // If the request was aborted while we were processing, the controller would be null.
           // We should stop here to prevent further execution.
           if (!abortControllerRef.current) {
@@ -271,6 +280,8 @@ export function ChatInterface({
         } else {
           throw new Error(imgResp.error || 'Image generation failed');
         }
+      } else {
+        // This block handles regular text messages
       }
 
       // Find image file if any
@@ -433,6 +444,10 @@ export function ChatInterface({
       // Check if this request is still the active one before updating UI
       if (abortControllerRef.current !== controller) return;
 
+      // If it was a text-only message, we can stop loading now.
+      // Image/file processing will handle their own loading state.
+      if (!imagineMatch && !isImageModeActive && files.length === 0) {
+      }
       onUpdateChat(finalChat);
       toast.error(`Failed to send message: ${errorMessage}`);
     } finally {
@@ -559,7 +574,15 @@ export function ChatInterface({
   const performImageEdit = async (closeOnSubmit: boolean = false) => {
     if (!viewerSrc) return;
     if (closeOnSubmit) setViewerOpen(false);
+    setIsLoading(true); // Show the main stop button
     setIsEditing(true);
+
+    // Create and store a new AbortController for this request
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    // Add a flag to identify this as an image edit cancellation
+    (abortControllerRef.current as any).isImageEdit = true;
+    const signal = controller.signal;
 
     // Ensure we have base64 data
     let imageBase64 = '';
@@ -580,6 +603,9 @@ export function ChatInterface({
       } catch (err) {
         toast.error('Failed to load image for editing');
         setIsEditing(false);
+        setIsLoading(false);
+        (abortControllerRef.current as any).isImageEdit = false;
+        abortControllerRef.current = null;
         return;
       }
     }
@@ -645,16 +671,24 @@ export function ChatInterface({
       attachments: ['__editing_image__']
     };
 
+    // Check if this request is still the active one before updating UI
+    if (abortControllerRef.current !== controller) return;
+
     if (activeChat) {
       onUpdateChat({ ...activeChat, messages: [...activeChat.messages, placeholderMsg] });
     }
 
     try {
       let editResp;
+      // Check if the request was aborted before making the API call
+      if (signal.aborted) {
+        throw new Error('AbortError');
+      }
+
       if (maskBase64) {
-        editResp = await apiService.editImageWithMask({ imageBase64, maskBase64, editPrompt });
+        editResp = await apiService.editImageWithMask({ imageBase64, maskBase64, editPrompt, signal });
       } else {
-        editResp = await apiService.editImage({ imageBase64, editPrompt });
+        editResp = await apiService.editImage({ imageBase64, editPrompt, signal });
       }
 
       if (editResp.success && (editResp.imageBase64 || editResp.imageUri)) {
@@ -662,6 +696,9 @@ export function ChatInterface({
 
         // Replace placeholder in activeChat
         if (activeChat) {
+          // Check if this request is still the active one before updating UI
+          if (abortControllerRef.current !== controller) return;
+
           const filtered = activeChat.messages.filter(m => !(m.attachments && m.attachments.includes('__editing_image__')));
           const newMsg: Message = {
             id: (Date.now() + 1).toString(),
@@ -674,26 +711,39 @@ export function ChatInterface({
         }
 
         setViewerSrc(newUrl);
+        setEditPrompt(''); // Clear prompt for next edit
         // Dialog sudah ditutup di awal jika closeOnSubmit true
         toast.success('Image edited');
       } else {
         throw new Error(editResp.error || 'Image edit failed');
       }
-    } catch (err) {
+    } catch (err: any) {
+      if ((err as Error).name === 'AbortError') {
+        console.log('Image edit was aborted by the user.');
+        // The handleStopGeneration function will show a toast and clean up the placeholder
+        return;
+      }
+
       const msg = handleApiError(err);
       toast.error(`Edit failed: ${msg}`);
       // remove placeholder and leave original viewer
       if (activeChat) {
+        // Check if this request is still the active one before updating UI
+        if (abortControllerRef.current !== controller) return;
         const filtered = activeChat.messages.filter(m => !(m.attachments && m.attachments.includes('__editing_image__')));
         onUpdateChat({ ...activeChat, messages: filtered });
       }
-      // Jika gagal, buka kembali dialognya agar pengguna bisa mencoba lagi
+      // Jika gagal dan dialog ditutup, buka kembali agar pengguna bisa mencoba lagi
       if (closeOnSubmit) {
         setViewerOpen(true);
       }
     } finally {
       setIsEditing(false);
+      setIsLoading(false); // Hide the main stop button
       setMaskFile(null);
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null; // Clean up controller only if it's still the same one
+      }
     }
   };
 
@@ -927,34 +977,49 @@ export function ChatInterface({
                               : "bg-muted text-foreground"
                           }`}
                         > 
-                            <p className="whitespace-pre-wrap text-sm">
-                              {message.content}
-                            </p>
-
                           {/* Attachment handling */}
+                          {/* For image messages, the prompt is inside the card, so we don't show it here */}
+                          {!(message.attachments && message.attachments.some(f => typeof f === 'string' && f.startsWith('data:image'))) && (
+                              <p className="whitespace-pre-wrap text-sm">
+                                {message.content}
+                              </p>
+                          )}
                           {message.attachments && message.attachments.length > 0 && editingMessageId !== message.id && (
                             <div className="mt-2 space-y-1">
                               {message.attachments.map((file, idx) => (
                                 <React.Fragment key={idx}>
-                                  {typeof file === 'string' && file === '__generating_image__' ? (
+                                  {typeof file === 'string' && (file === '__generating_image__' || file === '__editing_image__') ? (
                                     <div className="w-64 h-40 bg-gray-100 rounded-md animate-pulse flex items-center justify-center">
-                                      <div className="text-sm text-muted-foreground">Generating image...</div>
+                                      <div className="text-sm text-muted-foreground">
+                                        {file === '__editing_image__' 
+                                          ? 'Editing image...' 
+                                          : 'Generating image...'
+                                        }
+                                      </div>
                                     </div>
                                   ) : typeof file === 'string' && file.startsWith('data:image') ? (
-                                    <div className="flex flex-col gap-2">
-                                      <img
-                                        src={file}
-                                        alt={`generated-${idx}`}
-                                        className="max-w-xs rounded-md cursor-pointer hover:opacity-90 transition-opacity"
-                                        onClick={() => openImageViewer(file, message.content)}
-                                      />
-                                      <div className="flex gap-2">
-                                        <Button size="sm" variant="outline" onClick={() => openImageViewer(file, message.content)}>
-                                          <Eye className="mr-2 h-4 w-4" /> Open
-                                        </Button>
-                                        <Button size="sm" variant="secondary" onClick={() => downloadImage(file)}>
-                                          <Download className="mr-2 h-4 w-4" /> Download
-                                        </Button>
+                                    // --- Redesigned Image Card ---
+                                    <div className="bg-muted/50 rounded-xl border border-border/20 shadow-sm overflow-hidden w-full max-w-md">
+                                      {/* Image Preview */}
+                                      <div className="bg-muted p-2">
+                                        <img
+                                          src={file}
+                                          alt={message.content || `generated-${idx}`}
+                                          className="w-full h-auto object-contain rounded-lg cursor-pointer transition-opacity hover:opacity-90"
+                                          onClick={() => openImageViewer(file, message.content)}
+                                        />
+                                      </div>
+                                      {/* Prompt and Actions */}
+                                      <div className="p-4 pt-2">
+                                        <p className="text-sm text-muted-foreground line-clamp-2 mb-3">{message.content}</p>
+                                        <div className="flex items-center justify-end gap-2">
+                                          <Button size="sm" variant="outline" className="h-8" onClick={() => openImageViewer(file, message.content)}>
+                                            <Eye className="mr-1.5 h-4 w-4" /> Open
+                                          </Button>
+                                          <Button size="sm" variant="outline" className="h-8" onClick={() => downloadImage(file)}>
+                                            <Download className="mr-1.5 h-4 w-4" /> Download
+                                          </Button>
+                                        </div>
                                       </div>
                                     </div>
                                   ) : (
@@ -1273,4 +1338,3 @@ export function ChatInterface({
     </div>
   );
 }
-
