@@ -209,9 +209,8 @@ import { ChatHistory, ChatMessage, NavigationSection, User } from "./types";
 
 export default function App() {
   const { isDarkMode, toggleDarkMode } = useDarkMode();
-  const { user, signIn, signOut } = useAuth();
+  const { user, signInWithGoogle, signOut, isLoading } = useAuth();
   const [isAuthDialogOpen, setAuthDialogOpen] = useState(false);
-  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
 
   const [activeSection, setActiveSection] = useState<NavigationSection>("home");
 
@@ -290,9 +289,13 @@ export default function App() {
     });
   }, [chats.length]); // Run when the number of chats changes
 
-  const handleSignIn = (userData: Omit<User, "isAuthenticated">) => {
-    signIn(userData);
-    setAuthDialogOpen(false);
+  const handleSignIn = async () => {
+    try {
+      await signInWithGoogle();
+      setAuthDialogOpen(false);
+    } catch (error: any) {
+      toast.error(error.message || "Failed to sign in with Google");
+    }
   };
 
   const handleSignOut = async () => {
@@ -370,12 +373,10 @@ export default function App() {
   };
 
   const handleTriggerSignIn = () => {
-    setAuthMode('signin');
     setAuthDialogOpen(true);
   };
 
   const handleTriggerSignUp = () => {
-    setAuthMode('signup');
     setAuthDialogOpen(true);
   };
 
@@ -484,8 +485,6 @@ export default function App() {
       <AuthDialog
         open={isAuthDialogOpen}
         onOpenChange={setAuthDialogOpen}
-        mode={authMode}
-        onModeChange={setAuthMode}
         onSignIn={handleSignIn}
       />
     </div>
