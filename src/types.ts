@@ -78,6 +78,7 @@ export interface ChatMessage {
   imageUrl?: string;
   isConfirmation?: boolean;
   confirmationId?: string;
+  attachments?: string[]; // 🎯 For file names and image URLs
 }
 
 export interface ChatHistory {

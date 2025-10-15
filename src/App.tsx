@@ -192,7 +192,7 @@
 //   );
 // }
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Header } from "./components/Header"; // Assuming Header.tsx is created
 import { AuthDialog } from "./components/AuthDialog";
 import { Sidebar } from "./components/Sidebar";
@@ -265,6 +265,31 @@ export default function App() {
   });
   const [activeChat, setActiveChat] = useState<ChatHistory | null>(createInitialChat());
 
+  // Helper function to remove duplicate chats (by id)
+  const deduplicateChats = (chats: ChatHistory[]): ChatHistory[] => {
+    const seen = new Set<string>();
+    return chats.filter(chat => {
+      if (seen.has(chat.id)) {
+        return false;
+      }
+      seen.add(chat.id);
+      return true;
+    });
+  };
+
+  // Clean up duplicates whenever chats array changes
+  useEffect(() => {
+    setChats((prev) => {
+      const deduplicated = deduplicateChats(prev);
+      // Only update if there were actually duplicates
+      if (deduplicated.length !== prev.length) {
+        console.log(`🧹 Removed ${prev.length - deduplicated.length} duplicate chat(s)`);
+        return deduplicated;
+      }
+      return prev;
+    });
+  }, [chats.length]); // Run when the number of chats changes
+
   const handleSignIn = (userData: Omit<User, "isAuthenticated">) => {
     signIn(userData);
     setAuthDialogOpen(false);
@@ -287,9 +312,16 @@ export default function App() {
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    // Only add the chat to the history list if it's not the initial empty chat
+    // Only add the current active chat to history if it has messages AND isn't already in the array
     if (activeChat && activeChat.messages.length > 0) {
-      setChats((prev) => [activeChat, ...prev]);
+      setChats((prev) => {
+        // Check if this chat is already in the array (prevent duplicates)
+        const exists = prev.some(chat => chat.id === activeChat.id);
+        if (!exists) {
+          return [activeChat, ...prev];
+        }
+        return prev;
+      });
     }
     setActiveChat(newChat);
     setActiveSection("home");
@@ -353,13 +385,25 @@ export default function App() {
         return (
           <ChatInterface
             activeChat={activeChat}
+            user={user}
             onUpdateChat={(updatedChat) => {
               setActiveChat(updatedChat);
-              setChats((prev) =>
-                prev.map((chat) =>
-                  chat.id === updatedChat.id ? updatedChat : chat
-                )
-              );
+              setChats((prev) => {
+                // Check if this chat already exists in the array
+                const existingIndex = prev.findIndex(chat => chat.id === updatedChat.id);
+                if (existingIndex >= 0) {
+                  // Update existing chat
+                  return prev.map((chat) =>
+                    chat.id === updatedChat.id ? updatedChat : chat
+                  );
+                } else {
+                  // Add new chat to the beginning of the array (if it has messages)
+                  if (updatedChat.messages.length > 0) {
+                    return [updatedChat, ...prev];
+                  }
+                  return prev;
+                }
+              });
             }}
           />
         );
@@ -396,7 +440,7 @@ export default function App() {
       //   );
       default:
         return (
-          <ChatInterface activeChat={activeChat} onUpdateChat={() => {}} />
+          <ChatInterface activeChat={activeChat} user={user} onUpdateChat={() => {}} />
         );
     }
   };
@@ -426,7 +470,10 @@ export default function App() {
             activeSection={activeSection}
             onSectionChange={setActiveSection}
             onNewChat={handleNewChat}
-            recentChats={chats.filter(c => !c.archived)}
+            recentChats={deduplicateChats(chats)
+              .filter(c => !c.archived)
+              .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+            }
             onSelectChat={handleSelectChat}
             activeChatId={activeChat?.id || null}
           />

@@ -1,6 +1,7 @@
 // conversationService.ts - Local conversation storage and summarization
 import { GoogleGenAI } from '@google/genai';
 import { getEmbeddingService, MemoryItem } from './embeddingService';
+import { userProfileService } from './userProfileService';
 
 export interface ConversationTurn {
   id: string;
@@ -8,11 +9,13 @@ export interface ConversationTurn {
   aiResponse: string;
   timestamp: number;
   userId: string;
+  chatId?: string;  // 🎯 NEW! Chat-scoped memory
 }
 
 export interface ConversationSession {
   sessionId: string;
   userId: string;
+  chatId?: string;  // 🎯 NEW! Associate session with chat
   turns: ConversationTurn[];
   startTime: number;
   lastActivity: number;
@@ -22,6 +25,7 @@ export interface ConversationSession {
 export interface ConversationSummary {
   sessionId: string;
   userId: string;
+  chatId?: string;  // 🎯 NEW! Track which chat this summary belongs to
   summary: string;
   keyTopics: string[];
   turnCount: number;
@@ -48,15 +52,19 @@ class ConversationService {
 
   /**
    * Add a new conversation turn to local memory
+   * NOTE: This should be called AFTER the response is sent to the user (async)
+   * to avoid delaying the response. Memory storage is done in the background.
+   * 🎯 UPDATED: Now requires chatId for chat-scoped memory optimization
    */
-  addConversationTurn(userId: string, userPrompt: string, aiResponse: string): ConversationTurn {
-    const sessionId = this.getActiveSessionId(userId);
+  addConversationTurn(userId: string, userPrompt: string, aiResponse: string, chatId?: string): ConversationTurn {
+    const sessionId = this.getActiveSessionId(userId, chatId);
     const turn: ConversationTurn = {
       id: `turn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       userPrompt,
       aiResponse,
       timestamp: Date.now(),
-      userId
+      userId,
+      chatId  // 🎯 NEW! Track which chat this turn belongs to
     };
 
     let session = this.conversations.get(sessionId);
@@ -64,19 +72,41 @@ class ConversationService {
       session = {
         sessionId,
         userId,
+        chatId,  // 🎯 NEW! Associate session with chat
         turns: [],
         startTime: Date.now(),
         lastActivity: Date.now(),
         isSummarized: false
       };
       this.conversations.set(sessionId, session);
-      console.log(`📝 Created new conversation session: ${sessionId} for user: ${userId}`);
+      console.log(`   📝 [BACKGROUND] Created new session: ${sessionId}${chatId ? ` (chat: ${chatId})` : ''}`);
     }
 
     session.turns.push(turn);
     session.lastActivity = Date.now();
 
-    console.log(`💬 Added turn to session ${sessionId}: ${userPrompt.substring(0, 50)}...`);
+    console.log(`   💬 [BACKGROUND] Stored turn in session${chatId ? ` (chat: ${chatId})` : ''}: "${userPrompt.substring(0, 50)}${userPrompt.length > 50 ? '...' : ''}"`);
+    
+    // 🎯 NEW! Extract user profile in the background (non-blocking)
+    // Only extract every few turns to avoid excessive API calls
+    if (session.turns.length % 3 === 0) { // Extract every 3 turns
+      setImmediate(async () => {
+        try {
+          // 🔧 FIX: Pass ENTIRE conversation history, not just latest turn
+          const conversationHistory = session.turns.map(t => [
+            { role: 'user', content: t.userPrompt },
+            { role: 'assistant', content: t.aiResponse }
+          ]).flat();
+          
+          console.log(`[USER PROFILE] Extracting from ${session.turns.length} conversation turns...`);
+          
+          await userProfileService.updateProfileFromConversation(userId, conversationHistory);
+        } catch (error) {
+          console.error('[BACKGROUND] Profile extraction failed:', error);
+        }
+      });
+    }
+    
     return turn;
   }
 
@@ -125,12 +155,27 @@ class ConversationService {
 
   /**
    * Get or create active session ID for a user
+   * 🎯 UPDATED: Now includes chatId for chat-scoped sessions
    */
-  private getActiveSessionId(userId: string): string {
+  private getActiveSessionId(userId: string, chatId?: string): string {
     const now = Date.now();
     const sessionTimeout = 30 * 60 * 1000; // 30 minutes
 
-    // Find existing active session
+    // If chatId is provided, create/find session for that specific chat
+    if (chatId) {
+      for (const session of this.conversations.values()) {
+        if (session.userId === userId && 
+            session.chatId === chatId &&
+            (now - session.lastActivity) < sessionTimeout &&
+            !session.isSummarized) {
+          return session.sessionId;
+        }
+      }
+      // Create new session ID for this chat
+      return `session_${userId}_chat_${chatId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    // Fallback: Find existing active session (old behavior)
     for (const session of this.conversations.values()) {
       if (session.userId === userId && 
           (now - session.lastActivity) < sessionTimeout &&
@@ -195,6 +240,42 @@ class ConversationService {
     } catch (error) {
       console.error('❌ Error in periodic summarization:', error);
     }
+  }
+
+  /**
+   * PUBLIC: Persist a specific chat session to Pinecone (called when user switches chats)
+   * This is the optimized approach - only upload when needed, not on every message
+   */
+  async persistChatToPinecone(userId: string, chatId: string): Promise<void> {
+    console.log(`🔍 Looking for chat session to persist: userId=${userId}, chatId=${chatId}`);
+    
+    // Find the session for this chat
+    let targetSession: ConversationSession | undefined;
+    
+    for (const session of this.conversations.values()) {
+      if (session.userId === userId && session.chatId === chatId && !session.isSummarized) {
+        targetSession = session;
+        break;
+      }
+    }
+
+    if (!targetSession) {
+      console.log(`⚠️ No active session found for chat ${chatId}`);
+      return;
+    }
+
+    if (targetSession.turns.length === 0) {
+      console.log(`⚠️ Session ${targetSession.sessionId} has no turns, skipping persistence`);
+      return;
+    }
+
+    console.log(`📦 Found session ${targetSession.sessionId} with ${targetSession.turns.length} turns`);
+
+    // Summarize and upload to Pinecone
+    await this.summarizeAndUploadSession(targetSession);
+    targetSession.isSummarized = true;
+
+    console.log(`✅ Chat ${chatId} persisted to Pinecone successfully`);
   }
 
   /**

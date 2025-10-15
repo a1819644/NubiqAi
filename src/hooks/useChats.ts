@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import type { Chat, Message } from '../App';
+import { apiService } from '../services/api';
 
 interface ChatState {
   chats: Chat[];
@@ -46,11 +47,28 @@ export function useChats() {
       archived: false,
     };
 
-    setChatState(prev => ({
-      ...prev,
-      chats: [newChat, ...prev.chats],
-      activeChat: newChat,
-    }));
+    setChatState(prev => {
+      // 🎯 OPTIMIZATION: Persist previous active chat before creating new one
+      if (prev.activeChat && prev.activeChat.messages.length > 0) {
+        const previousChatId = `initial-${prev.activeChat.id}`;
+        const userId = 'anoop123'; // TODO: Get from auth context
+        
+        // Call endChat API in background (don't block UI)
+        apiService.endChat({ userId, chatId: previousChatId })
+          .then(() => {
+            console.log(`✅ Previous chat ${previousChatId} will be persisted to Pinecone`);
+          })
+          .catch((error) => {
+            console.warn('⚠️ Failed to persist previous chat:', error);
+          });
+      }
+      
+      return {
+        ...prev,
+        chats: [newChat, ...prev.chats],
+        activeChat: newChat,
+      };
+    });
 
     return newChat;
   }, []);
@@ -121,10 +139,27 @@ export function useChats() {
   }, []);
 
   const setActiveChat = useCallback((chat: Chat | null) => {
-    setChatState(prev => ({
-      ...prev,
-      activeChat: chat,
-    }));
+    setChatState(prev => {
+      // 🎯 OPTIMIZATION: Persist previous chat to Pinecone when switching
+      if (prev.activeChat && prev.activeChat.id !== chat?.id) {
+        const previousChatId = `initial-${prev.activeChat.id}`;
+        const userId = 'anoop123'; // TODO: Get from auth context
+        
+        // Call endChat API in background (don't block UI)
+        apiService.endChat({ userId, chatId: previousChatId })
+          .then(() => {
+            console.log(`✅ Previous chat ${previousChatId} will be persisted to Pinecone`);
+          })
+          .catch((error) => {
+            console.warn('⚠️ Failed to persist previous chat:', error);
+          });
+      }
+      
+      return {
+        ...prev,
+        activeChat: chat,
+      };
+    });
   }, []);
 
   const sendMessage = useCallback(async (

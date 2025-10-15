@@ -4,7 +4,7 @@ import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Badge } from "./ui/badge";
 import { toast } from "sonner";
-import type { ChatHistory as Chat, ChatMessage as Message } from "../types"; // UPDATED: Use centralized types
+import type { ChatHistory as Chat, ChatMessage as Message, User } from "../types"; // UPDATED: Use centralized types
 import { apiService, handleApiError } from "../services/api";
 import {
   Dialog,
@@ -22,11 +22,13 @@ const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTY
 
 interface ChatInterfaceProps {
   activeChat: Chat | null;
+  user: User | null;
   onUpdateChat: (chat: Chat) => void;
 }
 
 export function ChatInterface({
   activeChat,
+  user,
   onUpdateChat,
 }: ChatInterfaceProps) {
   // Small inline helper to show truncated text with Show more/less
@@ -42,6 +44,7 @@ export function ChatInterface({
       </div>
     );
   };
+  
   const [input, setInput] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB
@@ -65,6 +68,29 @@ export function ChatInterface({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeChat?.messages]);
+
+  // 🎯 OPTIMIZATION: Persist chat when window closes
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (activeChat && activeChat.messages.length > 0 && user) {
+        const chatId = `initial-${activeChat.id}`;
+        const userId = user.id; // Use actual user ID from auth
+        
+        // Use navigator.sendBeacon for reliable sending during page unload
+        const data = JSON.stringify({ userId, chatId });
+        const blob = new Blob([data], { type: 'application/json' });
+        navigator.sendBeacon('http://localhost:8000/api/end-chat', blob);
+        
+        console.log(`✅ Chat ${chatId} will be persisted (window closing)`);
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [activeChat, user]);
 
   const handleFileAttach = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []);
@@ -138,17 +164,32 @@ export function ChatInterface({
     files: File[] = attachedFiles,
     isVoice: boolean = false,
     isContinuation: boolean = false, // NEW PARAMETER FOR PREVENT DUPLICATIONS
+    skipConfirmation: boolean = false, // NEW: Skip image confirmation check
     continuationChat?: Chat // Optional chat state for continuations
   ) => {
     if (!activeChat) return;
     if (!text.trim() && files.length === 0 && !isVoice) return;
 
-    let updatedChat = { ...activeChat };
+    // 🔒 CAPTURE THE CHAT ID AND STATE AT THE TIME OF SENDING
+    // This ensures responses go to the correct chat even if user switches chats
+    const targetChatId = activeChat.id;
+    const targetChatSnapshot = { ...activeChat };
+    
+    // Helper function to safely update the target chat, even if activeChat has changed
+    const safeUpdateChat = (chatUpdater: (chat: Chat) => Chat) => {
+      const updatedTargetChat = chatUpdater(targetChatSnapshot);
+      // Update the snapshot for next call
+      Object.assign(targetChatSnapshot, updatedTargetChat);
+      // Always update using the snapshot with the captured ID
+      onUpdateChat(updatedTargetChat);
+    };
+    
+    let updatedChat = { ...targetChatSnapshot };
     let isFirstMessage = false;
 
     // Use the provided chat state for continuations (like message edits)
     if (!isContinuation) {
-      isFirstMessage = activeChat.messages.filter((m) => m.role === "user").length === 0;
+      isFirstMessage = targetChatSnapshot.messages.filter((m) => m.role === "user").length === 0;
 
       const newMessage: Message = {
         id: Date.now().toString(),
@@ -159,12 +200,12 @@ export function ChatInterface({
       };
 
       updatedChat = {
-        ...activeChat,
-        messages: [...activeChat.messages, newMessage],
+        ...targetChatSnapshot,
+        messages: [...targetChatSnapshot.messages, newMessage],
         updatedAt: new Date(),
       };
 
-      onUpdateChat(updatedChat);
+      safeUpdateChat(() => updatedChat);
       setInput("");
       setAttachedFiles([]);
     } else if (continuationChat) {
@@ -183,7 +224,8 @@ export function ChatInterface({
       const containsImageKeyword = imageKeywords.some(keyword => text.toLowerCase().includes(keyword));
       const isImagineCommand = text.trim().startsWith('/imagine');
 
-      if (containsImageKeyword && !isImagineCommand && !isImageModeActive) {
+      // Only show confirmation if not skipping and conditions are met
+      if (containsImageKeyword && !isImagineCommand && !isImageModeActive && !skipConfirmation) {
         setPendingImagePrompt(text); // SAVE REAL PROMPT FOR IMAGE MODE
         const confirmationId = `confirm-${Date.now()}`;
         const confirmationMessage: Message = {
@@ -194,7 +236,7 @@ export function ChatInterface({
           timestamp: new Date(),
           confirmationId: confirmationId,
         };
-        onUpdateChat({ ...updatedChat, messages: [...updatedChat.messages, confirmationMessage] });
+        safeUpdateChat((chat) => ({ ...chat, messages: [...chat.messages, confirmationMessage] }));
         setIsLoading(false); // Stop loading as we are waiting for user confirmation
         return;
       }
@@ -224,10 +266,10 @@ export function ChatInterface({
         // Check if this request is still the active one before updating UI
         if (abortControllerRef.current !== controller) return;
 
-        onUpdateChat(chatWithPlaceholder);
+        safeUpdateChat(() => chatWithPlaceholder);
 
         // Call backend image generation
-        const imgResp = await apiService.generateImage(prompt, signal);
+        const imgResp = await apiService.generateImage(prompt);
 
         if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
           const imageUrl = imgResp.imageBase64
@@ -258,7 +300,7 @@ export function ChatInterface({
           // Check if this request is still the active one before updating UI
           if (abortControllerRef.current !== controller) return;
 
-          onUpdateChat(finalChat);
+          safeUpdateChat(() => finalChat);
           setIsImageModeActive(false); // Deactivate image mode after sending
           setIsLoading(false);
           // If the request was aborted while we were processing, the controller would be null.
@@ -276,12 +318,37 @@ export function ChatInterface({
       // Find image file if any
       const imageFile = files.find(file => file.type.startsWith('image/'));
       
-      // Call the backend API
+      // 🧠 MEMORY SYSTEM LOGGING
+      console.group('🧠 Memory System - Request');
+      console.log('📤 Sending to AI:', {
+        chatId: targetChatId,
+        messageCount: targetChatSnapshot.messages.length,
+        isNewChat: targetChatSnapshot.messages.length === 0,
+        useMemory: true,
+        promptPreview: text.substring(0, 50) + (text.length > 50 ? '...' : '')
+      });
+      console.groupEnd();
+      
+      // Call the backend API with chat-scoped memory
       const response = await apiService.askAI({
         message: text,
         image: imageFile,
-        signal: signal,
+        chatId: targetChatId,                          // 🎯 NEW! For chat-scoped memory
+        messageCount: targetChatSnapshot.messages.length, // 🎯 NEW! Detect new vs continuing chat
+        userId: user?.id,                              // 🎯 NEW! Pass actual user ID from auth
+        userName: user?.name,                          // 🎯 NEW! Pass user name for auto-profile creation
+        useMemory: true
       });
+
+      // 🧠 MEMORY SYSTEM LOGGING
+      console.group('🧠 Memory System - Response');
+      console.log('✅ Response received:', {
+        success: response.success,
+        textLength: response.text?.length || 0,
+        chatId: targetChatId,
+        messageCount: targetChatSnapshot.messages.length + 1
+      });
+      console.groupEnd();
 
       if (response.success && response.text) {
         const aiMessage: Message = {
@@ -302,7 +369,7 @@ export function ChatInterface({
         // Check if this request is still the active one before updating UI
         if (abortControllerRef.current !== controller) return;
 
-        onUpdateChat(finalChat);
+        safeUpdateChat(() => finalChat);
         // If the request was aborted while we were processing, the controller would be null.
         // We should stop here to prevent further execution.
         if (!abortControllerRef.current) {
@@ -333,7 +400,7 @@ export function ChatInterface({
         // Check if this request is still the active one before updating UI
         if (abortControllerRef.current !== controller) return;
 
-        onUpdateChat(withPlaceholder);
+        safeUpdateChat(() => withPlaceholder);
 
         // convert file to base64
         const buffer = await file.arrayBuffer();
@@ -345,7 +412,7 @@ export function ChatInterface({
         const base64 = btoa(binary);
 
         try {
-          const procResp = await apiService.processDocument({ fileBase64: base64, mimeType: file.type }, signal);
+          const procResp = await apiService.processDocument({ fileBase64: base64, mimeType: file.type });
           if (procResp.success && procResp.extractedText) {
             const resultMessage: Message = {
               id: (Date.now() + 3).toString(),
@@ -361,7 +428,7 @@ export function ChatInterface({
             // Check if this request is still the active one before updating UI
             if (abortControllerRef.current !== controller) return;
 
-            onUpdateChat({ ...withPlaceholder, messages: replacedMessages });
+            safeUpdateChat((chat) => ({ ...chat, messages: replacedMessages }));
             // If the request was aborted while we were processing, the controller would be null.
             // We should stop here to prevent further execution.
             if (!abortControllerRef.current) {
@@ -399,7 +466,7 @@ export function ChatInterface({
           // Check if this request is still the active one before updating UI
           if (abortControllerRef.current !== controller) return;
 
-          onUpdateChat({ ...withPlaceholder, messages: replacedMessages });
+          safeUpdateChat((chat) => ({ ...chat, messages: replacedMessages }));
         }
       }
     } catch (error) {
@@ -433,7 +500,7 @@ export function ChatInterface({
       // Check if this request is still the active one before updating UI
       if (abortControllerRef.current !== controller) return;
 
-      onUpdateChat(finalChat);
+      safeUpdateChat(() => finalChat);
       toast.error(`Failed to send message: ${errorMessage}`);
     } finally {
       setIsLoading(false);
@@ -719,7 +786,7 @@ export function ChatInterface({
     onUpdateChat(updatedChat);
 
     // Resend the message to the AI for a new response
-    handleSendMessage(editedContent, [], false, true, updatedChat); // Pass the truncated chat state
+    handleSendMessage(editedContent, [], false, true, false, updatedChat); // Pass the truncated chat state
     setEditingMessageId(null); // Exit editing mode
   };
 
@@ -767,12 +834,19 @@ export function ChatInterface({
         // Set image mode to true. The useEffect will then trigger the send.
         // This decouples confirmation from sending and prevents race conditions.
         setIsImageModeActive(true);
+        toast.success("Starting image generation...");
       }
     } else {
       // If ‘No’ is clicked, also clear the saved prompt and provide a notification.
       if (pendingImagePrompt) {
+        const promptToSend = pendingImagePrompt;
         setPendingImagePrompt(null); // Clear the saved prompt
-        toast.info("Image generation cancelled.");
+        setIsLoading(false); // Ensure loading state is reset
+        setIsImageModeActive(false); // Make sure image mode is off
+        toast.info("Sending as regular chat message...");
+        
+        // Send the original prompt as a normal chat message (skipConfirmation=true to avoid infinite loop)
+        handleSendMessage(promptToSend, [], false, false, true);
       }
     }
   };
@@ -794,7 +868,7 @@ export function ChatInterface({
     if (isImageModeActive && pendingImagePrompt) {
       // Use isContinuation: true to prevent duplicating the user's message.
       // The original message that triggered the confirmation is already in the chat.
-      handleSendMessage(pendingImagePrompt, [], false, true, activeChat);
+      handleSendMessage(pendingImagePrompt, [], false, true, false, activeChat);
       setPendingImagePrompt(null); // Clear the prompt after sending.
     }
   }, [isImageModeActive, pendingImagePrompt]); // Dependencies are correct
@@ -958,7 +1032,7 @@ export function ChatInterface({
                                       </div>
                                     </div>
                                   ) : (
-                                    <div className="text-xs opacity-80">📎 {typeof file === 'string' ? file : file.name}</div>
+                                    <div className="text-xs opacity-80">📎 {file}</div>
                                   )}
                                 </React.Fragment>
                               ))}
