@@ -125,3 +125,4 @@ local.*
 # Security scan results
 security-report.*
 vulnerability-report.*
+.vercel

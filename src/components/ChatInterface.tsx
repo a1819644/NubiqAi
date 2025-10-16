@@ -15,7 +15,6 @@ import {
 } from "./ui/dialog";
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
-import { ImageMessage } from "../ImageMessage";
 
 // Using a placeholder for image icon
 const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTIgMkgxNFYxNEgyVjJaIiBzdHJva2U9IiM2NjY2NjYiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIvPgo8cGF0aCBkPSJNMiAxMkw2IDhMOCAxMEwxMiA2TDE0IDhWMTJIMloiIGZpbGw9IiM2NjY2NjYiLz4KPC9zdmc+';
@@ -64,10 +63,19 @@ export function ChatInterface({
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // Create a stable reference to avoid issues with null activeChat
+  const chat = activeChat || {
+    id: 'temp',
+    title: 'New Chat',
+    messages: [],
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
   // --- FIXING ---
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeChat?.messages]);
+  }, [chat.messages]);
 
   // 🎯 OPTIMIZATION: Persist chat when window closes
   useEffect(() => {
@@ -220,8 +228,16 @@ export function ChatInterface({
 
     try {
       // --- LOGIC CONFIRMATION IMAGE---
-      const imageKeywords = ['generate', 'draw', 'create', 'image', 'gambar', 'buatkan'];
-      const containsImageKeyword = imageKeywords.some(keyword => text.toLowerCase().includes(keyword));
+      // More precise image generation detection - require explicit image-related phrases
+      const imageKeywords = [
+        'generate image', 'generate an image', 'generate a picture',
+        'create image', 'create an image', 'create a picture',
+        'draw image', 'draw an image', 'draw a picture', 'draw me',
+        'make image', 'make an image', 'make a picture',
+        'gambar', 'buatkan gambar'
+      ];
+      const textLower = text.toLowerCase();
+      const containsImageKeyword = imageKeywords.some(keyword => textLower.includes(keyword));
       const isImagineCommand = text.trim().startsWith('/imagine');
 
       // Only show confirmation if not skipping and conditions are met
@@ -271,10 +287,21 @@ export function ChatInterface({
         // Call backend image generation
         const imgResp = await apiService.generateImage(prompt);
 
+        console.log('📥 Image generation response:', {
+          success: imgResp.success,
+          hasImageBase64: !!imgResp.imageBase64,
+          imageBase64Length: imgResp.imageBase64?.length || 0,
+          hasImageUri: !!imgResp.imageUri,
+          imageUri: imgResp.imageUri,
+          altText: imgResp.altText
+        });
+
         if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
           const imageUrl = imgResp.imageBase64
             ? `data:image/png;base64,${imgResp.imageBase64}`
             : imgResp.imageUri!;
+
+          console.log('🖼️ Creating image URL:', imageUrl.substring(0, 100) + '...');
 
           const aiImageMessage: Message = {
             id: (Date.now() + 2).toString(),
@@ -283,6 +310,8 @@ export function ChatInterface({
             timestamp: new Date(),
             attachments: [imageUrl],
           };
+
+          console.log('✅ Image message created, updating chat...');
 
           // Replace placeholder with actual image message
           const finalMessages = chatWithPlaceholder.messages
@@ -329,12 +358,19 @@ export function ChatInterface({
       });
       console.groupEnd();
       
+      // 📝 Prepare conversation history (previous messages for context)
+      const conversationHistory = targetChatSnapshot.messages.map(msg => ({
+        role: msg.role,
+        content: msg.content
+      }));
+      
       // Call the backend API with chat-scoped memory
       const response = await apiService.askAI({
         message: text,
         image: imageFile,
         chatId: targetChatId,                          // 🎯 NEW! For chat-scoped memory
         messageCount: targetChatSnapshot.messages.length, // 🎯 NEW! Detect new vs continuing chat
+        conversationHistory,                           // 🎯 NEW! Send previous messages for context
         userId: user?.id,                              // 🎯 NEW! Pass actual user ID from auth
         userName: user?.name,                          // 🎯 NEW! Pass user name for auto-profile creation
         useMemory: true
@@ -504,6 +540,7 @@ export function ChatInterface({
       toast.error(`Failed to send message: ${errorMessage}`);
     } finally {
       setIsLoading(false);
+      setIsImageModeActive(false); // 🔧 FIX: Always reset image mode, even on error
       abortControllerRef.current = null; // Clean up controller
     }
   };
@@ -851,24 +888,13 @@ export function ChatInterface({
     }
   };
 
-  if (!activeChat) {
-    return (
-      <div className="flex-1 flex items-center justify-center">
-        <div className="text-center">
-          <h3 className="text-lg font-medium mb-2">Welcome to AI Portal</h3>
-          <p className="text-muted-foreground">Start a new chat to begin</p>
-        </div>
-      </div>
-    );
-  }
-
   // This effect handles sending a message after image mode is confirmed and activated.
   useEffect(() => {
     // Only run if image mode is active and there's a prompt waiting.
     if (isImageModeActive && pendingImagePrompt) {
       // Use isContinuation: true to prevent duplicating the user's message.
       // The original message that triggered the confirmation is already in the chat.
-      handleSendMessage(pendingImagePrompt, [], false, true, false, activeChat);
+      handleSendMessage(pendingImagePrompt, [], false, true, false, chat);
       setPendingImagePrompt(null); // Clear the prompt after sending.
     }
   }, [isImageModeActive, pendingImagePrompt]); // Dependencies are correct
@@ -895,19 +921,28 @@ export function ChatInterface({
     return () => document.removeEventListener('keydown', handleGlobalKeyDown);
   }, [activeChat?.messages]); // Rerun when messages change
 
+  // If no active chat, show a placeholder
+  if (!activeChat) {
+    return (
+      <div className="flex flex-col h-full bg-background text-foreground items-center justify-center">
+        <p className="text-muted-foreground">No active chat. Click "New Chat" to start.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-full bg-background text-foreground">
       {/* Header */}
       <div className="border-b border-border p-4">
-        <h1 className="text-xl font-medium">{activeChat.title}</h1>
+        <h1 className="text-xl font-medium">{chat.title}</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          {activeChat.messages.length} messages
+          {chat.messages.length} messages
         </p>
       </div>
 
       {/* Messages Area */}
       <div className="flex-1 overflow-auto">
-        {activeChat.messages.length === 0 ? (
+        {chat.messages.length === 0 ? (
           <div className="h-full flex items-center justify-center bg-background">
             <div className="text-center max-w-md px-6">
               <div className="mb-6">
@@ -949,7 +984,7 @@ export function ChatInterface({
           </div>
         ) : (
           <div className="p-6 space-y-6 max-w-4xl mx-auto">
-            {activeChat.messages.map((message) => (
+            {chat.messages.map((message) => (
               <div
                 key={message.id}
                 className={`group flex ${

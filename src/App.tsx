@@ -198,6 +198,7 @@ import { AuthDialog } from "./components/AuthDialog";
 import { Sidebar } from "./components/Sidebar";
 import { History } from "./components/History";
 import { ChatInterface } from "./components/ChatInterface";
+import { apiService } from "./services/api";
 // import { History } from "./components/History";
 // import { Workspace } from "./components/Workspace";
 // import { Settings } from "./components/Settings";
@@ -214,45 +215,8 @@ export default function App() {
 
   const [activeSection, setActiveSection] = useState<NavigationSection>("home");
 
-  const [chats, setChats] = useState<ChatHistory[]>([
-    {
-      id: "1",
-      title: "Getting Started with AI",
-      messages: [
-        {
-          id: "1",
-          content: "Hello! How can I help you today?",
-          role: "assistant",
-          timestamp: new Date(Date.now() - 3600000),
-        },
-      ],
-      createdAt: new Date(Date.now() - 3600000),
-      updatedAt: new Date(Date.now() - 3600000),
-      archived: false,
-    },
-    {
-      id: "2",
-      title: "Project Planning Discussion",
-      messages: [
-        {
-          id: "2",
-          content: "I need help with project planning",
-          role: "user",
-          timestamp: new Date(Date.now() - 7200000),
-        },
-        {
-          id: "3",
-          content:
-            "I'd be happy to help you with project planning! What kind of project are you working on?",
-          role: "assistant",
-          timestamp: new Date(Date.now() - 7150000),
-        },
-      ],
-      createdAt: new Date(Date.now() - 7200000),
-      updatedAt: new Date(Date.now() - 7200000),
-      archived: false,
-    },
-  ]);
+  // Start with empty chats array - will be loaded from localStorage/Pinecone on auth
+  const [chats, setChats] = useState<ChatHistory[]>([]);
 
   // Create a new, empty chat on initial load to show the welcome screen.
   const createInitialChat = (): ChatHistory => ({
@@ -289,10 +253,138 @@ export default function App() {
     });
   }, [chats.length]); // Run when the number of chats changes
 
+  // 💾 Auto-save chats to localStorage whenever they change
+  // But strip large base64 images to avoid quota exceeded errors
+  useEffect(() => {
+    if (user && chats.length > 0) {
+      const localStorageKey = `chat_history_${user.id}`;
+      
+      try {
+        // Strip base64 images from attachments to save space
+        const chatsForStorage = chats.map(chat => ({
+          ...chat,
+          messages: chat.messages.map(msg => ({
+            ...msg,
+            attachments: msg.attachments?.map(att => {
+              // Keep only non-base64 attachments (URLs, file names, etc)
+              // Remove data:image/... base64 to save localStorage space
+              if (typeof att === 'string' && att.startsWith('data:image')) {
+                return '__image_removed__'; // Placeholder
+              }
+              return att;
+            })
+          }))
+        }));
+        
+        localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
+        console.log(`💾 Auto-saved ${chats.length} chat(s) to localStorage (images excluded)`);
+      } catch (error: any) {
+        if (error.name === 'QuotaExceededError') {
+          console.error('❌ localStorage quota exceeded! Clearing old data...');
+          // Try to save without any attachments at all
+          const chatsWithoutAttachments = chats.map(chat => ({
+            ...chat,
+            messages: chat.messages.map(msg => ({
+              ...msg,
+              attachments: undefined
+            }))
+          }));
+          try {
+            localStorage.setItem(localStorageKey, JSON.stringify(chatsWithoutAttachments));
+            console.log(`💾 Saved ${chats.length} chat(s) without attachments`);
+          } catch (e) {
+            console.error('❌ Still failed, clearing localStorage...');
+            localStorage.removeItem(localStorageKey);
+          }
+        } else {
+          console.error('❌ Failed to save to localStorage:', error);
+        }
+      }
+    }
+  }, [chats, user]);
+
+  // 🔄 Load chat history when user is authenticated (on page reload or initial sign-in)
+  useEffect(() => {
+    const loadChatHistory = async () => {
+      if (!user || isLoading) return;
+
+      console.log('🔄 User authenticated, loading chat history...');
+      
+      // 🚀 FAST: Load from localStorage immediately for instant UX
+      const localStorageKey = `chat_history_${user.id}`;
+      const savedChats = localStorage.getItem(localStorageKey);
+      
+      if (savedChats) {
+        try {
+          const parsedChats = JSON.parse(savedChats);
+          // Convert date strings back to Date objects
+          const restoredChats = parsedChats.map((chat: any) => ({
+            ...chat,
+            createdAt: new Date(chat.createdAt),
+            updatedAt: new Date(chat.updatedAt),
+            messages: chat.messages.map((msg: any) => ({
+              ...msg,
+              timestamp: new Date(msg.timestamp)
+            }))
+          }));
+          
+          if (restoredChats.length > 0) {
+            setChats(restoredChats);
+            console.log(`✅ Loaded ${restoredChats.length} chat(s) from localStorage`);
+          }
+        } catch (error) {
+          console.error('Failed to parse saved chats:', error);
+        }
+      }
+      
+      // 🌐 BACKGROUND: Sync with Pinecone for cross-device consistency
+      try {
+        const response = await apiService.getChats();
+        if (response && Array.isArray(response) && response.length > 0) {
+          // Convert dates from Pinecone response
+          const cloudChats = response.map((chat: any) => ({
+            ...chat,
+            createdAt: new Date(chat.createdAt),
+            updatedAt: new Date(chat.updatedAt),
+            messages: chat.messages.map((msg: any) => ({
+              ...msg,
+              timestamp: new Date(msg.timestamp)
+            }))
+          }));
+          
+          setChats(cloudChats);
+          // Update localStorage with fresh data from Pinecone (strip images to avoid quota)
+          try {
+            const chatsForStorage = cloudChats.map((chat: any) => ({
+              ...chat,
+              messages: chat.messages.map((msg: any) => ({
+                ...msg,
+                attachments: msg.attachments?.map((att: any) => 
+                  typeof att === 'string' && att.startsWith('data:image') ? '__image_removed__' : att
+                )
+              }))
+            }));
+            localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
+            console.log(`☁️ Synced ${cloudChats.length} chat(s) from Pinecone (images excluded from localStorage)`);
+          } catch (e) {
+            console.warn('⚠️ Could not save to localStorage, continuing anyway...');
+          }
+        }
+      } catch (error) {
+        console.warn('Failed to load chats from Pinecone:', error);
+        // Local data is still available, so user can continue
+      }
+    };
+
+    loadChatHistory();
+  }, [user, isLoading]);
+
   const handleSignIn = async () => {
     try {
       await signInWithGoogle();
       setAuthDialogOpen(false);
+      toast.success("Signed in successfully!");
+      // Chat history will be loaded by the useEffect hook
     } catch (error: any) {
       toast.error(error.message || "Failed to sign in with Google");
     }
@@ -300,14 +392,50 @@ export default function App() {
 
   const handleSignOut = async () => {
     try {
+      // 💾 Save to localStorage before signing out (strip images to avoid quota)
+      if (user && chats.length > 0) {
+        const localStorageKey = `chat_history_${user.id}`;
+        try {
+          const chatsForStorage = chats.map((chat: any) => ({
+            ...chat,
+            messages: chat.messages.map((msg: any) => ({
+              ...msg,
+              attachments: msg.attachments?.map((att: any) => 
+                typeof att === 'string' && att.startsWith('data:image') ? '__image_removed__' : att
+              )
+            }))
+          }));
+          localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
+          console.log(`💾 Saved ${chats.length} chats to localStorage (images excluded)`);
+        } catch (e) {
+          console.warn('⚠️ Could not save to localStorage on sign out');
+        }
+        
+        // 🌐 Persist all chats to Pinecone for cross-device sync
+        for (const chat of chats) {
+          if (chat.messages.length > 0) {
+            await apiService.endChat({ userId: user.id, chatId: chat.id });
+          }
+        }
+      }
+      
+      // Clear local state
+      setChats([]);
+      setActiveChat(null);
+      
       await signOut();
-      // User state will be cleared by the useEffect
+      
+      // Show welcome screen (component will render automatically when user is null)
+      // The welcome screen has a "Sign In to Get Started" button
+      toast.success("Signed out successfully");
     } catch (error) {
       console.error('Sign out error:', error);
+      toast.error('Failed to sign out');
     }
   };
 
   const handleNewChat = () => {
+    console.log('🆕 Creating new chat...');
     const newChat: ChatHistory = {
       id: Date.now().toString(),
       title: "New Chat",
@@ -328,6 +456,7 @@ export default function App() {
     }
     setActiveChat(newChat);
     setActiveSection("home");
+    console.log('✅ New chat created:', newChat.id, '| Active section:', 'home');
     toast.success("New chat created");
   };
 
@@ -381,6 +510,7 @@ export default function App() {
   };
 
   const renderMainContent = () => {
+    console.log(`📄 Rendering main content | Section: ${activeSection} | Active chat:`, activeChat?.id);
     switch (activeSection) {
       case "home":
         return (
@@ -447,17 +577,99 @@ export default function App() {
   };
 
   // Show loading screen while checking authentication
+  if (isLoading) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-background">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+          <p className="text-muted-foreground">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show welcome screen with sign-in prompt when not authenticated
+  if (!user) {
+    return (
+      <div className="h-screen flex flex-col bg-background text-foreground">
+        <Header
+          user={{
+            id: "",
+            name: "",
+            email: "",
+            avatar: "",
+            isAuthenticated: false,
+            subscription: "free",
+          }}
+          onTriggerSignIn={handleTriggerSignIn}
+          onTriggerSignUp={handleTriggerSignUp}
+          onSignOut={handleSignOut}
+          isDarkMode={isDarkMode}
+          onToggleDarkMode={toggleDarkMode}
+          onLogoClick={handleLogoClick}
+        />
+        <div className="flex-1 flex items-center justify-center p-8">
+          <div className="max-w-md w-full text-center space-y-8">
+            <div className="space-y-4">
+              <h1 className="text-4xl font-bold tracking-tight">Welcome to NubiqAI ✨</h1>
+              <p className="text-xl text-muted-foreground">
+                Your intelligent AI assistant with persistent memory
+              </p>
+            </div>
+            
+            <div className="space-y-6 pt-8">
+              <div className="space-y-3">
+                <div className="flex items-center gap-3 text-left">
+                  <span className="text-2xl">💬</span>
+                  <div>
+                    <p className="font-semibold">Smart Conversations</p>
+                    <p className="text-sm text-muted-foreground">Natural, context-aware responses</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 text-left">
+                  <span className="text-2xl">🧠</span>
+                  <div>
+                    <p className="font-semibold">Persistent Memory</p>
+                    <p className="text-sm text-muted-foreground">Remembers your conversations</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 text-left">
+                  <span className="text-2xl">🎨</span>
+                  <div>
+                    <p className="font-semibold">Image Generation</p>
+                    <p className="text-sm text-muted-foreground">Create stunning visuals with AI</p>
+                  </div>
+                </div>
+              </div>
+
+              <button
+                onClick={handleTriggerSignIn}
+                className="w-full py-3 px-6 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition-colors shadow-lg"
+              >
+                Sign In to Get Started
+              </button>
+              
+              <p className="text-sm text-muted-foreground">
+                Sign in with your Google account to start chatting
+              </p>
+            </div>
+          </div>
+        </div>
+        <Toaster richColors />
+        <AuthDialog
+          open={isAuthDialogOpen}
+          onOpenChange={setAuthDialogOpen}
+          onSignIn={handleSignIn}
+        />
+      </div>
+    );
+  }
+
+  // Main app interface for authenticated users
   return (
     <div className="h-screen flex flex-col bg-background text-foreground">
       <Header
-        user={user || {
-          id: "",
-          name: "",
-          email: "",
-          avatar: "",
-          isAuthenticated: false,
-          subscription: "free",
-        }}
+        user={user}
         onTriggerSignIn={handleTriggerSignIn}
         onTriggerSignUp={handleTriggerSignUp}
         onSignOut={handleSignOut}

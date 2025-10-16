@@ -173,6 +173,7 @@ class ApiService {
     userName?: string; // 🎯 NEW! User name for auto-profile creation
     chatId?: string; // 🎯 NEW! Chat ID for chat-scoped memory
     messageCount?: number; // 🎯 NEW! Message count to detect new vs continuing chat
+    conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>; // 🎯 NEW! Previous messages for context
     useMemory?: boolean; // Enable/disable memory
   }): Promise<{ success: boolean; text?: string; error?: string }> {
     if (data.image) {
@@ -203,6 +204,7 @@ class ApiService {
           userName: data.userName,                // 🎯 NEW! For auto-profile creation
           chatId: data.chatId,                    // 🎯 NEW! For chat-scoped memory
           messageCount: data.messageCount,        // 🎯 NEW! Detect new vs continuing
+          conversationHistory: data.conversationHistory, // 🎯 NEW! Previous messages for context
           useMemory: data.useMemory !== false // Default to true if not specified
         }),
       });
@@ -211,6 +213,7 @@ class ApiService {
 
   /**
    * Generate an image from prompt using the backend /ask-ai endpoint with type=image
+   * Image generation can take 30-90 seconds, so we use a longer timeout
    */
   async generateImage(prompt: string): Promise<{
     success: boolean;
@@ -219,10 +222,44 @@ class ApiService {
     altText?: string | null;
     error?: string;
   }> {
-    return this.request('/ask-ai', {
-      method: 'POST',
-      body: JSON.stringify({ prompt, type: 'image' }),
-    });
+    // Image generation can take 30-90 seconds, use longer timeout
+    const url = `${this.baseURL}/ask-ai`;
+    const controller = new AbortController();
+    const timeoutMs = 90 * 1000; // 90 seconds timeout for image generation
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, type: 'image' }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      
+      if (err.name === 'AbortError') {
+        return {
+          success: false,
+          error: 'Image generation timed out (90 seconds). The AI model may be busy. Please try again.'
+        };
+      }
+      
+      console.error('Image generation error:', err);
+      return {
+        success: false,
+        error: err.message || 'Failed to generate image'
+      };
+    }
   }
 
   /**

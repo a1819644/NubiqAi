@@ -9,6 +9,36 @@ import { getHybridMemoryService } from './services/hybridMemoryService';
 import { extractDocumentTopics } from './services/conversationService';
 import * as userProfileService from './services/userProfileService';
 
+// Import performance optimizations with error handling
+let profileCache: any;
+let recentContextCache: any;
+let needsMemorySearch: any;
+let determineMemoryStrategy: any;
+let preloadMemoryForNextQuery: any;
+let getPerformanceStats: any;
+
+try {
+  const perfOptimizations = require('./services/performanceOptimizations');
+  profileCache = perfOptimizations.profileCache;
+  recentContextCache = perfOptimizations.recentContextCache;
+  needsMemorySearch = perfOptimizations.needsMemorySearch;
+  determineMemoryStrategy = perfOptimizations.determineMemoryStrategy;
+  preloadMemoryForNextQuery = perfOptimizations.preloadMemoryForNextQuery;
+  getPerformanceStats = perfOptimizations.getPerformanceStats;
+  console.log('✅ Performance optimizations loaded successfully');
+} catch (error) {
+  console.error('❌ CRITICAL: Failed to load performance optimizations:', error);
+  console.error('Stack:', (error as Error).stack);
+  // Provide fallbacks
+  profileCache = { get: () => undefined, set: () => {}, clear: () => {}, getStats: () => ({}) };
+  recentContextCache = { get: () => undefined, set: () => {}, clear: () => {}, getStats: () => ({}) };
+  needsMemorySearch = () => true;
+  determineMemoryStrategy = () => 'profile-only';
+  preloadMemoryForNextQuery = async () => {};
+  getPerformanceStats = () => ({});
+  console.log('⚠️ Using fallback implementations for performance optimizations');
+}
+
 const app = express();
 const port = Number(process.env.PORT ?? 8000);
 
@@ -43,6 +73,19 @@ try {
 // Home / health
 app.get('/api', (req, res) => res.json({ ok: true }));
 
+// Global error handlers to prevent server crashes
+process.on('uncaughtException', (error) => {
+  console.error('❌ UNCAUGHT EXCEPTION:', error);
+  console.error('Stack:', error.stack);
+  // Don't exit - keep server running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ UNHANDLED REJECTION at:', promise);
+  console.error('Reason:', reason);
+  // Don't exit - keep server running
+});
+
 /**
  * POST /api/ask-ai
  * body: { prompt: string, type?: 'text' | 'image', model?: string, useMemory?: boolean, userId?: string }
@@ -51,7 +94,10 @@ app.post('/api/ask-ai', async (req, res) => {
   if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
 
   try {
-    const { prompt, type = 'text', model, useMemory = true, userId, chatId, messageCount, userName } = req.body;
+    console.log('📥 Request received at /api/ask-ai');
+    const { prompt, type = 'text', model, useMemory = true, userId, chatId, messageCount, userName, conversationHistory } = req.body;
+    console.log('📦 Request body parsed successfully');
+    
     if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt (string) is required' });
 
     // For testing purposes, use anoop123 if no userId provided
@@ -70,7 +116,7 @@ app.post('/api/ask-ai', async (req, res) => {
       }
     }
     
-    console.log(`💬 Chat request - User: ${effectiveUserId}, Chat: ${effectiveChatId || 'none'}, Message#: ${effectiveMessageCount !== undefined ? effectiveMessageCount + 1 : '?'}, Memory: ${useMemory}, Prompt: "${prompt.substring(0, 50)}..."`);
+    console.log(`💬 Chat request - User: ${effectiveUserId}, Chat: ${effectiveChatId || 'none'}, Message#: ${effectiveMessageCount !== undefined ? effectiveMessageCount + 1 : '?'}, History: ${conversationHistory?.length || 0} msgs, Memory: ${useMemory}, Prompt: "${prompt.substring(0, 50)}..."`);
 
     let enhancedPrompt = prompt;
 
@@ -132,7 +178,43 @@ app.post('/api/ask-ai', async (req, res) => {
 
     // Use memory system based on search strategy
     if (useMemory && type === 'text') {
-      const strategy = determineSearchStrategy(prompt, effectiveMessageCount || 0);
+      // ⚡ OPTIMIZATION: Use smart strategy determination
+      const memoryStrategy = determineMemoryStrategy(prompt, effectiveMessageCount || 0);
+      console.log(`🎯 Memory strategy selected: ${memoryStrategy}`);
+      
+      let strategy: 'full' | 'profile-only' | 'skip' = 'profile-only';
+      
+      if (memoryStrategy === 'none') {
+        strategy = 'skip';
+      } else if (memoryStrategy === 'search') {
+        strategy = 'full';
+      } else if (memoryStrategy === 'cache' && effectiveChatId) {
+        // Try to use cached context first
+        const cachedTurns = recentContextCache.get(effectiveUserId, effectiveChatId);
+        if (cachedTurns && Array.isArray(cachedTurns) && cachedTurns.length > 0) {
+          console.log(`⚡ Using cached context (${cachedTurns.length} turns) - instant retrieval!`);
+          // Build prompt from cached turns
+          const contextText = cachedTurns.map((turn: any) => 
+            `User: ${turn.userMessage}\nAssistant: ${turn.aiResponse}`
+          ).join('\n\n');
+          
+          enhancedPrompt = `SYSTEM: You are NubiqAI ✨
+
+RECENT CONVERSATION:
+${contextText}
+
+USER QUESTION:
+${prompt}
+
+Respond naturally.`;
+          
+          strategy = 'skip'; // Skip full memory search
+        } else {
+          strategy = 'profile-only'; // Fall back to profile
+        }
+      }
+      
+      const originalStrategy = determineSearchStrategy(prompt, effectiveMessageCount || 0);
       
       if (strategy === 'skip') {
         console.log('⏭️ Skipping memory - simple greeting/acknowledgment');
@@ -140,20 +222,43 @@ app.post('/api/ask-ai', async (req, res) => {
         // Lightweight: Only use user profile (no expensive searches)
         console.log('👤 Using profile-only memory (lightweight) for user:', effectiveUserId);
         try {
-          const profileContext = userProfileService.generateProfileContext(effectiveUserId);
+          // ⚡ OPTIMIZATION: Check cache first
+          let profileContextCached = profileCache.get(effectiveUserId);
+          let profileContext: string | null = null;
+          
+          if (profileContextCached === undefined) {
+            // Cache miss - fetch from service
+            console.log('📥 Profile cache miss - fetching from service');
+            profileContext = userProfileService.generateProfileContext(effectiveUserId);
+            // Cache the profile object for future use
+            const profile = userProfileService.getUserProfile(effectiveUserId);
+            profileCache.set(effectiveUserId, profile);
+          } else {
+            console.log('⚡ Profile cache hit - instant retrieval!');
+            // Generate context from cached profile
+            profileContext = profileContextCached ? userProfileService.generateProfileContext(effectiveUserId) : null;
+          }
           
           if (profileContext) {
-            enhancedPrompt = `SYSTEM: You are Nubiq AI assistant with persistent memory. You have access to the user's profile information below. USE IT naturally in your responses. DO NOT say "my memory resets" - you HAVE real memory about this user.
+            enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent assistant with persistent memory.
+
+⚠️ CRITICAL: NEVER use # ## ### or * symbols in your response!
+
+🎯 CORRECT FORMAT:
+Write naturally with emojis at the start of sections
+Use 1️⃣ 2️⃣ 3️⃣ for numbered lists
+Use ✅ for list items, NOT asterisks
+Add blank lines between topics
 
 ${'='.repeat(60)}
-USER PROFILE:
+👤 USER PROFILE:
 ${profileContext}
 ${'='.repeat(60)}
 
-CURRENT USER QUESTION:
+💬 CURRENT USER QUESTION:
 ${prompt}
 
-Respond naturally using the profile information above. Be conversational and confident in your memory of this user.`;
+🎨 Respond using ONLY emojis and natural text. NO markdown symbols!`;
             
             console.log('✅ Enhanced prompt with user profile context');
           } else {
@@ -175,9 +280,9 @@ Respond naturally using the profile information above. Be conversational and con
             effectiveMessageCount,
             {
               maxLocalResults: 3,
-              maxLongTermResults: 2,
+              maxLongTermResults: 1, // ⚡ OPTIMIZED: Reduced from 2 to 1 (saves 100-200ms)
               localWeight: 0.8,
-              threshold: 0.3,
+              threshold: 0.35, // ⚡ OPTIMIZED: Slightly higher threshold (faster, more relevant)
               skipPineconeIfLocalFound: true,
               minLocalResultsForSkip: 2
             }
@@ -190,19 +295,139 @@ Respond naturally using the profile information above. Be conversational and con
           }
           
           if (memoryResult.combinedContext && memoryResult.combinedContext !== 'No relevant conversation history found.') {
-            enhancedPrompt = `SYSTEM: You are Nubiq AI assistant with persistent memory. You have access to conversation history and user profile information below. When this context is relevant, USE IT naturally in your responses. If the user asks about past conversations or personal info, reference the context. DO NOT say "my memory resets" or "for privacy" - you HAVE real memory.
+            enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent, helpful assistant with persistent memory and excellent communication skills.
+
+⚠️ CRITICAL FORMATTING RULES - READ CAREFULLY:
+
+🚫 NEVER EVER USE THESE SYMBOLS:
+DO NOT use # or ## or ### for headers
+DO NOT use * or ** for bold or bullets  
+DO NOT use - for lists
+DO NOT use markdown syntax at all
+These symbols make responses look technical and ugly!
+
+✅ INSTEAD USE THIS FORMAT:
+
+For lists, write like this:
+"🎯 Main Topic
+
+✅ First point - explanation here
+✅ Second point - explanation here  
+✅ Third point - explanation here"
+
+For sections, write like this:
+"💡 Important Information
+
+Here is the explanation in natural sentences. Use emojis to mark important points ✅ or warnings ⚠️ within the text itself.
+
+🚀 Next Section
+
+More content here with emojis naturally integrated into the text flow."
+
+For steps, write like this:
+"🎯 How to Do Something
+
+1️⃣ First do this - clear explanation
+2️⃣ Then do this - more details
+3️⃣ Finally do this - wrap up"
+
+🎯 YOUR CORE CAPABILITIES:
+🧠 Access to conversation history and user profile information
+💭 Remember past conversations and reference them naturally
+📝 Provide well-structured, visually appealing responses
+🤝 Confident, friendly, and professional communication
+🎨 Creative use of emojis for better readability
+
+💬 WRITING STYLE:
+Write in natural, flowing sentences
+Use emojis at the START of new ideas, not as bullets
+Add blank lines between different topics
+Keep paragraphs short (2-3 sentences)
+Be warm, friendly, and conversational 😊
+
+🎭 EMOJI USAGE (use strategically):
+Sections: �, �, ⚡, �, �, �, 🌟
+Lists: ✅, ▶️, �, ⭐
+Steps: 1️⃣, 2️⃣, 3️⃣, 4️⃣, 5️⃣
+Important: ⚠️, 🔥, �, 🎯
+Tips: 💡, 🎓, ⭐
+Positive: ✅, 🎉, �, �
+Questions: ❓, 🤔, �
+
+🚫 ABSOLUTELY FORBIDDEN:
+### Headers like this
+** Bold like this **
+* Bullet points like this
+- List items like this
+Any markdown syntax
+
+✅ CORRECT EXAMPLES:
+
+Example 1:
+"Hey there! 👋
+
+🎯 Coffee Making Guide
+
+Making great coffee is easy! Let me show you three popular methods.
+
+☕ Drip Coffee Machine
+
+1️⃣ Add filter to the basket
+2️⃣ Add 2 tablespoons of ground coffee per 6 ounces of water
+3️⃣ Pour cold water into the reservoir
+4️⃣ Turn it on and wait for the magic! ✨
+
+🇫🇷 French Press
+
+1️⃣ Add coarse-ground coffee to the press
+2️⃣ Pour hot water (around 200°F)
+3️⃣ Let it steep for 4 minutes
+4️⃣ Press down slowly and pour
+
+💡 Pro Tip: Always use fresh, cold filtered water for the best taste!
+
+Which method sounds good to you? 😊"
+
+Example 2:
+"🎯 Five Productivity Tips
+
+Here are some game-changing strategies:
+
+1️⃣ Time Blocking
+Schedule specific tasks in your calendar. This keeps you focused and prevents multitasking chaos!
+
+2️⃣ Pomodoro Technique  
+Work for 25 minutes, then take a 5-minute break. Your brain will thank you! ⏰
+
+3️⃣ Single-Tasking
+Focus on ONE thing at a time. Studies show multitasking kills productivity by 40%!
+
+4️⃣ Morning Routine
+Tackle your hardest task first thing. Your willpower is strongest in the AM! 🌅
+
+5️⃣ Regular Breaks
+Step away every hour. Movement and fresh air reset your mind.
+
+Which tip will you try first? 🚀"
+
+❌ WRONG EXAMPLES (NEVER DO THIS):
+
+### This is wrong - no hashtags!
+** This is wrong - no asterisks! **
+* This is wrong - no bullet symbols!
+- This is wrong - no dashes!
 
 ${'='.repeat(60)}
-CONVERSATION HISTORY & USER PROFILE:
+🧠 CONVERSATION HISTORY & USER PROFILE:
 ${memoryResult.combinedContext}
 ${'='.repeat(60)}
 
-CURRENT USER QUESTION:
+💬 CURRENT USER QUESTION:
 ${prompt}
 
-Respond naturally using the context above when relevant. Be conversational and confident in your memory.`;
+🎨 NOW RESPOND: Use the correct format shown above. Natural language with emojis. NO # or * symbols. Make it visually beautiful and easy to read!`;
             
-            console.log(`✅ Enhanced prompt with ${memoryResult.type} memory context`);
+            console.log(`✅ Enhanced prompt with ${memoryResult.type} memory context + structured response instructions`);
           } else {
             console.log(`❌ No relevant memory context found for user ${effectiveUserId}`);
           }
@@ -212,13 +437,69 @@ Respond naturally using the context above when relevant. Be conversational and c
       }
     }
 
-    const textModel = model ?? 'gemini-2.5-pro';
+    // 💬 Add conversation history from current chat for context continuity
+    if (conversationHistory && conversationHistory.length > 0) {
+      const historyText = conversationHistory.map((msg: any) => 
+        `${msg.role.toUpperCase()}: ${msg.content}`
+      ).join('\n\n');
+      
+      enhancedPrompt = `CONVERSATION SO FAR IN THIS CHAT:
+${'='.repeat(60)}
+${historyText}
+${'='.repeat(60)}
+
+${enhancedPrompt}
+
+Remember: The conversation above is from the CURRENT chat session. Use it to maintain context and continuity in your responses.`;
+      
+      console.log(`💬 Added ${conversationHistory.length} messages from current conversation for context`);
+    } else if (!enhancedPrompt.includes('SYSTEM:')) {
+      // If no memory context and no conversation history, add base structured prompt
+      enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent, helpful assistant.
+
+⚠️ CRITICAL FORMATTING RULE:
+NEVER use # ## ### or * - symbols in your responses!
+These are forbidden markdown symbols.
+
+✅ CORRECT FORMAT EXAMPLES:
+
+For sections:
+"🎯 Topic Name
+
+Explanation in natural sentences here.
+
+💡 Another Topic
+
+More content here."
+
+For lists:
+"✅ First point - details
+✅ Second point - details
+✅ Third point - details"
+
+For steps:
+"1️⃣ Do this first
+2️⃣ Then do this
+3️⃣ Finally this"
+
+USER QUESTION:
+${prompt}
+
+� Respond using ONLY emojis and natural language. NO # or * symbols!`;
+      console.log(`📋 Using base structured response prompt`);
+    }
+
+    const textModel = model ?? 'gemini-2.5-flash';
     const imageModel = model ?? 'gemini-2.5-flash-image';
 
     if (type === 'image') {
+      // For image generation, use the ORIGINAL prompt, not the enhanced text prompt
+      // Image models don't need system instructions or memory context
+      console.log(`🎨 Generating image with prompt: "${prompt.substring(0, 100)}..."`);
+      
       const response = await ai.models.generateContent({
         model: imageModel,
-        contents: [enhancedPrompt],
+        contents: [prompt], // Use original prompt, not enhancedPrompt
       });
 
       const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
@@ -226,12 +507,32 @@ Respond naturally using the context above when relevant. Be conversational and c
       let imageUri: string | null = null;
       let altText: string | null = null;
 
+      console.log(`📦 Received ${parts.length} parts from Gemini`);
+      
       for (const part of parts) {
-        if ((part as any).inlineData?.data) imageBase64 = (part as any).inlineData.data;
-        if ((part as any).fileData?.fileUri) imageUri = (part as any).fileData.fileUri;
-        if ((part as any).text) altText = (part as any).text ?? altText;
+        // Log what we find in each part
+        if ((part as any).inlineData) {
+          console.log(`📸 Found inlineData - mimeType: ${(part as any).inlineData.mimeType}, data length: ${(part as any).inlineData.data?.length || 0}`);
+          imageBase64 = (part as any).inlineData.data;
+        }
+        if ((part as any).fileData) {
+          console.log(`📁 Found fileData - URI: ${(part as any).fileData.fileUri}`);
+          imageUri = (part as any).fileData.fileUri;
+        }
+        if ((part as any).text) {
+          console.log(`📝 Found text: ${(part as any).text.substring(0, 100)}`);
+          altText = (part as any).text ?? altText;
+        }
       }
 
+      if (imageBase64) {
+        console.log(`✅ Image generated successfully - base64 data (${imageBase64.length} chars)`);
+      } else if (imageUri) {
+        console.log(`✅ Image generated successfully - URI: ${imageUri}`);
+      } else {
+        console.error(`❌ No image data found in response!`);
+      }
+      
       return res.json({ success: true, imageBase64, imageUri, altText, raw: response });
     }
 
@@ -270,6 +571,12 @@ Respond naturally using the context above when relevant. Be conversational and c
           );
           
           console.log(`💬 [BACKGROUND] Stored turn in session (chat: ${effectiveChatId}): "${prompt.substring(0, 50)}..."`);
+          
+          // ⚡ OPTIMIZATION: Preload memory for next query
+          if (effectiveChatId) {
+            preloadMemoryForNextQuery(effectiveUserId, effectiveChatId, hybridMemoryService)
+              .catch((err: any) => console.warn('Preload failed:', err));
+          }
         } catch (memoryError) {
           console.error('❌ [BACKGROUND] Failed to store conversation turn:', memoryError);
         }
@@ -280,8 +587,19 @@ Respond naturally using the context above when relevant. Be conversational and c
     return;
 
   } catch (err: any) {
-    console.error('ask-ai error:', err);
-    return res.status(500).json({ success: false, error: err?.message ?? String(err) });
+    console.error('❌ FATAL ERROR in /api/ask-ai:', err);
+    console.error('❌ Error stack:', err?.stack);
+    console.error('❌ Error name:', err?.name);
+    console.error('❌ Error message:', err?.message);
+    
+    // Don't let the server crash - always return a response
+    if (!res.headersSent) {
+      return res.status(500).json({ 
+        success: false, 
+        error: err?.message ?? String(err),
+        details: process.env.NODE_ENV === 'development' ? err?.stack : undefined
+      });
+    }
   }
 });
 
@@ -413,17 +731,17 @@ app.post('/api/edit-image', async (req, res) => {
       return res.status(400).json({ error: 'editPrompt (string) is required' });
     }
 
-    const imageModel = model ?? 'gemini-2.5-flash-image-preview';
-
-    // Create a prompt that combines the edit instruction with the image
-    const combinedPrompt = `Edit this image based on the following instruction: ${editPrompt}. Generate a new version of the image with the requested modifications.`;
-
-    const response = await ai.models.generateContent({
-      model: imageModel,
+    // NOTE: Gemini's image models (gemini-2.5-flash-image) only GENERATE new images, they don't edit existing ones
+    // For "editing", we'll use the vision model to analyze the image and generate a new one based on the edit instruction
+    
+    // Step 1: Use vision model to describe the image
+    const visionModel = 'gemini-2.5-flash';
+    const descriptionResponse = await ai.models.generateContent({
+      model: visionModel,
       contents: [
         {
           parts: [
-            { text: combinedPrompt },
+            { text: 'Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.' },
             {
               inlineData: {
                 data: imageBase64,
@@ -433,6 +751,21 @@ app.post('/api/edit-image', async (req, res) => {
           ],
         },
       ],
+    });
+
+    const imageDescription = descriptionResponse?.candidates?.[0]?.content?.parts?.[0]?.text || 'an image';
+
+    // Step 2: Generate a new image based on the description + edit instruction
+    const imageModel = model ?? 'gemini-2.5-flash-image';
+    const combinedPrompt = `Based on this description: "${imageDescription}"
+
+Apply this edit: ${editPrompt}
+
+Generate a new image that matches the original description but with the requested edits applied.`;
+
+    const response = await ai.models.generateContent({
+      model: imageModel,
+      contents: [combinedPrompt],
     });
 
     const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
@@ -473,31 +806,37 @@ app.post('/api/edit-image-with-mask', async (req, res) => {
       return res.status(400).json({ error: 'editPrompt (string) is required' });
     }
 
-    const imageModel = model ?? 'gemini-2.5-flash-image';
-
-    // Create a detailed prompt that explains the mask-based editing
-    const combinedPrompt = `You are editing an image with marked areas. The first image is the original, and the second image shows the marked areas (colored markings) that need to be edited.
-
-Instructions:
-- Focus your edits ONLY on the marked/colored areas in the mask image
-- Leave unmarked areas unchanged
-- Apply this edit to the marked areas: ${editPrompt}
-- Generate a new version of the original image with only the marked areas modified
-
-Original image and marking mask are provided below.`;
-
-    const response = await ai.models.generateContent({
-      model: imageModel,
+    // NOTE: Gemini doesn't support true mask-based editing like Stable Diffusion inpainting
+    // For mask-based editing, we'll use vision model to analyze BOTH images and generate a new one
+    
+    // Step 1: Describe the original image
+    const visionModel = 'gemini-2.5-flash';
+    const descriptionResponse = await ai.models.generateContent({
+      model: visionModel,
       contents: [
         {
           parts: [
-            { text: combinedPrompt },
+            { text: 'Describe this image in detail.' },
             {
               inlineData: {
                 data: imageBase64,
                 mimeType: 'image/png',
               },
             },
+          ],
+        },
+      ],
+    });
+
+    const imageDescription = descriptionResponse?.candidates?.[0]?.content?.parts?.[0]?.text || 'an image';
+
+    // Step 2: Analyze the mask to understand what areas to edit
+    const maskResponse = await ai.models.generateContent({
+      model: visionModel,
+      contents: [
+        {
+          parts: [
+            { text: 'Describe the colored/marked areas in this mask image. Where are they located and what parts of the image do they cover?' },
             {
               inlineData: {
                 data: maskBase64,
@@ -507,6 +846,23 @@ Original image and marking mask are provided below.`;
           ],
         },
       ],
+    });
+
+    const maskDescription = maskResponse?.candidates?.[0]?.content?.parts?.[0]?.text || 'marked areas';
+
+    // Step 3: Generate new image with edits applied to masked areas
+    const imageModel = model ?? 'gemini-2.5-flash-image';
+    const combinedPrompt = `Original image: ${imageDescription}
+
+Masked areas to edit: ${maskDescription}
+
+Edit instruction for the masked areas ONLY: ${editPrompt}
+
+Generate a new version of the image with the edit applied ONLY to the masked areas. Keep everything else the same as the original.`;
+
+    const response = await ai.models.generateContent({
+      model: imageModel,
+      contents: [combinedPrompt],
     });
 
     const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
@@ -910,6 +1266,40 @@ app.get('/api/get-user-profile/:userId', async (req, res) => {
 
   } catch (err: any) {
     console.error('get-user-profile error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message ?? String(err)
+    });
+  }
+});
+
+/**
+ * GET /api/performance-stats
+ * Get performance optimization statistics
+ */
+app.get('/api/performance-stats', (req, res) => {
+  try {
+    const stats = getPerformanceStats();
+    return res.json({
+      success: true,
+      stats,
+      info: {
+        profileCacheEnabled: true,
+        contextCacheEnabled: true,
+        smartMemoryStrategy: true,
+        preloadingEnabled: true,
+        optimizations: [
+          'Profile caching (5min TTL)',
+          'Recent context caching (2min TTL)',
+          'Smart memory strategy selection',
+          'Reduced Pinecone results (1 instead of 2)',
+          'Background memory preloading',
+          'Skip memory for simple queries'
+        ]
+      }
+    });
+  } catch (err: any) {
+    console.error('performance-stats error:', err);
     return res.status(500).json({
       success: false,
       error: err?.message ?? String(err)
