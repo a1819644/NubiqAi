@@ -4,13 +4,13 @@
 
 ### Frontend (.env in root directory)
 - ✅ `.env` file created
-- ✅ Firebase credentials added:
-  - API Key: `AIzaSyCn1rcyy3CDjg_RxOzFo2oiu750h5gXhPw`
-  - Auth Domain: `vectorslabai.firebaseapp.com`
-  - Project ID: `vectorslabai`
-  - Storage Bucket: `vectorslabai.appspot.com`
-  - Messaging Sender ID: `837406667658`
-  - App ID: `1:837406667658:web:7649ce66194dfee02e4e73`
+- ✅ Firebase credentials added (configured via environment variables)
+  - API Key: `VITE_FIREBASE_API_KEY` ✅
+  - Auth Domain: `VITE_FIREBASE_AUTH_DOMAIN` ✅
+  - Project ID: `VITE_FIREBASE_PROJECT_ID` ✅
+  - Storage Bucket: `VITE_FIREBASE_STORAGE_BUCKET` ✅
+  - Messaging Sender ID: `VITE_FIREBASE_MESSAGING_SENDER_ID` ✅
+  - App ID: `VITE_FIREBASE_APP_ID` ✅
 
 ### Backend (Server/.env)
 - ✅ Gemini API key configured
