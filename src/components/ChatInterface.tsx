@@ -15,6 +15,7 @@ import {
 } from "./ui/dialog";
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
+import { imageStorageService } from "../services/imageStorageService";
 
 // Using a placeholder for image icon
 const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTIgMkgxNFYxNEgyVjJaIiBzdHJva2U9IiM2NjY2NjYiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIvPgo8cGF0aCBkPSJNMiAxMkw2IDhMOCAxMEwxMiA2TDE0IDhWMTJIMloiIGZpbGw9IiM2NjY2NjYiLz4KPC9zdmc+';
@@ -76,6 +77,57 @@ export function ChatInterface({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chat.messages]);
+
+  // 💾 Preload images from IndexedDB when chat loads
+  useEffect(() => {
+    const preloadChatImages = async () => {
+      if (!activeChat?.id || !user?.id) return;
+
+      try {
+        console.log(`🔍 Checking IndexedDB for cached images in chat ${activeChat.id}...`);
+        const cachedImages = await imageStorageService.getChatImages(activeChat.id);
+        
+        if (cachedImages.length > 0) {
+          console.log(`✅ Found ${cachedImages.length} cached images in IndexedDB`);
+          
+          // Update messages with cached images (if they're not already loaded)
+          const updatedMessages = activeChat.messages.map(msg => {
+            const cachedImage = cachedImages.find(img => img.id === msg.id);
+            
+            if (cachedImage && msg.attachments) {
+              // Replace Firebase URL with cached base64 for instant loading
+              const hasFirebaseUrl = msg.attachments.some(att => 
+                typeof att === 'string' && att.startsWith('https://storage.googleapis.com')
+              );
+              
+              if (hasFirebaseUrl) {
+                return {
+                  ...msg,
+                  attachments: [cachedImage.imageData] // Use cached base64
+                };
+              }
+            }
+            
+            return msg;
+          });
+          
+          // Only update if we actually replaced some URLs
+          const hasChanges = updatedMessages.some((msg, idx) => 
+            msg.attachments !== activeChat.messages[idx].attachments
+          );
+          
+          if (hasChanges) {
+            onUpdateChat({ ...activeChat, messages: updatedMessages });
+            console.log('✅ Loaded images from IndexedDB cache (instant)');
+          }
+        }
+      } catch (error) {
+        console.warn('⚠️ Failed to preload images from IndexedDB:', error);
+      }
+    };
+
+    preloadChatImages();
+  }, [activeChat?.id, user?.id]);
 
   // 🎯 OPTIMIZATION: Persist chat when window closes
   useEffect(() => {
@@ -240,21 +292,113 @@ export function ChatInterface({
       const containsImageKeyword = imageKeywords.some(keyword => textLower.includes(keyword));
       const isImagineCommand = text.trim().startsWith('/imagine');
 
-      // Only show confirmation if not skipping and conditions are met
+      // 🎨 Direct image generation without confirmation
       if (containsImageKeyword && !isImagineCommand && !isImageModeActive && !skipConfirmation) {
-        setPendingImagePrompt(text); // SAVE REAL PROMPT FOR IMAGE MODE
-        const confirmationId = `confirm-${Date.now()}`;
-        const confirmationMessage: Message = {
-          id: confirmationId,
+        console.log('🎨 Detected image generation request - processing directly!');
+        console.log('🖼️ Generating image with prompt:', text);
+        
+        // Insert a placeholder AI message to show a skeleton while image generates
+        const placeholderMessage: Message = {
+          id: `gen-${Date.now()}`,
+          content: 'Generating your image...',
           role: 'assistant',
-          type: 'confirmation',
-          content: `It looks like you want to generate an image. Would you like to proceed?`,
           timestamp: new Date(),
-          confirmationId: confirmationId,
+          attachments: ['__generating_image__'],
         };
-        safeUpdateChat((chat) => ({ ...chat, messages: [...chat.messages, confirmationMessage] }));
-        setIsLoading(false); // Stop loading as we are waiting for user confirmation
-        return;
+
+        const chatWithPlaceholder = {
+          ...updatedChat,
+          messages: [...updatedChat.messages, placeholderMessage],
+        };
+
+        safeUpdateChat(() => chatWithPlaceholder);
+
+        // Build conversation history from current chat for context
+        const history = updatedChat.messages
+          .filter(m => m.role === 'user' || m.role === 'assistant')
+          .slice(-10) // Last 10 messages for context
+          .map(m => ({
+            role: m.role as 'user' | 'assistant',
+            content: m.content
+          }));
+
+        // Call backend image generation with user context AND conversation history
+        const imgResp = await apiService.generateImage(
+          text,
+          user?.id,
+          targetChatId,
+          user?.name,
+          history // 🎯 Pass conversation context!
+        );
+
+        console.log('📥 Image generation response:', {
+          success: imgResp.success,
+          hasImageBase64: !!imgResp.imageBase64,
+          hasImageUri: !!imgResp.imageUri,
+        });
+
+        if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
+          // Store image in IndexedDB for persistence
+          const imageUrl = imgResp.imageUri || imgResp.imageBase64!;
+          const imageId = `${user?.id}_${targetChatId}_${Date.now()}`;
+
+          try {
+            await imageStorageService.storeImage(
+              imageId,
+              user?.id || 'anonymous',
+              targetChatId,
+              imageUrl,
+              text,
+              imgResp.imageUri || undefined
+            );
+            console.log('💾 Image cached in IndexedDB for instant loading');
+          } catch (cacheError) {
+            console.warn('⚠️ Failed to cache image in IndexedDB:', cacheError);
+          }
+
+          // Create the actual image message
+          const imageMessage: Message = {
+            id: `img-${Date.now()}`,
+            content: imgResp.altText || text,
+            role: 'assistant',
+            timestamp: new Date(),
+            attachments: [imageUrl],
+          };
+
+          const finalChat = {
+            ...chatWithPlaceholder,
+            messages: [
+              ...chatWithPlaceholder.messages.filter(m => m.id !== placeholderMessage.id),
+              imageMessage
+            ]
+          };
+
+          safeUpdateChat(() => finalChat);
+          setIsLoading(false);
+          toast.success('✨ Image generated successfully!');
+          return;
+        } else {
+          // Image generation failed
+          const errorMessage: Message = {
+            id: `err-${Date.now()}`,
+            content: imgResp.error || 'Failed to generate image. Please try again.',
+            role: 'assistant',
+            timestamp: new Date(),
+          };
+
+          const errorChat = {
+            ...chatWithPlaceholder,
+            messages: [
+              ...chatWithPlaceholder.messages.filter(m => m.id !== placeholderMessage.id),
+              errorMessage
+            ]
+          };
+
+          safeUpdateChat(() => errorChat);
+          setIsLoading(false);
+          toast.error('Failed to generate image');
+          return;
+        }
       }
 
       // Check if this request is still the active one before updating UI
@@ -284,8 +428,13 @@ export function ChatInterface({
 
         safeUpdateChat(() => chatWithPlaceholder);
 
-        // Call backend image generation
-        const imgResp = await apiService.generateImage(prompt);
+        // Call backend image generation with user context
+        const imgResp = await apiService.generateImage(
+          prompt,
+          user?.id,
+          targetChatId,
+          user?.name
+        );
 
         console.log('📥 Image generation response:', {
           success: imgResp.success,
@@ -303,8 +452,26 @@ export function ChatInterface({
 
           console.log('🖼️ Creating image URL:', imageUrl.substring(0, 100) + '...');
 
+          // 💾 Store image in IndexedDB for instant loading on page reload
+          const messageId = (Date.now() + 2).toString();
+          try {
+            if (user?.id && imageUrl) {
+              await imageStorageService.storeImage(
+                messageId,
+                user.id,
+                targetChatId,
+                imageUrl,
+                prompt,
+                imgResp.imageUri || undefined // Firebase Storage URL
+              );
+              console.log('💾 Image cached in IndexedDB for instant loading');
+            }
+          } catch (cacheError) {
+            console.warn('⚠️ Failed to cache image in IndexedDB (non-critical):', cacheError);
+          }
+
           const aiImageMessage: Message = {
-            id: (Date.now() + 2).toString(),
+            id: messageId,
             content: imgResp.altText || `Image generated for: ${prompt}`,
             role: 'assistant',
             timestamp: new Date(),
@@ -387,6 +554,62 @@ export function ChatInterface({
       console.groupEnd();
 
       if (response.success && response.text) {
+        // Check if response includes an image (AI detected image request)
+        const hasImage = (response as any).isImageGeneration && 
+                        ((response as any).imageBase64 || (response as any).imageUri);
+        
+        if (hasImage) {
+          console.log('🖼️ AI response includes generated image!');
+          
+          // Create image URL
+          const imageUrl = (response as any).imageBase64
+            ? `data:image/png;base64,${(response as any).imageBase64}`
+            : (response as any).imageUri!;
+          
+          const messageId = (Date.now() + 1).toString();
+          
+          // 💾 Store image in IndexedDB for instant loading on page reload
+          try {
+            if (user?.id && imageUrl) {
+              await imageStorageService.storeImage(
+                messageId,
+                user.id,
+                targetChatId,
+                imageUrl,
+                text, // Original user prompt
+                (response as any).imageUri || undefined
+              );
+              console.log('💾 Image cached in IndexedDB for instant loading');
+            }
+          } catch (cacheError) {
+            console.warn('⚠️ Failed to cache image in IndexedDB (non-critical):', cacheError);
+          }
+          
+          const aiMessage: Message = {
+            id: messageId,
+            content: response.text,
+            role: "assistant",
+            timestamp: new Date(),
+            attachments: [imageUrl], // Include the image as attachment
+          };
+
+          const finalChat = {
+            ...updatedChat,
+            messages: [...updatedChat.messages, aiMessage],
+            title: isFirstMessage
+              ? (text || "New Chat").slice(0, 40) + (text.length > 40 ? "..." : "")
+              : updatedChat.title,
+          };
+
+          // Check if this request is still the active one before updating UI
+          if (abortControllerRef.current !== controller) return;
+
+          safeUpdateChat(() => finalChat);
+          setIsLoading(false);
+          return;
+        }
+        
+        // Regular text response (no image)
         const aiMessage: Message = {
           id: (Date.now() + 1).toString(),
           content: response.text,

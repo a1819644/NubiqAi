@@ -129,8 +129,9 @@ class ApiService {
   }
 
   // Chat endpoints
-  async getChats(): Promise<ApiResponse<any[]>> {
-    return this.request('/chats');
+  // Smart two-tier loading: local first (instant), then Pinecone (background)
+  async getChats(userId: string, source: 'local' | 'pinecone' | 'all' = 'local'): Promise<ApiResponse<any[]>> {
+    return this.request(`/chats?userId=${encodeURIComponent(userId)}&source=${source}`);
   }
 
   async createChat(title: string): Promise<ApiResponse<any>> {
@@ -215,7 +216,13 @@ class ApiService {
    * Generate an image from prompt using the backend /ask-ai endpoint with type=image
    * Image generation can take 30-90 seconds, so we use a longer timeout
    */
-  async generateImage(prompt: string): Promise<{
+  async generateImage(
+    prompt: string, 
+    userId?: string, 
+    chatId?: string, 
+    userName?: string,
+    conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }> // 🎯 NEW! Pass conversation context
+  ): Promise<{
     success: boolean;
     imageBase64?: string | null;
     imageUri?: string | null;
@@ -232,7 +239,14 @@ class ApiService {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, type: 'image' }),
+        body: JSON.stringify({ 
+          prompt, 
+          type: 'image',
+          userId,
+          chatId,
+          userName,
+          conversationHistory // 🎯 NEW! Include conversation context
+        }),
         signal: controller.signal,
       });
 
@@ -506,6 +520,18 @@ class ApiService {
    */
   async endChat(data: { userId: string; chatId: string }): Promise<{ success: boolean }> {
     return this.request('/end-chat', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  /**
+   * Save all chats at once (batch operation) - bypasses cooldown
+   * Use for critical events: sign-out, app close, etc.
+   * 🎯 NEW: Ensures all conversations + images are saved to Pinecone
+   */
+  async saveAllChats(data: { userId: string; chatIds: string[] }): Promise<{ success: boolean; message?: string }> {
+    return this.request('/save-all-chats', {
       method: 'POST',
       body: JSON.stringify(data),
     });

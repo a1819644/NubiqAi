@@ -199,6 +199,8 @@ import { Sidebar } from "./components/Sidebar";
 import { History } from "./components/History";
 import { ChatInterface } from "./components/ChatInterface";
 import { apiService } from "./services/api";
+import { imageStorageService } from "./services/imageStorageService";
+import { imageRehydrationService } from "./services/imageRehydrationService";
 // import { History } from "./components/History";
 // import { Workspace } from "./components/Workspace";
 // import { Settings } from "./components/Settings";
@@ -310,7 +312,7 @@ export default function App() {
 
       console.log('🔄 User authenticated, loading chat history...');
       
-      // 🚀 FAST: Load from localStorage immediately for instant UX
+      // 🚀 PHASE 1: Load from localStorage immediately for instant UX
       const localStorageKey = `chat_history_${user.id}`;
       const savedChats = localStorage.getItem(localStorageKey);
       
@@ -330,32 +332,38 @@ export default function App() {
           
           if (restoredChats.length > 0) {
             setChats(restoredChats);
-            console.log(`✅ Loaded ${restoredChats.length} chat(s) from localStorage`);
+            console.log(`✅ PHASE 1: Loaded ${restoredChats.length} chat(s) from localStorage`);
           }
         } catch (error) {
           console.error('Failed to parse saved chats:', error);
         }
       }
       
-      // 🌐 BACKGROUND: Sync with Pinecone for cross-device consistency
+      // 🔥 PHASE 2: Load from server's local memory (fast - no DB delay)
       try {
-        const response = await apiService.getChats();
-        if (response && Array.isArray(response) && response.length > 0) {
-          // Convert dates from Pinecone response
-          const cloudChats = response.map((chat: any) => ({
+        console.log('⚡ PHASE 2: Loading from server memory (instant)...');
+        const response = await apiService.getChats(user.id, 'local');
+        
+        if (response?.data && Array.isArray(response.data) && response.data.length > 0) {
+          // Convert dates from server response
+          const serverChats = response.data.map((chat: any) => ({
             ...chat,
-            createdAt: new Date(chat.createdAt),
-            updatedAt: new Date(chat.updatedAt),
+            createdAt: new Date(chat.timestamp),
+            updatedAt: new Date(chat.timestamp),
             messages: chat.messages.map((msg: any) => ({
               ...msg,
               timestamp: new Date(msg.timestamp)
             }))
           }));
           
-          setChats(cloudChats);
-          // Update localStorage with fresh data from Pinecone (strip images to avoid quota)
+          // 🖼️ Rehydrate images from Firebase URLs back into IndexedDB
+          const rehydratedChats = await imageRehydrationService.rehydrateChats(serverChats, user.id);
+          setChats(rehydratedChats);
+          console.log(`✅ PHASE 2: Loaded ${rehydratedChats.length} chat(s) from server memory with image rehydration`);
+          
+          // Update localStorage with server data
           try {
-            const chatsForStorage = cloudChats.map((chat: any) => ({
+            const chatsForStorage = rehydratedChats.map((chat: any) => ({
               ...chat,
               messages: chat.messages.map((msg: any) => ({
                 ...msg,
@@ -365,14 +373,55 @@ export default function App() {
               }))
             }));
             localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
-            console.log(`☁️ Synced ${cloudChats.length} chat(s) from Pinecone (images excluded from localStorage)`);
           } catch (e) {
             console.warn('⚠️ Could not save to localStorage, continuing anyway...');
           }
         }
       } catch (error) {
-        console.warn('Failed to load chats from Pinecone:', error);
-        // Local data is still available, so user can continue
+        console.warn('Phase 2 failed (non-critical):', error);
+      }
+      
+      // 🌐 PHASE 3: Load from Pinecone in background (slower - full history)
+      // Only load if we don't have much local data
+      if (chats.length < 5) {
+        setTimeout(async () => {
+          try {
+            console.log('🔍 PHASE 3: Checking Pinecone for older history...');
+            const pineconeResponse = await apiService.getChats(user.id, 'pinecone');
+            
+            if (pineconeResponse?.data && Array.isArray(pineconeResponse.data) && pineconeResponse.data.length > 0) {
+              const olderChats = pineconeResponse.data.map((chat: any) => ({
+                ...chat,
+                createdAt: new Date(chat.timestamp),
+                updatedAt: new Date(chat.timestamp),
+                messages: chat.messages.map((msg: any) => ({
+                  ...msg,
+                  timestamp: new Date(msg.timestamp)
+                }))
+              }));
+              
+              // 🖼️ Rehydrate images from Firebase URLs
+              const rehydratedOlderChats = await imageRehydrationService.rehydrateChats(olderChats, user.id);
+              
+              // Merge with existing chats (avoid duplicates)
+              setChats(prevChats => {
+                const existingIds = new Set(prevChats.map(c => c.id));
+                const newChats = rehydratedOlderChats.filter(c => !existingIds.has(c.id));
+                
+                if (newChats.length > 0) {
+                  console.log(`✅ PHASE 3: Added ${newChats.length} older chat(s) from Pinecone with image rehydration`);
+                  // Sort by timestamp (ascending - oldest first)
+                  return [...prevChats, ...newChats].sort((a, b) => 
+                    a.createdAt.getTime() - b.createdAt.getTime()
+                  );
+                }
+                return prevChats;
+              });
+            }
+          } catch (error) {
+            console.warn('Phase 3 failed (non-critical):', error);
+          }
+        }, 1000); // Delay 1 second to not block initial load
       }
     };
 
@@ -411,11 +460,31 @@ export default function App() {
           console.warn('⚠️ Could not save to localStorage on sign out');
         }
         
-        // 🌐 Persist all chats to Pinecone for cross-device sync
-        for (const chat of chats) {
-          if (chat.messages.length > 0) {
-            await apiService.endChat({ userId: user.id, chatId: chat.id });
+        // 🌐 Persist all chats to Pinecone for cross-device sync (batch operation)
+        const chatIdsWithMessages = chats
+          .filter(chat => chat.messages.length > 0)
+          .map(chat => chat.id);
+        
+        if (chatIdsWithMessages.length > 0) {
+          console.log(`🚀 Saving ${chatIdsWithMessages.length} chats to Pinecone (batch)...`);
+          try {
+            await apiService.saveAllChats({ 
+              userId: user.id, 
+              chatIds: chatIdsWithMessages 
+            });
+            console.log(`✅ All ${chatIdsWithMessages.length} chats queued for Pinecone save`);
+          } catch (saveError) {
+            console.error('⚠️ Failed to queue chats for Pinecone:', saveError);
+            // Don't block sign-out if Pinecone save fails
           }
+        }
+        
+        // 🗑️ Clear IndexedDB image cache for privacy (shared device security)
+        try {
+          await imageStorageService.clearAll();
+          console.log('✅ Cleared IndexedDB image cache');
+        } catch (e) {
+          console.warn('⚠️ Failed to clear IndexedDB cache (non-critical):', e);
         }
       }
       
@@ -436,6 +505,22 @@ export default function App() {
 
   const handleNewChat = () => {
     console.log('🆕 Creating new chat...');
+    
+    // 🎯 Persist previous chat before creating new one
+    if (activeChat && activeChat.messages.length > 0 && user) {
+      const previousChatId = activeChat.id;
+      const userId = user.id;
+      
+      // Call endChat API in background (don't block UI)
+      apiService.endChat({ userId, chatId: previousChatId })
+        .then(() => {
+          console.log(`✅ Previous chat ${previousChatId} will be persisted to Pinecone`);
+        })
+        .catch((error) => {
+          console.warn('⚠️ Failed to persist previous chat:', error);
+        });
+    }
+    
     const newChat: ChatHistory = {
       id: Date.now().toString(),
       title: "New Chat",
@@ -471,6 +556,21 @@ export default function App() {
   };
 
   const handleSelectChat = (chat: ChatHistory) => {
+    // 🎯 Persist previous chat before switching
+    if (activeChat && activeChat.id !== chat.id && activeChat.messages.length > 0 && user) {
+      const previousChatId = activeChat.id;
+      const userId = user.id;
+      
+      // Call endChat API in background (don't block UI)
+      apiService.endChat({ userId, chatId: previousChatId })
+        .then(() => {
+          console.log(`✅ Previous chat ${previousChatId} will be persisted to Pinecone`);
+        })
+        .catch((error) => {
+          console.warn('⚠️ Failed to persist previous chat:', error);
+        });
+    }
+    
     setActiveChat(chat);
     setActiveSection("home");
   };

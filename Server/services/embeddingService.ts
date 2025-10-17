@@ -9,13 +9,18 @@ export interface MemoryItem {
     type: 'conversation' | 'document' | 'note' | 'conversation_summary';
     source?: string;
     userId?: string;
-    chatId?: string;           // 🎯 NEW! Chat-scoped memory optimization
+    chatId?: string;           // 🎯 Chat-scoped memory optimization
     tags?: string[];
     sessionId?: string;
     turnCount?: number;
     timespanStart?: number;
     timespanEnd?: number;
-    isFirstMessage?: boolean;  // 🎯 NEW! Track if this is chat's first message
+    isFirstMessage?: boolean;  // 🎯 Track if this is chat's first message
+    role?: 'user' | 'assistant'; // 🎯 Message role for chat reconstruction
+    turnId?: string;           // 🎯 Links user/assistant messages in same turn
+    imageUrl?: string;         // 🖼️ NEW! Image URL or base64 data
+    imagePrompt?: string;      // 🎨 NEW! Original image generation prompt
+    hasImage?: boolean;        // 🖼️ NEW! Flag for quick filtering
   };
 }
 

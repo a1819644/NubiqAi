@@ -8,6 +8,15 @@ import { getEmbeddingService, MemoryItem, SearchResult } from './services/embedd
 import { getHybridMemoryService } from './services/hybridMemoryService';
 import { extractDocumentTopics } from './services/conversationService';
 import * as userProfileService from './services/userProfileService';
+import { firebaseStorageService } from './services/firebaseStorageService';
+import { 
+  rateLimitMiddleware, 
+  validateUserIdMiddleware, 
+  sanitizeBodyMiddleware, 
+  securityHeadersMiddleware,
+  SecurityValidator,
+  logSecurityEvent
+} from './services/securityMiddleware';
 
 // Import performance optimizations with error handling
 let profileCache: any;
@@ -51,6 +60,10 @@ app.use(cors({
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
+// 🔒 Security middleware
+app.use(securityHeadersMiddleware);
+app.use(sanitizeBodyMiddleware);
+
 // Add request logging
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${req.headers.origin || 'none'}`);
@@ -89,8 +102,9 @@ process.on('unhandledRejection', (reason, promise) => {
 /**
  * POST /api/ask-ai
  * body: { prompt: string, type?: 'text' | 'image', model?: string, useMemory?: boolean, userId?: string }
+ * 🔒 SECURITY: Rate limited, input validated
  */
-app.post('/api/ask-ai', async (req, res) => {
+app.post('/api/ask-ai', rateLimitMiddleware('general'), async (req, res) => {
   if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
 
   try {
@@ -98,7 +112,30 @@ app.post('/api/ask-ai', async (req, res) => {
     const { prompt, type = 'text', model, useMemory = true, userId, chatId, messageCount, userName, conversationHistory } = req.body;
     console.log('📦 Request body parsed successfully');
     
-    if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt (string) is required' });
+    // 🔒 Validate prompt
+    const promptValidation = SecurityValidator.validatePrompt(prompt);
+    if (!promptValidation.valid) {
+      logSecurityEvent('Invalid prompt blocked', { userId, error: promptValidation.error });
+      return res.status(400).json({ error: promptValidation.error });
+    }
+    
+    // 🔒 Validate userId if provided
+    if (userId) {
+      const userIdValidation = SecurityValidator.validateUserId(userId);
+      if (!userIdValidation.valid) {
+        logSecurityEvent('Invalid userId blocked', { userId, error: userIdValidation.error });
+        return res.status(400).json({ error: userIdValidation.error });
+      }
+    }
+    
+    // 🔒 Validate chatId if provided
+    if (chatId) {
+      const chatIdValidation = SecurityValidator.validateChatId(chatId);
+      if (!chatIdValidation.valid) {
+        logSecurityEvent('Invalid chatId blocked', { userId, chatId, error: chatIdValidation.error });
+        return res.status(400).json({ error: chatIdValidation.error });
+      }
+    }
 
     // For testing purposes, use anoop123 if no userId provided
     const effectiveUserId = userId || 'anoop123';
@@ -490,17 +527,139 @@ ${prompt}
     }
 
     const textModel = model ?? 'gemini-2.5-flash';
-    const imageModel = model ?? 'gemini-2.5-flash-image';
+    const imageModel = model ?? 'gemini-2.0-flash-exp'; // ✅ Gemini 2.0 with image generation
 
     if (type === 'image') {
-      // For image generation, use the ORIGINAL prompt, not the enhanced text prompt
-      // Image models don't need system instructions or memory context
-      console.log(`🎨 Generating image with prompt: "${prompt.substring(0, 100)}..."`);
+      // 🔒 Apply image-specific rate limiting
+      const { rateLimiter } = require('./services/securityMiddleware');
+      if (!rateLimiter.checkRateLimit(effectiveUserId, 'image')) {
+        logSecurityEvent('Image rate limit exceeded', { userId: effectiveUserId });
+        return res.status(429).json({ 
+          success: false,
+          error: 'Image generation rate limit exceeded. Please try again later.' 
+        });
+      }
       
-      const response = await ai.models.generateContent({
-        model: imageModel,
-        contents: [prompt], // Use original prompt, not enhancedPrompt
-      });
+      // 🎨 Smart context-aware image generation
+      let imagePrompt = prompt;
+      
+      // Check if prompt is generic (e.g., "generate an image", "create image", "show me")
+      const genericImageKeywords = [
+        'generate an image', 'create an image', 'make an image', 
+        'show me an image', 'draw', 'illustrate', 'visualize',
+        'generate image', 'create image', 'make image', 'show me',
+        'draw something', 'illustrate this', 'visualize this',
+        'another image', 'more image', 'one more', 'again'
+      ];
+      const promptLower = prompt.toLowerCase().trim();
+      
+      // More flexible detection: check if prompt CONTAINS keywords (not just starts with)
+      // and is relatively short (< 50 chars), indicating it's not a specific description
+      // Also detect continuation words like "another", "more", "again" (even with typos like "AAANOTHER")
+      const hasContinuationWord = /\b(another|more|again|one more)\b/i.test(promptLower);
+      const hasGenericKeyword = genericImageKeywords.some(kw => promptLower.includes(kw));
+      const hasSpecificDescriptor = promptLower.includes(' of a ') || promptLower.includes(' with a ') || promptLower.includes(' that has ');
+      
+      const isGenericRequest = (hasGenericKeyword || hasContinuationWord) && 
+                                prompt.length < 50 && 
+                                !hasSpecificDescriptor;
+      
+      // If generic request and we have chat history, add conversation context
+      if (isGenericRequest && effectiveUserId) {
+        console.log(`🧠 Generic image request detected - fetching conversation context...`);
+        try {
+          // Get conversation service (contains local memory)
+          const { getConversationService } = require('./services/conversationService');
+          const conversationService = getConversationService();
+          
+          // Get last 5 conversation turns for context
+          const recentTurns = conversationService.getRecentConversations(effectiveUserId, 5);
+          
+          if (recentTurns.length > 0) {
+            // Build context from recent conversation (reverse to get chronological order)
+            const contextSummary = recentTurns
+              .reverse() // Most recent last
+              .map((turn: any) => `User: ${turn.userPrompt}\nAI: ${turn.aiResponse}`)
+              .join('\n\n');
+            
+            // Enhance prompt with conversation context
+            imagePrompt = `Based on this recent conversation:
+
+${contextSummary}
+
+Create a detailed, visually compelling image that captures the essence and context of what we've been discussing. Make it relevant to the conversation topic.`;
+            
+            console.log(`✨ Enhanced image prompt with ${recentTurns.length} conversation turns from memory`);
+            console.log(`📝 Context-aware prompt: "${imagePrompt.substring(0, 150)}..."`);
+          } else if (conversationHistory && conversationHistory.length > 0) {
+            // Fallback: Use conversation history from the request (current chat session)
+            console.log(`💬 Using ${conversationHistory.length} messages from current chat session`);
+            const contextSummary = conversationHistory
+              .slice(-5) // Last 5 messages
+              .map((msg: any) => `${msg.role === 'user' ? 'User' : 'AI'}: ${msg.content}`)
+              .join('\n\n');
+            
+            imagePrompt = `Based on this recent conversation:
+
+${contextSummary}
+
+Create a detailed, visually compelling image that captures the essence and context of what we've been discussing. Make it relevant to the conversation topic.`;
+            
+            console.log(`✨ Enhanced image prompt with ${conversationHistory.length} messages from request`);
+            console.log(`📝 Context-aware prompt: "${imagePrompt.substring(0, 150)}..."`);
+          } else {
+            // No conversation history - provide a helpful default prompt
+            console.log(`⚠️ No conversation history found, creating a beautiful surprise image`);
+            imagePrompt = `Create a beautiful, high-quality, visually stunning image. Since no specific subject was mentioned, create something inspiring and artistic. Think: nature scenery, abstract art, or a serene landscape. Make it photorealistic and captivating.`;
+          }
+        } catch (error) {
+          console.warn('⚠️ Could not fetch conversation context, using default prompt:', error);
+          imagePrompt = `Create a beautiful, high-quality, visually stunning image. Since no specific subject was mentioned, create something inspiring and artistic. Think: nature scenery, abstract art, or a serene landscape. Make it photorealistic and captivating.`;
+        }
+      } else if (!isGenericRequest) {
+        console.log(`🎯 Specific image request detected - using exact prompt: "${prompt}"`);
+      }
+      
+      console.log(`🎨 Generating image...`);
+      
+      // Retry logic: Gemini sometimes returns text instead of image
+      let retryCount = 0;
+      const maxRetries = 2;
+      let response;
+      let imageGenerated = false;
+      
+      while (!imageGenerated && retryCount <= maxRetries) {
+        if (retryCount > 0) {
+          console.log(`🔄 Retry ${retryCount}/${maxRetries} - Gemini returned text instead of image, retrying...`);
+          // Make prompt more explicit for retry
+          imagePrompt = imagePrompt + `\n\nIMPORTANT: Generate an actual IMAGE, not text. Do not describe the image, CREATE it.`;
+        }
+        
+        response = await ai.models.generateContent({
+          model: imageModel,
+          contents: [imagePrompt],
+        });
+
+        const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+        
+        // Check if we got an actual image
+        const hasImage = parts.some(part => 
+          (part as any).inlineData || (part as any).fileData
+        );
+        
+        if (hasImage) {
+          imageGenerated = true;
+          console.log(`✅ Image generated successfully on attempt ${retryCount + 1}`);
+        } else {
+          retryCount++;
+          if (retryCount <= maxRetries) {
+            console.log(`⚠️ Attempt ${retryCount} returned text only, retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second before retry
+          } else {
+            console.error(`❌ Failed to generate image after ${maxRetries + 1} attempts`);
+          }
+        }
+      }
 
       const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
       let imageBase64: string | null = null;
@@ -533,10 +692,171 @@ ${prompt}
         console.error(`❌ No image data found in response!`);
       }
       
+      // � Upload image to Firebase Storage and store URL
+      if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
+        setImmediate(async () => {
+          try {
+            const hybridMemoryService = getHybridMemoryService();
+            let firebaseImageUrl: string;
+            
+            // Upload to Firebase Storage
+            if (imageBase64) {
+              console.log('📤 Uploading base64 image to Firebase Storage...');
+              firebaseImageUrl = await firebaseStorageService.uploadImage(
+                effectiveUserId,
+                effectiveChatId || 'default',
+                imageBase64,
+                prompt
+              );
+            } else if (imageUri) {
+              // For imageUri, we need to download and re-upload
+              console.log('📤 Uploading URI image to Firebase Storage...');
+              // For now, store the URI directly (Gemini-hosted)
+              firebaseImageUrl = imageUri;
+            } else {
+              console.error('❌ No image data to upload');
+              return;
+            }
+            
+            console.log(`✅ Image uploaded to Firebase: ${firebaseImageUrl}`);
+            
+            // Store Firebase URL in conversation history (NOT base64)
+            const conversationTurn = hybridMemoryService.storeConversationTurn(
+              effectiveUserId,
+              prompt, // User's prompt
+              altText || 'Image generated', // AI's response (alt text or placeholder)
+              effectiveChatId,
+              { url: firebaseImageUrl, prompt: prompt } // � Store Firebase URL
+            );
+            
+            console.log(`🖼️ [BACKGROUND] Stored image URL in conversation history`);
+          } catch (memoryError) {
+            console.error('❌ [BACKGROUND] Failed to upload/store image:', memoryError);
+          }
+        });
+      }
+      
       return res.json({ success: true, imageBase64, imageUri, altText, raw: response });
     }
 
-    // TEXT
+    // TEXT - with intelligent image generation detection
+    // Detect if user wants to generate an image
+    const imageRequestKeywords = [
+      'generate image', 'generate an image', 'create image', 'create an image', 
+      'make image', 'make an image', 'draw image', 'draw an image',
+      'picture of', 'photo of', 'illustration of', 'image of',
+      'show me', 'can you draw', 'can you create', 'can you generate'
+    ];
+    
+    const promptLower = prompt.toLowerCase();
+    const isImageRequest = imageRequestKeywords.some(keyword => promptLower.includes(keyword));
+    const isImagineCommand = prompt.trim().startsWith('/imagine');
+    
+    // If it's an image request, generate image directly without asking for confirmation
+    if ((isImageRequest || isImagineCommand) && type !== 'image') {
+      console.log('🎨 Detected image generation request - processing directly!');
+      
+      // Extract the image description from the prompt
+      let imagePrompt = prompt;
+      
+      // Remove common prefixes to get the actual description
+      const prefixes = ['generate image of', 'generate an image of', 'create image of', 'create an image of', 
+                       'make image of', 'make an image of', 'draw image of', 'draw an image of',
+                       'picture of', 'photo of', 'illustration of', 'image of'];
+      
+      for (const prefix of prefixes) {
+        if (promptLower.startsWith(prefix)) {
+          imagePrompt = prompt.substring(prefix.length).trim();
+          break;
+        }
+      }
+      
+      // Remove /imagine command if present
+      const imagineMatch = imagePrompt.match(/^\/imagine\s+(.+)$/i);
+      if (imagineMatch) {
+        imagePrompt = imagineMatch[1].trim();
+      }
+      
+      console.log(`🖼️ Generating image with prompt: "${imagePrompt}"`);
+      
+      // Generate the image
+      let imageBase64: string | null = null;
+      let firebaseImageUrl: string | null = null;
+      
+      try {
+        const imgResult = await ai.models.generateContent({
+          model: imageModel,
+          contents: [imagePrompt]
+        });
+
+        const imagePart = imgResult?.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
+        if (imagePart?.inlineData?.data) {
+          imageBase64 = imagePart.inlineData.data;
+          console.log(`✅ Image generated (${imageBase64.length} base64 chars)`);
+
+          // Upload to Firebase Storage
+          if (effectiveUserId && imageBase64) {
+            try {
+              firebaseImageUrl = await firebaseStorageService.uploadImage(
+                effectiveUserId,
+                effectiveChatId || 'default',
+                imageBase64,
+                imagePrompt
+              );
+              console.log(`✅ Image uploaded to Firebase Storage: ${firebaseImageUrl}`);
+            } catch (uploadError) {
+              console.warn('⚠️ Failed to upload to Firebase Storage:', uploadError);
+            }
+          }
+        }
+        
+        const responseText = `Here's your image: ${imagePrompt}`;
+        
+        // 💾 Store conversation turn with image data in local memory
+        if (useMemory && effectiveUserId && firebaseImageUrl) {
+          setImmediate(() => {
+            try {
+              const hybridMemoryService = getHybridMemoryService();
+              
+              // Store with image data
+              hybridMemoryService.storeConversationTurn(
+                effectiveUserId,
+                prompt,
+                responseText,
+                effectiveChatId,
+                { 
+                  url: firebaseImageUrl!, 
+                  prompt: imagePrompt 
+                }
+              );
+              
+              console.log(`💾 [BACKGROUND] Stored image turn in memory (Firebase URL: ${firebaseImageUrl})`);
+            } catch (memoryError) {
+              console.error('❌ [BACKGROUND] Failed to store image turn:', memoryError);
+            }
+          });
+        }
+        
+        // Return image with a brief description
+        return res.json({ 
+          success: true, 
+          text: responseText,
+          imageBase64, 
+          imageUri: firebaseImageUrl,
+          altText: imagePrompt,
+          isImageGeneration: true
+        });
+      } catch (imgError) {
+        console.error('❌ Image generation failed:', imgError);
+        // Fall back to text response
+        return res.json({
+          success: true,
+          text: `I apologize, but I encountered an error while generating the image. ${(imgError as Error).message}`
+        });
+      }
+    }
+
+    // Normal text response
     const response = await ai.models.generateContent({ 
       model: textModel, 
       contents: [enhancedPrompt] 
@@ -607,11 +927,28 @@ ${prompt}
  * POST /api/process-document
  * body: { fileBase64?: string, filePath?: string, mimeType?: string, prompt?: string }
  */
-app.post('/api/process-document', async (req, res) => {
+app.post('/api/process-document', rateLimitMiddleware('general'), async (req, res) => {
   if (!ai) return res.status(500).json({ error: 'Gemini process-document client not initialized' });
 
   try {
-    const { fileBase64, filePath, mimeType: clientMime, prompt } = req.body;
+    const { fileBase64, filePath, mimeType: clientMime, prompt, userId } = req.body;
+    
+    // 🔒 Validate inputs
+    if (prompt && !SecurityValidator.validatePrompt(prompt)) {
+      logSecurityEvent('Invalid document processing prompt', { userId });
+      return res.status(400).json({ error: 'Invalid prompt format' });
+    }
+    
+    if (userId && !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in document processing', { userId });
+      return res.status(400).json({ error: 'Invalid user ID format' });
+    }
+    
+    // Validate base64 document size if provided
+    if (fileBase64 && !SecurityValidator.validateBase64Image(fileBase64)) {
+      logSecurityEvent('Document size exceeds limit', { userId });
+      return res.status(400).json({ error: 'Document size exceeds 10MB limit' });
+    }
 
     let base64Data = '';
     let mimeType = clientMime || 'application/pdf';
@@ -665,7 +1002,7 @@ app.post('/api/process-document', async (req, res) => {
     const extractedText = response?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
 
     // Optionally store the processed document in memory
-    const { storeInMemory = false, userId } = req.body;
+    const { storeInMemory = false } = req.body;
     if (storeInMemory && extractedText && userId) {
       try {
         // Extract topics from document content using AI
@@ -717,18 +1054,28 @@ app.post('/api/process-document', async (req, res) => {
 
 /**
  * POST /api/edit-image
- * body: { imageBase64: string, editPrompt: string, model?: string }
+ * body: { imageBase64: string, editPrompt: string, model?: string, userId?: string }
  */
-app.post('/api/edit-image', async (req, res) => {
+app.post('/api/edit-image', rateLimitMiddleware('image'), async (req, res) => {
   if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
 
   try {
-    const { imageBase64, editPrompt, model } = req.body;
-    if (!imageBase64 || typeof imageBase64 !== 'string') {
-      return res.status(400).json({ error: 'imageBase64 (string) is required' });
+    const { imageBase64, editPrompt, model, userId } = req.body;
+    
+    // 🔒 Validate inputs
+    if (!editPrompt || typeof editPrompt !== 'string' || !SecurityValidator.validatePrompt(editPrompt)) {
+      logSecurityEvent('Invalid image edit prompt', { userId });
+      return res.status(400).json({ error: 'Invalid or missing editPrompt' });
     }
-    if (!editPrompt || typeof editPrompt !== 'string') {
-      return res.status(400).json({ error: 'editPrompt (string) is required' });
+    
+    if (!imageBase64 || typeof imageBase64 !== 'string' || !SecurityValidator.validateBase64Image(imageBase64)) {
+      logSecurityEvent('Invalid image in edit-image', { userId });
+      return res.status(400).json({ error: 'Invalid or oversized imageBase64 (max 10MB)' });
+    }
+    
+    if (userId && !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in edit-image', { userId });
+      return res.status(400).json({ error: 'Invalid user ID format' });
     }
 
     // NOTE: Gemini's image models (gemini-2.5-flash-image) only GENERATE new images, they don't edit existing ones
@@ -756,7 +1103,7 @@ app.post('/api/edit-image', async (req, res) => {
     const imageDescription = descriptionResponse?.candidates?.[0]?.content?.parts?.[0]?.text || 'an image';
 
     // Step 2: Generate a new image based on the description + edit instruction
-    const imageModel = model ?? 'gemini-2.5-flash-image';
+    const imageModel = model ?? 'gemini-2.0-flash-exp'; // ✅ Gemini 2.0 with image generation
     const combinedPrompt = `Based on this description: "${imageDescription}"
 
 Apply this edit: ${editPrompt}
@@ -789,21 +1136,33 @@ Generate a new image that matches the original description but with the requeste
 
 /**
  * POST /api/edit-image-with-mask
- * body: { imageBase64: string, maskBase64: string, editPrompt: string, model?: string }
+ * body: { imageBase64: string, maskBase64: string, editPrompt: string, model?: string, userId?: string }
  */
-app.post('/api/edit-image-with-mask', async (req, res) => {
+app.post('/api/edit-image-with-mask', rateLimitMiddleware('image'), async (req, res) => {
   if (!ai) return res.status(500).json({ error: 'Gemini client not initialized' });
 
   try {
-    const { imageBase64, maskBase64, editPrompt, model } = req.body;
-    if (!imageBase64 || typeof imageBase64 !== 'string') {
-      return res.status(400).json({ error: 'imageBase64 (string) is required' });
+    const { imageBase64, maskBase64, editPrompt, model, userId } = req.body;
+    
+    // 🔒 Validate inputs
+    if (!editPrompt || typeof editPrompt !== 'string' || !SecurityValidator.validatePrompt(editPrompt)) {
+      logSecurityEvent('Invalid mask edit prompt', { userId });
+      return res.status(400).json({ error: 'Invalid or missing editPrompt' });
     }
-    if (!maskBase64 || typeof maskBase64 !== 'string') {
-      return res.status(400).json({ error: 'maskBase64 (string) is required' });
+    
+    if (!imageBase64 || typeof imageBase64 !== 'string' || !SecurityValidator.validateBase64Image(imageBase64)) {
+      logSecurityEvent('Invalid image in edit-image-with-mask', { userId });
+      return res.status(400).json({ error: 'Invalid or oversized imageBase64 (max 10MB)' });
     }
-    if (!editPrompt || typeof editPrompt !== 'string') {
-      return res.status(400).json({ error: 'editPrompt (string) is required' });
+    
+    if (!maskBase64 || typeof maskBase64 !== 'string' || !SecurityValidator.validateBase64Image(maskBase64)) {
+      logSecurityEvent('Invalid mask in edit-image-with-mask', { userId });
+      return res.status(400).json({ error: 'Invalid or oversized maskBase64 (max 10MB)' });
+    }
+    
+    if (userId && !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in edit-image-with-mask', { userId });
+      return res.status(400).json({ error: 'Invalid user ID format' });
     }
 
     // NOTE: Gemini doesn't support true mask-based editing like Stable Diffusion inpainting
@@ -851,7 +1210,7 @@ app.post('/api/edit-image-with-mask', async (req, res) => {
     const maskDescription = maskResponse?.candidates?.[0]?.content?.parts?.[0]?.text || 'marked areas';
 
     // Step 3: Generate new image with edits applied to masked areas
-    const imageModel = model ?? 'gemini-2.5-flash-image';
+    const imageModel = model ?? 'gemini-2.0-flash-exp'; // ✅ Gemini 2.0 with image generation
     const combinedPrompt = `Original image: ${imageDescription}
 
 Masked areas to edit: ${maskDescription}
@@ -888,12 +1247,19 @@ Generate a new version of the image with the edit applied ONLY to the masked are
  * POST /api/store-memory
  * body: { content: string, type?: 'conversation' | 'document' | 'note', source?: string, userId?: string, tags?: string[] }
  */
-app.post('/api/store-memory', async (req, res) => {
+app.post('/api/store-memory', rateLimitMiddleware('general'), async (req, res) => {
   try {
     const { content, type = 'note', source, userId, tags } = req.body;
 
-    if (!content || typeof content !== 'string') {
-      return res.status(400).json({ error: 'content (string) is required' });
+    // 🔒 Validate inputs
+    if (!userId || !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in store-memory', { userId });
+      return res.status(400).json({ error: 'Valid userId is required' });
+    }
+    
+    if (!content || typeof content !== 'string' || content.length > 50000) {
+      logSecurityEvent('Invalid memory content', { userId });
+      return res.status(400).json({ error: 'Valid content (string, max 50KB) is required' });
     }
 
     const embeddingService = getEmbeddingService();
@@ -931,12 +1297,29 @@ app.post('/api/store-memory', async (req, res) => {
  * POST /api/store-memories
  * body: { memories: Array<{ content: string, type?: string, source?: string, userId?: string, tags?: string[] }> }
  */
-app.post('/api/store-memories', async (req, res) => {
+app.post('/api/store-memories', rateLimitMiddleware('general'), async (req, res) => {
   try {
     const { memories } = req.body;
 
     if (!Array.isArray(memories) || memories.length === 0) {
       return res.status(400).json({ error: 'memories (array) is required and cannot be empty' });
+    }
+    
+    // 🔒 Validate batch size
+    if (memories.length > 50) {
+      logSecurityEvent('Too many memories in batch', { count: memories.length });
+      return res.status(400).json({ error: 'Maximum 50 memories per batch' });
+    }
+    
+    // Validate each memory
+    for (const memory of memories) {
+      if (!memory.content || typeof memory.content !== 'string' || memory.content.length > 50000) {
+        return res.status(400).json({ error: 'Each memory must have valid content (max 50KB)' });
+      }
+      if (memory.userId && !SecurityValidator.validateUserId(memory.userId)) {
+        logSecurityEvent('Invalid userId in batch memory', { userId: memory.userId });
+        return res.status(400).json({ error: 'Invalid userId in memory batch' });
+      }
     }
 
     const embeddingService = getEmbeddingService();
@@ -974,12 +1357,23 @@ app.post('/api/store-memories', async (req, res) => {
  * POST /api/search-memory
  * body: { query: string, topK?: number, threshold?: number, userId?: string, type?: string }
  */
-app.post('/api/search-memory', async (req, res) => {
+app.post('/api/search-memory', rateLimitMiddleware('general'), async (req, res) => {
   try {
     const { query, topK = 5, threshold = 0.7, userId, type } = req.body;
 
-    if (!query || typeof query !== 'string') {
-      return res.status(400).json({ error: 'query (string) is required' });
+    // 🔒 Validate inputs
+    if (!query || typeof query !== 'string' || !SecurityValidator.validatePrompt(query)) {
+      logSecurityEvent('Invalid search query', { userId });
+      return res.status(400).json({ error: 'Valid query (string, max 10000 chars) is required' });
+    }
+    
+    if (userId && !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in search-memory', { userId });
+      return res.status(400).json({ error: 'Invalid userId format' });
+    }
+    
+    if (topK && (typeof topK !== 'number' || topK < 1 || topK > 100)) {
+      return res.status(400).json({ error: 'topK must be a number between 1 and 100' });
     }
 
     const embeddingService = getEmbeddingService();
@@ -1015,12 +1409,19 @@ app.post('/api/search-memory', async (req, res) => {
  * DELETE /api/memory/:id
  * Delete a specific memory by ID
  */
-app.delete('/api/memory/:id', async (req, res) => {
+app.delete('/api/memory/:id', rateLimitMiddleware('general'), async (req, res) => {
   try {
     const { id } = req.params;
+    const { userId } = req.body; // Should be provided for ownership validation
 
-    if (!id) {
-      return res.status(400).json({ error: 'Memory ID is required' });
+    if (!id || typeof id !== 'string') {
+      return res.status(400).json({ error: 'Valid Memory ID is required' });
+    }
+    
+    // 🔒 Validate userId for ownership check
+    if (userId && !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in delete-memory', { userId, memoryId: id });
+      return res.status(400).json({ error: 'Invalid userId format' });
     }
 
     const embeddingService = getEmbeddingService();
@@ -1066,13 +1467,20 @@ app.get('/api/memory-stats', async (req, res) => {
 /**
  * GET /api/debug-memories/:userId
  * Debug endpoint to list all memories for a user
+ * ⚠️ DISABLED IN PRODUCTION
  */
 app.get('/api/debug-memories/:userId', async (req, res) => {
+  // 🔒 Disable in production
+  if (process.env.NODE_ENV === 'production') {
+    logSecurityEvent('Debug endpoint accessed in production', { endpoint: 'debug-memories' });
+    return res.status(403).json({ error: 'Debug endpoints are disabled in production' });
+  }
+  
   try {
     const { userId } = req.params;
 
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
+    if (!userId || !SecurityValidator.validateUserId(userId)) {
+      return res.status(400).json({ error: 'Valid User ID is required' });
     }
 
     const embeddingService = getEmbeddingService();
@@ -1110,13 +1518,20 @@ app.get('/api/debug-memories/:userId', async (req, res) => {
 /**
  * GET /api/hybrid-memory-debug/:userId
  * Debug endpoint for hybrid memory system
+ * ⚠️ DISABLED IN PRODUCTION
  */
 app.get('/api/hybrid-memory-debug/:userId', async (req, res) => {
+  // 🔒 Disable in production
+  if (process.env.NODE_ENV === 'production') {
+    logSecurityEvent('Debug endpoint accessed in production', { endpoint: 'hybrid-memory-debug' });
+    return res.status(403).json({ error: 'Debug endpoints are disabled in production' });
+  }
+  
   try {
     const { userId } = req.params;
 
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
+    if (!userId || !SecurityValidator.validateUserId(userId)) {
+      return res.status(400).json({ error: 'Valid User ID is required' });
     }
 
     const hybridMemoryService = getHybridMemoryService();
@@ -1212,12 +1627,25 @@ app.post('/api/hybrid-memory-search', async (req, res) => {
  * POST /api/set-user-profile
  * Manually set user profile for testing
  */
-app.post('/api/set-user-profile', async (req, res) => {
+app.post('/api/set-user-profile', rateLimitMiddleware('general'), async (req, res) => {
   try {
     const { userId, name, role, interests, preferences, background } = req.body;
 
-    if (!userId) {
-      return res.status(400).json({ success: false, error: 'userId is required' });
+    // 🔒 Validate userId
+    if (!userId || !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in set-user-profile', { userId });
+      return res.status(400).json({ success: false, error: 'Valid userId is required' });
+    }
+    
+    // Validate text fields length
+    if (name && (typeof name !== 'string' || name.length > 200)) {
+      return res.status(400).json({ success: false, error: 'Name must be a string (max 200 chars)' });
+    }
+    if (role && (typeof role !== 'string' || role.length > 200)) {
+      return res.status(400).json({ success: false, error: 'Role must be a string (max 200 chars)' });
+    }
+    if (background && (typeof background !== 'string' || background.length > 5000)) {
+      return res.status(400).json({ success: false, error: 'Background must be a string (max 5000 chars)' });
     }
 
     const profileData: any = {};
@@ -1247,9 +1675,16 @@ app.post('/api/set-user-profile', async (req, res) => {
  * GET /api/get-user-profile/:userId
  * Get user profile
  */
-app.get('/api/get-user-profile/:userId', async (req, res) => {
+app.get('/api/get-user-profile/:userId', rateLimitMiddleware('general'), async (req, res) => {
   try {
     const { userId } = req.params;
+    
+    // 🔒 Validate userId
+    if (!SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in get-user-profile', { userId });
+      return res.status(400).json({ success: false, error: 'Invalid userId format' });
+    }
+    
     const profile = userProfileService.getUserProfile(userId);
 
     if (!profile) {
@@ -1276,8 +1711,15 @@ app.get('/api/get-user-profile/:userId', async (req, res) => {
 /**
  * GET /api/performance-stats
  * Get performance optimization statistics
+ * ⚠️ DISABLED IN PRODUCTION
  */
 app.get('/api/performance-stats', (req, res) => {
+  // 🔒 Disable in production
+  if (process.env.NODE_ENV === 'production') {
+    logSecurityEvent('Debug endpoint accessed in production', { endpoint: 'performance-stats' });
+    return res.status(403).json({ error: 'Debug endpoints are disabled in production' });
+  }
+  
   try {
     const stats = getPerformanceStats();
     return res.json({
@@ -1310,21 +1752,24 @@ app.get('/api/performance-stats', (req, res) => {
 /**
  * POST /api/end-chat
  * Called when user switches chats - persists current chat to Pinecone
- * This is where we do the heavy lifting (embeddings, vector storage)
+ * 🎯 OPTIMIZED: Respects cooldown to avoid spam uploads
  */
-app.post('/api/end-chat', async (req, res) => {
+app.post('/api/end-chat', rateLimitMiddleware('general'), async (req, res) => {
   try {
-    const { userId, chatId } = req.body;
+    const { userId, chatId, force } = req.body;
 
-    if (!userId) {
-      return res.status(400).json({ success: false, error: 'userId is required' });
+    // 🔒 Validate inputs
+    if (!userId || !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in end-chat', { userId });
+      return res.status(400).json({ success: false, error: 'Valid userId is required' });
     }
 
-    if (!chatId) {
-      return res.status(400).json({ success: false, error: 'chatId is required' });
+    if (!chatId || !SecurityValidator.validateChatId(chatId)) {
+      logSecurityEvent('Invalid chatId in end-chat', { userId, chatId });
+      return res.status(400).json({ success: false, error: 'Valid chatId is required' });
     }
 
-    console.log(`\n🔚 End chat request - User: ${userId}, Chat: ${chatId}`);
+    console.log(`\n🔚 End chat request - User: ${userId}, Chat: ${chatId}, Force: ${force || false}`);
 
     // Persist this chat session to Pinecone in the background
     setImmediate(async () => {
@@ -1332,10 +1777,14 @@ app.post('/api/end-chat', async (req, res) => {
         console.log(`💾 [BACKGROUND] Persisting chat ${chatId} to Pinecone...`);
         const hybridMemoryService = getHybridMemoryService();
         
-        // This will summarize and upload to Pinecone
-        await hybridMemoryService.persistChatSession(userId, chatId);
+        // Upload with optional force flag (bypasses cooldown)
+        if (force) {
+          await hybridMemoryService.forceUpload(userId, chatId);
+        } else {
+          await hybridMemoryService.persistChatSession(userId, chatId);
+        }
         
-        console.log(`✅ [BACKGROUND] Chat ${chatId} persisted to Pinecone successfully\n`);
+        console.log(`✅ [BACKGROUND] Chat ${chatId} processed\n`);
       } catch (error) {
         console.error(`❌ [BACKGROUND] Failed to persist chat ${chatId}:`, error);
       }
@@ -1352,6 +1801,208 @@ app.post('/api/end-chat', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: err?.message ?? String(err)
+    });
+  }
+});
+
+/**
+ * POST /api/save-all-chats
+ * Force upload all active chats (for sign-out or critical save)
+ * 🎯 OPTIMIZED: Bypasses cooldown for critical events
+ */
+app.post('/api/save-all-chats', rateLimitMiddleware('general'), async (req, res) => {
+  try {
+    const { userId, chatIds } = req.body;
+
+    // 🔒 Validate inputs
+    if (!userId || !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in save-all-chats', { userId });
+      return res.status(400).json({ success: false, error: 'Valid userId is required' });
+    }
+
+    if (!chatIds || !Array.isArray(chatIds) || chatIds.length === 0) {
+      logSecurityEvent('Invalid chatIds in save-all-chats', { userId });
+      return res.status(400).json({ success: false, error: 'chatIds array is required' });
+    }
+    
+    if (chatIds.length > 100) {
+      logSecurityEvent('Too many chatIds in save-all-chats', { userId, count: chatIds.length });
+      return res.status(400).json({ success: false, error: 'Maximum 100 chats per request' });
+    }
+    
+    // Validate each chatId format
+    for (const chatId of chatIds) {
+      if (!SecurityValidator.validateChatId(chatId)) {
+        logSecurityEvent('Invalid chatId format in batch save', { userId, chatId });
+        return res.status(400).json({ success: false, error: `Invalid chatId format: ${chatId}` });
+      }
+    }
+
+    console.log(`\n💾 Force save all chats - User: ${userId}, Chats: ${chatIds.length}`);
+
+    // Save all chats in background (with force flag)
+    setImmediate(async () => {
+      try {
+        const hybridMemoryService = getHybridMemoryService();
+        
+        for (const chatId of chatIds) {
+          try {
+            await hybridMemoryService.forceUpload(userId, chatId);
+          } catch (error) {
+            console.error(`❌ Failed to save chat ${chatId}:`, error);
+            // Continue with other chats
+          }
+        }
+        
+        console.log(`✅ [BACKGROUND] All chats saved successfully\n`);
+      } catch (error) {
+        console.error(`❌ [BACKGROUND] Error in batch save:`, error);
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: `${chatIds.length} chats will be saved in background`
+    });
+
+  } catch (err: any) {
+    console.error('save-all-chats error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message ?? String(err)
+    });
+  }
+});
+
+/**
+ * GET /api/chats
+ * Smart two-tier chat loading strategy:
+ * 1. First load from local memory (instant) - recent chats
+ * 2. Then check Pinecone (background) - older history
+ * 3. Return in ascending order (oldest first)
+ * Query params: userId (required), source (optional: 'local', 'pinecone', or 'all')
+ */
+app.get('/api/chats', rateLimitMiddleware('general'), async (req, res) => {
+  try {
+    const userId = req.query.userId as string;
+    const source = (req.query.source as string) || 'local'; // Default to local for speed
+
+    // 🔒 Validate userId
+    if (!userId || !SecurityValidator.validateUserId(userId)) {
+      logSecurityEvent('Invalid userId in get-chats', { userId });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Valid userId query parameter is required' 
+      });
+    }
+
+    console.log(`\n📚 Fetching chat history for user: ${userId} (source: ${source})`);
+
+    const hybridMemoryService = getHybridMemoryService();
+    const embeddingService = getEmbeddingService();
+    const allChats: any[] = [];
+
+    // STEP 1: Load from LOCAL MEMORY (instant - no network delay)
+    if (source === 'local' || source === 'all') {
+      console.log('   ⚡ Loading from local memory (instant)...');
+      const conversationService = (hybridMemoryService as any).conversationService;
+      const recentTurns = conversationService.getRecentConversations(userId, 100);
+      
+      // Group conversations by chatId
+      const chatGroups = new Map<string, any>();
+      
+      recentTurns.forEach((turn: any) => {
+        const chatId = turn.chatId || 'default';
+        
+        if (!chatGroups.has(chatId)) {
+          chatGroups.set(chatId, {
+            id: chatId,
+            title: turn.userPrompt.substring(0, 50) + (turn.userPrompt.length > 50 ? '...' : ''),
+            timestamp: new Date(turn.timestamp).toISOString(),
+            userId: userId,
+            messages: [],
+            source: 'local' // Mark source for debugging
+          });
+        }
+        
+        const chat = chatGroups.get(chatId);
+        chat.messages.push(
+          {
+            role: 'user',
+            content: turn.userPrompt,
+            timestamp: new Date(turn.timestamp).toISOString()
+          },
+          {
+            role: 'assistant',
+            content: turn.aiResponse,
+            timestamp: new Date(turn.timestamp).toISOString()
+          }
+        );
+      });
+
+      const localChats = Array.from(chatGroups.values());
+      allChats.push(...localChats);
+      console.log(`   ✅ Found ${localChats.length} local chat sessions (${recentTurns.length} turns)`);
+    }
+
+    // STEP 2: Load from PINECONE (slower - only if requested or no local data)
+    if (source === 'pinecone' || (source === 'all' && allChats.length === 0)) {
+      console.log('   🔍 Checking Pinecone for older history...');
+      try {
+        // Use new PineconeStorageService to get properly structured chat history
+        const { getPineconeStorageService } = require('./services/pineconeStorageService');
+        const pineconeStorage = getPineconeStorageService();
+        
+        // Get user's chats from Pinecone (same structure as local memory)
+        const storedChats = await pineconeStorage.getUserChats(userId, 200);
+        
+        // Convert to API response format
+        const pineconeChats = storedChats.map((chat: any) => ({
+          id: chat.chatId,
+          title: chat.title,
+          timestamp: new Date(chat.createdAt).toISOString(),
+          userId: userId,
+          messages: chat.messages.map((msg: any) => ({
+            role: msg.role,
+            content: msg.content,
+            timestamp: new Date(msg.timestamp).toISOString()
+          })),
+          source: 'pinecone' // Mark source
+        }));
+
+        allChats.push(...pineconeChats);
+        console.log(`   ✅ Found ${pineconeChats.length} chat sessions in Pinecone (${storedChats.reduce((sum: number, c: any) => sum + c.messages.length, 0)} messages)`);
+      } catch (pineconeError) {
+        console.warn('   ⚠️ Pinecone query failed (non-critical):', pineconeError);
+        // Don't fail the whole request if Pinecone is down
+      }
+    }
+
+    // STEP 3: Sort by timestamp (ascending order - oldest first)
+    allChats.sort((a, b) => {
+      const timeA = new Date(a.timestamp).getTime();
+      const timeB = new Date(b.timestamp).getTime();
+      return timeA - timeB; // Ascending order
+    });
+
+    console.log(`✅ Total: ${allChats.length} chat sessions loaded for user ${userId}\n`);
+
+    return res.json({
+      success: true,
+      data: allChats,
+      message: `Retrieved ${allChats.length} chats`,
+      sources: {
+        local: allChats.filter(c => c.source === 'local').length,
+        pinecone: allChats.filter(c => c.source === 'pinecone').length
+      }
+    });
+
+  } catch (err: any) {
+    console.error('❌ Error fetching chats:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message ?? String(err),
+      data: [] // Return empty array on error
     });
   }
 });

@@ -27,7 +27,7 @@ const initialChats: Chat[] = [
   },
 ];
 
-export function useChats() {
+export function useChats(user?: { id: string } | null) {
   const [chatState, setChatState] = useState<ChatState>({
     chats: initialChats,
     // --- FIX IS HERE ---
@@ -51,7 +51,7 @@ export function useChats() {
       // 🎯 OPTIMIZATION: Persist previous active chat before creating new one
       if (prev.activeChat && prev.activeChat.messages.length > 0) {
         const previousChatId = `initial-${prev.activeChat.id}`;
-        const userId = 'anoop123'; // TODO: Get from auth context
+        const userId = user?.id || 'anoop123'; // ✅ FIXED: Use authenticated user
         
         // Call endChat API in background (don't block UI)
         apiService.endChat({ userId, chatId: previousChatId })
@@ -143,7 +143,7 @@ export function useChats() {
       // 🎯 OPTIMIZATION: Persist previous chat to Pinecone when switching
       if (prev.activeChat && prev.activeChat.id !== chat?.id) {
         const previousChatId = `initial-${prev.activeChat.id}`;
-        const userId = 'anoop123'; // TODO: Get from auth context
+        const userId = user?.id || 'anoop123'; // ✅ FIXED: Use authenticated user
         
         // Call endChat API in background (don't block UI)
         apiService.endChat({ userId, chatId: previousChatId })
