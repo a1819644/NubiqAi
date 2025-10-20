@@ -208,7 +208,7 @@ import { Toaster } from "sonner";
 import { toast } from "sonner";
 import { useDarkMode } from "./hooks/useDarkMode";
 import { useAuth } from "./hooks/useAuth";
-import { ChatHistory, ChatMessage, NavigationSection, User } from "./types";
+import { ChatHistory, NavigationSection } from "./types";
 
 export default function App() {
   const { isDarkMode, toggleDarkMode } = useDarkMode();
@@ -255,6 +255,24 @@ export default function App() {
     });
   }, [chats.length]); // Run when the number of chats changes
 
+  // Ensure activeChat always points at a chat in the current list
+  useEffect(() => {
+    if (chats.length === 0) {
+      setActiveChat((prev) => (prev && prev.id.startsWith('initial-') ? prev : createInitialChat()));
+      return;
+    }
+
+    setActiveChat((prev) => {
+      if (prev) {
+        const existing = chats.find((chat) => chat.id === prev.id);
+        if (existing) {
+          return existing;
+        }
+      }
+      return chats[0];
+    });
+  }, [chats]);
+
   // 💾 Auto-save chats to localStorage whenever they change
   // But strip large base64 images to avoid quota exceeded errors
   useEffect(() => {
@@ -263,23 +281,27 @@ export default function App() {
       
       try {
         // Strip base64 images from attachments to save space
+        // But preserve Firebase URLs so they can be rehydrated on next load
         const chatsForStorage = chats.map(chat => ({
           ...chat,
           messages: chat.messages.map(msg => ({
             ...msg,
             attachments: msg.attachments?.map(att => {
-              // Keep only non-base64 attachments (URLs, file names, etc)
-              // Remove data:image/... base64 to save localStorage space
+              // Keep Firebase URLs for rehydration
+              if (typeof att === 'string' && (att.startsWith('https://firebasestorage.googleapis.com/') || att.includes('.firebasestorage.app'))) {
+                return att; // Keep Firebase URLs
+              }
+              // Remove base64 images to save space (will be loaded from IndexedDB)
               if (typeof att === 'string' && att.startsWith('data:image')) {
-                return '__image_removed__'; // Placeholder
+                return undefined; // Remove base64, will be rehydrated from IndexedDB
               }
               return att;
-            })
+            }).filter(att => att !== undefined) // Remove undefined placeholders
           }))
         }));
         
         localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
-        console.log(`💾 Auto-saved ${chats.length} chat(s) to localStorage (images excluded)`);
+        console.log(`💾 Auto-saved ${chats.length} chat(s) to localStorage (Firebase URLs preserved)`);
       } catch (error: any) {
         if (error.name === 'QuotaExceededError') {
           console.error('❌ localStorage quota exceeded! Clearing old data...');
@@ -324,15 +346,29 @@ export default function App() {
             ...chat,
             createdAt: new Date(chat.createdAt),
             updatedAt: new Date(chat.updatedAt),
-            messages: chat.messages.map((msg: any) => ({
-              ...msg,
-              timestamp: new Date(msg.timestamp)
-            }))
-          }));
+            messages: chat.messages
+              .map((msg: any) => ({
+                ...msg,
+                timestamp: new Date(msg.timestamp)
+              }))
+              .sort((a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime()) // Sort messages chronologically (oldest first)
+          })).sort((a: any, b: any) => b.createdAt.getTime() - a.createdAt.getTime()); // Sort chats newest first
           
           if (restoredChats.length > 0) {
-            setChats(restoredChats);
-            console.log(`✅ PHASE 1: Loaded ${restoredChats.length} chat(s) from localStorage`);
+            // Ensure every message has a stable unique id
+            for (const chat of restoredChats) {
+              chat.messages = chat.messages.map((m: any, i: number) => {
+                const ts = typeof m.timestamp === 'string' ? Date.parse(m.timestamp) : (m.timestamp?.getTime ? m.timestamp.getTime() : Date.now());
+                return {
+                  ...m,
+                  id: m.id ?? `${chat.id}-${i}-${ts}`,
+                };
+              });
+            }
+            // 🖼️ Rehydrate images from Firebase URLs + IndexedDB cache
+            const rehydratedChats = await imageRehydrationService.rehydrateChats(restoredChats, user.id);
+            setChats(rehydratedChats);
+            console.log(`✅ PHASE 1: Loaded ${rehydratedChats.length} chat(s) from localStorage with image rehydration (sorted newest first)`);
           }
         } catch (error) {
           console.error('Failed to parse saved chats:', error);
@@ -350,16 +386,30 @@ export default function App() {
             ...chat,
             createdAt: new Date(chat.timestamp),
             updatedAt: new Date(chat.timestamp),
-            messages: chat.messages.map((msg: any) => ({
-              ...msg,
-              timestamp: new Date(msg.timestamp)
-            }))
+            messages: chat.messages
+              .map((msg: any) => ({
+                ...msg,
+                timestamp: new Date(msg.timestamp)
+              }))
+              .sort((a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime()) // Sort messages chronologically (oldest first)
           }));
           
+          // Ensure every message has a stable unique id
+          for (const chat of serverChats) {
+            chat.messages = chat.messages.map((m: any, i: number) => {
+              const ts = typeof m.timestamp === 'string' ? Date.parse(m.timestamp) : (m.timestamp?.getTime ? m.timestamp.getTime() : Date.now());
+              return {
+                ...m,
+                id: m.id ?? `${chat.id}-${i}-${ts}`,
+              };
+            });
+          }
           // 🖼️ Rehydrate images from Firebase URLs back into IndexedDB
           const rehydratedChats = await imageRehydrationService.rehydrateChats(serverChats, user.id);
+          // Sort newest first
+          rehydratedChats.sort((a: any, b: any) => b.createdAt.getTime() - a.createdAt.getTime());
           setChats(rehydratedChats);
-          console.log(`✅ PHASE 2: Loaded ${rehydratedChats.length} chat(s) from server memory with image rehydration`);
+          console.log(`✅ PHASE 2: Loaded ${rehydratedChats.length} chat(s) from server memory with image rehydration (sorted newest first)`);
           
           // Update localStorage with server data
           try {
@@ -367,9 +417,17 @@ export default function App() {
               ...chat,
               messages: chat.messages.map((msg: any) => ({
                 ...msg,
-                attachments: msg.attachments?.map((att: any) => 
-                  typeof att === 'string' && att.startsWith('data:image') ? '__image_removed__' : att
-                )
+                attachments: msg.attachments?.map((att: any) => {
+                  // Keep Firebase URLs for rehydration
+                  if (typeof att === 'string' && (att.startsWith('https://firebasestorage.googleapis.com/') || att.includes('.firebasestorage.app'))) {
+                    return att;
+                  }
+                  // Remove base64 images to save space
+                  if (typeof att === 'string' && att.startsWith('data:image')) {
+                    return undefined;
+                  }
+                  return att;
+                }).filter((att: any) => att !== undefined)
               }))
             }));
             localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
@@ -394,13 +452,25 @@ export default function App() {
                 ...chat,
                 createdAt: new Date(chat.timestamp),
                 updatedAt: new Date(chat.timestamp),
-                messages: chat.messages.map((msg: any) => ({
-                  ...msg,
-                  timestamp: new Date(msg.timestamp)
-                }))
+                messages: chat.messages
+                  .map((msg: any) => ({
+                    ...msg,
+                    timestamp: new Date(msg.timestamp)
+                  }))
+                  .sort((a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime()) // Sort messages chronologically (oldest first)
               }));
               
               // 🖼️ Rehydrate images from Firebase URLs
+              // Ensure every message has a stable unique id
+              for (const chat of olderChats) {
+                chat.messages = chat.messages.map((m: any, i: number) => {
+                  const ts = typeof m.timestamp === 'string' ? Date.parse(m.timestamp) : (m.timestamp?.getTime ? m.timestamp.getTime() : Date.now());
+                  return {
+                    ...m,
+                    id: m.id ?? `${chat.id}-${i}-${ts}`,
+                  };
+                });
+              }
               const rehydratedOlderChats = await imageRehydrationService.rehydrateChats(olderChats, user.id);
               
               // Merge with existing chats (avoid duplicates)
@@ -410,9 +480,9 @@ export default function App() {
                 
                 if (newChats.length > 0) {
                   console.log(`✅ PHASE 3: Added ${newChats.length} older chat(s) from Pinecone with image rehydration`);
-                  // Sort by timestamp (ascending - oldest first)
+                  // Sort by timestamp (descending - newest first)
                   return [...prevChats, ...newChats].sort((a, b) => 
-                    a.createdAt.getTime() - b.createdAt.getTime()
+                    b.createdAt.getTime() - a.createdAt.getTime()
                   );
                 }
                 return prevChats;
@@ -441,7 +511,7 @@ export default function App() {
 
   const handleSignOut = async () => {
     try {
-      // 💾 Save to localStorage before signing out (strip images to avoid quota)
+      // 💾 Save to localStorage before signing out (preserve Firebase URLs)
       if (user && chats.length > 0) {
         const localStorageKey = `chat_history_${user.id}`;
         try {
@@ -449,13 +519,21 @@ export default function App() {
             ...chat,
             messages: chat.messages.map((msg: any) => ({
               ...msg,
-              attachments: msg.attachments?.map((att: any) => 
-                typeof att === 'string' && att.startsWith('data:image') ? '__image_removed__' : att
-              )
+              attachments: msg.attachments?.map((att: any) => {
+                // Keep Firebase URLs for rehydration
+                if (typeof att === 'string' && (att.startsWith('https://firebasestorage.googleapis.com/') || att.includes('.firebasestorage.app'))) {
+                  return att;
+                }
+                // Remove base64 images to save space
+                if (typeof att === 'string' && att.startsWith('data:image')) {
+                  return undefined;
+                }
+                return att;
+              }).filter((att: any) => att !== undefined)
             }))
           }));
           localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
-          console.log(`💾 Saved ${chats.length} chats to localStorage (images excluded)`);
+          console.log(`💾 Saved ${chats.length} chats to localStorage (Firebase URLs preserved)`);
         } catch (e) {
           console.warn('⚠️ Could not save to localStorage on sign out');
         }

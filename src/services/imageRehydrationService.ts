@@ -115,23 +115,43 @@ export class ImageRehydrationService {
 
         // If it's a Firebase URL, download and cache it
         if (this.isFirebaseStorageUrl(url)) {
-          const imageId = this.extractImageIdFromUrl(url);
-          if (!imageId) {
-            console.warn('⚠️ Could not extract image ID from URL:', url);
-            return attachment;
-          }
-
-          // Add to queue for background processing
-          this.rehydrationQueue.add(`${imageId}:${url}:${userId}:${chatId}`);
-
-          // Try to get from cache immediately (non-blocking)
+          // Try to find by Firebase URL first (most reliable)
           try {
-            const cached = await imageStorageService.getImage(imageId);
+            const cached = await imageStorageService.getImageByFirebaseUrl(url);
             if (cached) {
+              console.log(`✅ Found image in IndexedDB by Firebase URL`);
               return typeof attachment === 'string' ? cached.imageData : { ...attachment, url: cached.imageData };
             }
-          } catch {
-            // Cache miss, will be downloaded in background
+          } catch (error) {
+            console.warn('⚠️ Failed to search by Firebase URL:', error);
+          }
+
+          // If not found, try to extract ID from URL and search by ID
+          const imageId = this.extractImageIdFromUrl(url);
+          if (imageId) {
+            try {
+              const cached = await imageStorageService.getImage(imageId);
+              if (cached) {
+                console.log(`✅ Found image in IndexedDB by ID: ${imageId}`);
+                return typeof attachment === 'string' ? cached.imageData : { ...attachment, url: cached.imageData };
+              }
+            } catch {
+              // Cache miss
+            }
+          }
+
+          // Not in cache - download immediately (don't just queue)
+          const downloadId = imageId || url.split('/').pop()?.split('?')[0] || `download-${Date.now()}`;
+          console.log(`📥 Image not in cache, downloading from Firebase: ${downloadId}`);
+          
+          try {
+            const base64Data = await this.downloadAndCache(url, downloadId, userId, chatId);
+            // Return the downloaded base64 data
+            return typeof attachment === 'string' ? base64Data : { ...attachment, url: base64Data };
+          } catch (error) {
+            console.error(`❌ Failed to download image ${downloadId}:`, error);
+            // Return original URL as fallback (will be displayed by UI with onError handler)
+            return attachment;
           }
         }
 

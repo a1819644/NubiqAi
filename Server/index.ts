@@ -2,6 +2,7 @@
 require("dotenv").config();
 import express from "express";
 import cors from "cors";
+import type { CorsOptions } from "cors";
 import { GoogleGenAI } from "@google/genai";
 import type { Part } from "@google/genai";
 import {
@@ -13,6 +14,7 @@ import { getHybridMemoryService } from "./services/hybridMemoryService";
 import { extractDocumentTopics } from "./services/conversationService";
 import * as userProfileService from "./services/userProfileService";
 import { firebaseStorageService } from "./services/firebaseStorageService";
+import { extractTextFromDocument } from "./services/documentExtractionService";
 import {
   rateLimitMiddleware,
   validateUserIdMiddleware,
@@ -70,19 +72,72 @@ try {
 const app = express();
 const port = Number(process.env.PORT ?? 8000);
 
-app.use(
-  cors({
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:3001",
-      "http://127.0.0.1:3000",
-      "http://127.0.0.1:3001",
-    ],
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  })
-);
+// Helper function to check if origin is localhost or private LAN
+function isAllowedOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    const hostname = url.hostname;
+    
+    // Allow localhost and 127.0.0.1
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return true;
+    }
+    
+    // Allow private IP ranges: 10.x.x.x, 192.168.x.x, 172.16-31.x.x
+    if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+// CORS with origin validation function - wrapping callback in try-catch to prevent crashes
+const corsOptions: CorsOptions = {
+  origin: (origin, callback) => {
+    try {
+      // Allow requests with no origin like mobile apps or curl
+      if (!origin) {
+        console.log(`[CORS] No origin header present -> allowed`);
+        return callback(null, true);
+      }
+      if (isAllowedOrigin(origin)) {
+        console.log(`[CORS] Origin allowed: ${origin}`);
+        return callback(null, true);
+      }
+      // Optionally allow additional origins via env (comma-separated)
+      const extra = (process.env.CORS_ORIGINS || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (extra.includes(origin)) {
+        console.log(`[CORS] Origin allowed via env CORS_ORIGINS: ${origin}`);
+        return callback(null, true);
+      }
+      console.warn(`[CORS] Origin blocked: ${origin}`);
+      // Don't throw Error, just return false
+      return callback(null, false);
+    } catch (err) {
+      console.error(`[CORS] Exception in origin check:`, err);
+      return callback(null, false);
+    }
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+// Generic OPTIONS handler to satisfy preflight without wildcard path
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ limit: "100mb", extended: true }));
 
@@ -150,6 +205,7 @@ app.post("/api/ask-ai", rateLimitMiddleware("general"), async (req, res) => {
       messageCount,
       userName,
       conversationHistory,
+      conversationSummary,
     } = req.body;
     console.log("📦 Request body parsed successfully");
 
@@ -602,17 +658,22 @@ ${prompt}
         .map((msg: any) => `${msg.role.toUpperCase()}: ${msg.content}`)
         .join("\n\n");
 
-      enhancedPrompt = `CONVERSATION SO FAR IN THIS CHAT:
+      // Add summary of older messages if provided
+      const summarySection = conversationSummary 
+        ? `\n\n📚 OLDER MESSAGES CONTEXT:\n${conversationSummary}\n${"=".repeat(60)}\n\n`
+        : '';
+
+      enhancedPrompt = `${summarySection}RECENT CONVERSATION (LAST ${conversationHistory.length} MESSAGES):
 ${"=".repeat(60)}
 ${historyText}
 ${"=".repeat(60)}
 
 ${enhancedPrompt}
 
-Remember: The conversation above is from the CURRENT chat session. Use it to maintain context and continuity in your responses.`;
+Remember: The conversation above is from the CURRENT chat session. ${conversationSummary ? 'Earlier messages are summarized above for context. ' : ''}Use it to maintain context and continuity in your responses.`;
 
       console.log(
-        `💬 Added ${conversationHistory.length} messages from current conversation for context`
+        `💬 Added ${conversationHistory.length} recent messages${conversationSummary ? ' + older message summary' : ''} from current conversation for context`
       );
     } else if (!enhancedPrompt.includes("SYSTEM:")) {
       // If no memory context and no conversation history, add base structured prompt
@@ -850,8 +911,8 @@ Create a detailed, visually compelling image that captures the essence and conte
       }
 
       const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
-      let imageBase64: string | null = null;
-      let imageUri: string | null = null;
+  let imageBase64: string | null = null;
+  let imageUri: string | null = null;
       let altText: string | null = null;
 
       console.log(`📦 Received ${parts.length} parts from Gemini`);
@@ -882,11 +943,26 @@ Create a detailed, visually compelling image that captures the essence and conte
         );
       } else if (imageUri) {
         console.log(`✅ Image generated successfully - URI: ${imageUri}`);
+        // Attempt to download the URI to base64 immediately so the client can render it
+        try {
+          console.log("📥 Downloading image from URI to base64 for immediate display...");
+          const resp = await fetch(imageUri);
+          if (resp.ok) {
+            const arrayBuf = await resp.arrayBuffer();
+            const buffer = Buffer.from(arrayBuf);
+            imageBase64 = buffer.toString('base64');
+            console.log(`✅ Converted URI image to base64 (${imageBase64.length} chars)`);
+          } else {
+            console.warn(`⚠️ Failed to fetch image URI (status ${resp.status}) - will return URI only`);
+          }
+        } catch (e) {
+          console.warn("⚠️ Could not convert image URI to base64:", e);
+        }
       } else {
         console.error(`❌ No image data found in response!`);
       }
 
-      // � Upload image to Firebase Storage and store URL
+      // Upload image to Firebase Storage and store URL
       if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
         setImmediate(async () => {
           try {
@@ -903,10 +979,28 @@ Create a detailed, visually compelling image that captures the essence and conte
                 prompt
               );
             } else if (imageUri) {
-              // For imageUri, we need to download and re-upload
-              console.log("📤 Uploading URI image to Firebase Storage...");
-              // For now, store the URI directly (Gemini-hosted)
-              firebaseImageUrl = imageUri;
+              // Fallback: try downloading the URI and uploading it
+              console.log("📤 Attempting to download URI and upload to Firebase Storage...");
+              try {
+                const resp = await fetch(imageUri);
+                if (resp.ok) {
+                  const arrayBuf = await resp.arrayBuffer();
+                  const buffer = Buffer.from(arrayBuf);
+                  const b64 = buffer.toString('base64');
+                  firebaseImageUrl = await firebaseStorageService.uploadImage(
+                    effectiveUserId,
+                    effectiveChatId || "default",
+                    b64,
+                    prompt
+                  );
+                } else {
+                  console.warn(`⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`);
+                  firebaseImageUrl = imageUri;
+                }
+              } catch (err) {
+                console.warn("⚠️ Error downloading URI for upload, storing URI as-is:", err);
+                firebaseImageUrl = imageUri;
+              }
             } else {
               console.error("❌ No image data to upload");
               return;
@@ -941,236 +1035,46 @@ Create a detailed, visually compelling image that captures the essence and conte
         imageUri,
         altText,
         raw: response,
+        metadata: {
+          tokens: response?.usageMetadata?.totalTokenCount || 0,
+          candidatesTokenCount: response?.usageMetadata?.candidatesTokenCount || 0,
+          promptTokenCount: response?.usageMetadata?.promptTokenCount || 0,
+        },
       });
     }
 
-    // TEXT - with intelligent image generation detection
-    // Detect if user wants to generate an image
-    const imageRequestKeywords = [
-      "generate image",
-      "generate an image",
-      "create image",
-      "create an image",
-      "make image",
-      "make an image",
-      "draw image",
-      "draw an image",
-      "picture of",
-      "photo of",
-      "illustration of",
-      "image of",
-      "show me",
-      "can you draw",
-      "can you create",
-      "can you generate",
-    ];
-
-    const promptLower = prompt.toLowerCase();
-    const isImageRequest = imageRequestKeywords.some((keyword) =>
-      promptLower.includes(keyword)
-    );
-    const isImagineCommand = prompt.trim().startsWith("/imagine");
-
-    // If it's an image request, generate image directly without asking for confirmation
-    if ((isImageRequest || isImagineCommand) && type !== "image") {
-      console.log(
-        "🎨 Detected image generation request - processing directly!"
-      );
-
-      // Extract the image description from the prompt
-      let imagePrompt = prompt;
-
-      // Remove common prefixes to get the actual description
-      const prefixes = [
-        "/imagine",
-        "generate image of",
-        "generate an image of",
-        "create image of",
-        "create an image of",
-        "make image of",
-        "make an image of",
-        "draw image of",
-        "draw an image of",
-        "picture of",
-        "photo of",
-        "illustration of",
-        "image of",
-      ];
-
-      for (const prefix of prefixes) {
-        if (promptLower.startsWith(prefix)) {
-          imagePrompt = prompt.substring(prefix.length).trim();
-          break;
-        }
-      }
-
-      // 🧠 NEW: Apply the same context-aware logic as explicit image generation
-      const genericImageKeywords = [
-        "image",
-        "picture",
-        "photo",
-        "drawing",
-        "illustration",
-        "logo",
-        "a thing",
-        "something",
-        "anything",
-      ];
-      const isGenericPrompt =
-        imagePrompt.length < 15 &&
-        genericImageKeywords.some((kw) => imagePrompt.includes(kw));
-
-      if (isGenericPrompt && effectiveUserId) {
-        console.log(
-          `🧠 Generic image prompt "${imagePrompt}" detected - fetching conversation context...`
-        );
-        try {
-          const {
-            getConversationService,
-          } = require("./services/conversationService");
-          const conversationService = getConversationService();
-          const recentTurns = conversationService.getRecentConversations(
-            effectiveUserId,
-            5
-          );
-
-          if (recentTurns.length > 0) {
-            const contextSummary = recentTurns
-              .reverse()
-              .map(
-                (turn: any) =>
-                  `User: ${turn.userPrompt}\nAI: ${turn.aiResponse}`
-              )
-              .join("\n\n");
-
-            imagePrompt = `Based on this recent conversation:
-
-${contextSummary}
-
-The user then requested an image with the prompt: "${imagePrompt}".
-
-Create a detailed, visually compelling image that captures the essence of the user's request in the context of the conversation.`;
-            console.log(
-              `✨ Enhanced image prompt with ${recentTurns.length} conversation turns.`
-            );
-          }
-        } catch (error) {
-          console.warn(
-            "⚠️ Could not fetch conversation context for implicit image generation:",
-            error
-          );
-        }
-      }
-
-      console.log(`🖼️ Generating image with prompt: "${imagePrompt}"`);
-
-      // Generate the image
-      let imageBase64: string | null = null;
-      let firebaseImageUrl: string | null = null;
-
-      try {
-        const imgResult = await ai.models.generateContent({
-          model: imageModel,
-          contents: [imagePrompt],
-        });
-
-        const imagePart = imgResult?.candidates?.[0]?.content?.parts?.find(
-          (p: any) => p.inlineData
-        );
-        if (imagePart?.inlineData?.data) {
-          imageBase64 = imagePart.inlineData.data;
-          console.log(
-            `✅ Image generated (${imageBase64.length} base64 chars)`
-          );
-
-          // Upload to Firebase Storage
-          if (effectiveUserId && imageBase64) {
-            try {
-              firebaseImageUrl = await firebaseStorageService.uploadImage(
-                effectiveUserId,
-                effectiveChatId || "default",
-                imageBase64,
-                imagePrompt
-              );
-              console.log(
-                `✅ Image uploaded to Firebase Storage: ${firebaseImageUrl}`
-              );
-            } catch (uploadError) {
-              console.warn(
-                "⚠️ Failed to upload to Firebase Storage:",
-                uploadError
-              );
-            }
-          }
-        }
-
-        const responseText = `Here's your image: ${imagePrompt}`;
-
-        // 💾 Store conversation turn with image data in local memory
-        if (useMemory && effectiveUserId && firebaseImageUrl) {
-          setImmediate(() => {
-            try {
-              const hybridMemoryService = getHybridMemoryService();
-
-              // Store with image data
-              hybridMemoryService.storeConversationTurn(
-                effectiveUserId,
-                prompt,
-                responseText,
-                effectiveChatId,
-                {
-                  url: firebaseImageUrl!,
-                  prompt: imagePrompt,
-                }
-              );
-
-              console.log(
-                `💾 [BACKGROUND] Stored image turn in memory (Firebase URL: ${firebaseImageUrl})`
-              );
-            } catch (memoryError) {
-              console.error(
-                "❌ [BACKGROUND] Failed to store image turn:",
-                memoryError
-              );
-            }
-          });
-        }
-
-        // Return image with a brief description
-        return res.json({
-          success: true,
-          text: responseText,
-          imageBase64,
-          imageUri: firebaseImageUrl,
-          altText: imagePrompt,
-          isImageGeneration: true,
-        });
-      } catch (imgError) {
-        console.error("❌ Image generation failed:", imgError);
-        // Fall back to text response
-        return res.json({
-          success: true,
-          text: `I apologize, but I encountered an error while generating the image. ${(imgError as Error).message}`,
-        });
-      }
-    }
+    // ✅ REMOVED: Automatic image generation detection
+    // Frontend now handles image generation explicitly via type='image' parameter
+    // This prevents unwanted interception of text messages containing image keywords
 
     // Normal text response
+    const startTime = Date.now();
     const response = await ai.models.generateContent({
       model: textModel,
       contents: [enhancedPrompt],
     });
+    const duration = (Date.now() - startTime) / 1000; // Convert to seconds
     const parts = response?.candidates?.[0]?.content?.parts ?? [];
     const text = parts.map((p: any) => p.text ?? "").join("");
 
     console.log(
-      `✅ AI response generated (${text.length} chars) - sending to user immediately...`
+      `✅ AI response generated (${text.length} chars) in ${duration.toFixed(2)}s - sending to user immediately...`
     );
 
     // ═══════════════════════════════════════════════════════════════════════
     // 🚀 CRITICAL: Send response to user FIRST (don't make them wait!)
     // ═══════════════════════════════════════════════════════════════════════
-    const jsonResponse = { success: true, text, raw: response };
+    const jsonResponse = { 
+      success: true, 
+      text, 
+      raw: response,
+      metadata: {
+        tokens: response?.usageMetadata?.totalTokenCount || 0,
+        candidatesTokenCount: response?.usageMetadata?.candidatesTokenCount || 0,
+        promptTokenCount: response?.usageMetadata?.promptTokenCount || 0,
+        duration: parseFloat(duration.toFixed(2)),
+      },
+    };
     res.json(jsonResponse);
     console.log(`📤 Response sent to user!`);
 
@@ -1255,26 +1159,69 @@ app.post(
       } = req.body;
 
       // 🔒 Validate inputs
-      if (prompt && !SecurityValidator.validatePrompt(prompt)) {
-        logSecurityEvent("Invalid document processing prompt", { userId });
-        return res.status(400).json({ error: "Invalid prompt format" });
+      if (prompt) {
+        const promptValidation = SecurityValidator.validatePrompt(prompt);
+        if (!promptValidation.valid) {
+          logSecurityEvent("Invalid document processing prompt", { userId, error: promptValidation.error });
+          return res.status(400).json({ error: promptValidation.error || "Invalid prompt format" });
+        }
       }
 
-      if (userId && !SecurityValidator.validateUserId(userId)) {
-        logSecurityEvent("Invalid userId in document processing", { userId });
-        return res.status(400).json({ error: "Invalid user ID format" });
+      if (userId) {
+        const userIdValidation = SecurityValidator.validateUserId(userId);
+        if (!userIdValidation.valid) {
+          logSecurityEvent("Invalid userId in document processing", { userId, error: userIdValidation.error });
+          return res.status(400).json({ error: userIdValidation.error || "Invalid user ID format" });
+        }
       }
 
-      // Validate base64 document size if provided
-      if (fileBase64 && !SecurityValidator.validateBase64Image(fileBase64)) {
-        logSecurityEvent("Document size exceeds limit", { userId });
-        return res
-          .status(400)
-          .json({ error: "Document size exceeds 10MB limit" });
+      // Validate base64 document size if provided (10MB limit)
+      if (fileBase64) {
+        const base64Validation = SecurityValidator.validateBase64Image(fileBase64);
+        if (!base64Validation.valid) {
+          logSecurityEvent("Document base64 validation failed", { userId, error: base64Validation.error });
+          return res.status(400).json({ error: base64Validation.error || "Document size exceeds 10MB limit" });
+        }
       }
 
       let base64Data = "";
       let mimeType = clientMime || "application/pdf";
+
+      // Define supported file types
+      // Note: Gemini API only supports PDF for document uploads via Files API
+      // Other formats (DOCX, DOC, XLSX) must be extracted locally first
+      const SUPPORTED_MIME_TYPES = [
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/json",
+        "application/pdf", // ✅ Gemini supports PDF
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx - local extraction
+        "application/msword", // .doc - local extraction
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx - local extraction
+      ];
+
+      const GEMINI_SUPPORTED_TYPES = [
+        "application/pdf", // Only PDF is supported by Gemini Files API
+      ];
+
+      const LOCAL_EXTRACTION_TYPES = [
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+        "application/msword", // .doc
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+        "text/csv",
+      ];
+
+      const SUPPORTED_EXTENSIONS: Record<string, string> = {
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".csv": "text/csv",
+        ".json": "application/json",
+      };
 
       if (fileBase64 && typeof fileBase64 === "string") {
         base64Data = fileBase64;
@@ -1283,16 +1230,27 @@ app.post(
         const buffer = fs.readFileSync(filePath);
         base64Data = buffer.toString("base64");
         if (!clientMime) {
-          if (filePath.endsWith(".pdf")) mimeType = "application/pdf";
-          else if (filePath.endsWith(".docx"))
-            mimeType =
-              "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-          else if (filePath.endsWith(".txt")) mimeType = "text/plain";
+          const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+          mimeType = SUPPORTED_EXTENSIONS[ext] || "application/pdf";
         }
       } else {
         return res
           .status(400)
           .json({ error: "fileBase64 or filePath is required" });
+      }
+
+      // Check if file type is supported
+      if (!SUPPORTED_MIME_TYPES.includes(mimeType)) {
+        const fileExtension = Object.keys(SUPPORTED_EXTENSIONS).find(
+          ext => SUPPORTED_EXTENSIONS[ext] === mimeType
+        ) || "this file type";
+        
+        console.warn(`Unsupported file type attempted: ${mimeType}`);
+        return res.status(400).json({ 
+          success: false, 
+          error: `We don't have the capability to process ${fileExtension} files yet. Supported formats: PDF, DOCX, DOC, TXT, MD, CSV, JSON, XLSX`,
+          unsupportedType: mimeType
+        });
       }
 
       // Check file size (base64 encoded size estimation)
@@ -1306,6 +1264,7 @@ app.post(
       }
 
       // Use Gemini for document processing
+      const DOC_MODEL = "gemini-2.5-flash";
       const defaultPrompt =
         "Extract all text content from this document. Provide a clean, well-formatted extraction of the text.";
       const userPrompt =
@@ -1313,25 +1272,133 @@ app.post(
           ? prompt.trim()
           : defaultPrompt;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [
-          {
-            parts: [
-              { text: userPrompt },
-              {
-                inlineData: {
-                  data: base64Data,
-                  mimeType: mimeType,
+      let extractedText = "";
+
+      // Fast-path 1: Plain text files can be returned directly
+      if (mimeType === "text/plain" || mimeType === "text/markdown" || mimeType === "application/json" || mimeType === "text/csv") {
+        try {
+          // Clean base64 data - remove any whitespace/newlines that might cause decoding issues
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const textContent = Buffer.from(cleanedBase64, "base64").toString(
+            "utf8"
+          );
+          extractedText = textContent;
+          console.log(`✅ Direct text extraction successful (${mimeType}), length: ${extractedText.length}`);
+        } catch (decodeErr) {
+          console.warn("Failed to decode text base64, falling back to local extraction", decodeErr);
+        }
+      }
+
+      // Fast-path 2: Use local extraction for DOCX, DOC, XLSX (Gemini doesn't support these)
+      if (!extractedText && LOCAL_EXTRACTION_TYPES.includes(mimeType)) {
+        try {
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const buffer = Buffer.from(cleanedBase64, "base64");
+          const local = await extractTextFromDocument(buffer, mimeType);
+          if (local.text && local.text.trim()) {
+            extractedText = local.text;
+            console.log(`✅ Local extraction succeeded via ${local.method} for ${mimeType}`);
+          }
+        } catch (localErr) {
+          console.warn(`Local extraction failed for ${mimeType}, will try Gemini:`, localErr);
+        }
+      }
+
+      // Gemini processing for PDF and other supported types
+      if (!extractedText) {
+        // For PDF, use the Files API to upload then reference via fileData
+        let parts: Part[] = [{ text: userPrompt }];
+
+        if (mimeType === "text/plain") {
+          // If text/plain wasn't decoded above for some reason, send as a text part
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const textContent = Buffer.from(cleanedBase64, "base64").toString(
+            "utf8"
+          );
+          parts.push({ text: `Document content:\n\n${textContent}` });
+        } else if (GEMINI_SUPPORTED_TYPES.includes(mimeType)) {
+          // Only upload to Gemini Files API if the type is supported (PDF)
+          try {
+            const extByMime: Record<string, string> = {
+              "application/pdf": "pdf",
+            };
+            const displayName = `document_${Date.now()}.${
+              extByMime[mimeType] || "bin"
+            }`;
+
+            // Clean base64 before decoding
+            const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+
+            console.log(`📤 Uploading ${mimeType} to Gemini Files API...`);
+            
+            // Use Files API (cast to any to avoid SDK type mismatch across versions)
+            const upload: any = await (ai as any).files.upload({
+              file: {
+                data: Buffer.from(cleanedBase64, "base64"),
+                mimeType,
+              },
+              displayName,
+            } as any);
+
+            if (upload && upload.file && upload.file.uri) {
+              console.log(`✅ File uploaded successfully: ${upload.file.uri}`);
+              parts.push({
+                fileData: {
+                  fileUri: upload.file.uri,
+                  mimeType,
                 },
+              } as any);
+            } else {
+              throw new Error("Files API upload returned no URI");
+            }
+          } catch (uploadErr) {
+            console.error(
+              "Files API upload failed:",
+              uploadErr
+            );
+            // Don't try inlineData - it won't work for unsupported types
+            throw new Error(`Failed to upload ${mimeType} to Gemini. This file type may not be supported.`);
+          }
+        } else {
+          // This shouldn't happen as we check SUPPORTED_MIME_TYPES earlier
+          throw new Error(`Unsupported MIME type for Gemini processing: ${mimeType}`);
+        }
+
+        // Only call Gemini if we have file data to send (PDF)
+        if (parts.length > 1) {
+          console.log(`🤖 Sending to Gemini for AI extraction...`);
+          const response = await ai.models.generateContent({
+            model: DOC_MODEL,
+            contents: [
+              {
+                parts,
               },
             ],
-          },
-        ],
-      });
+          });
 
-      const extractedText =
-        response?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+          extractedText =
+            (response as any)?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+          
+          if (extractedText) {
+            console.log(`✅ Gemini extraction successful, length: ${extractedText.length}`);
+          }
+        }
+      }
+
+      // 🛟 Fallback: local extraction if AI result is empty
+      if (!extractedText || !extractedText.trim()) {
+        try {
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const buffer = Buffer.from(cleanedBase64, "base64");
+          const local = await extractTextFromDocument(buffer, mimeType);
+          if (local.text && local.text.trim()) {
+            extractedText = local.text;
+            console.log(`✅ Fallback local extraction succeeded via ${local.method}`);
+          }
+        } catch (fallbackErr) {
+          console.warn("Local extraction fallback failed:", fallbackErr);
+        }
+      }
 
       // Optionally store the processed document in memory
       const { storeInMemory = false } = req.body;
@@ -1369,7 +1436,7 @@ app.post(
         }
       }
 
-      return res.json({ success: true, extractedText, raw: response });
+  return res.json({ success: true, extractedText });
     } catch (err: any) {
       console.error("process-document error:", err);
 
@@ -1380,7 +1447,7 @@ app.post(
         errorMessage.includes("too large")
       ) {
         errorMessage =
-          "File too large. Please try a smaller file (under 20MB).";
+          "File too large. Please try a smaller file (under 10MB).";
       } else if (
         errorMessage.includes("timeout") ||
         errorMessage.includes("deadline")
@@ -1441,7 +1508,7 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
     // For "editing", we'll use the vision model to analyze the image and generate a new one based on the edit instruction
 
     // Step 1: Use vision model to describe the image
-    const visionModel = "gemini-2.5-flash";
+    const visionModel = "gemini-2.5-flash-image"; // ✅ Gemini 2.5 with vision capabilities
     const descriptionResponse = await ai.models.generateContent({
       model: visionModel,
       contents: [
@@ -1466,7 +1533,7 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
       "an image";
 
     // Step 2: Generate a new image based on the description + edit instruction
-    const imageModel = model ?? "gemini-2.0-flash-exp"; // ✅ Gemini 2.0 with image generation
+  const imageModel = model ?? "gemini-2.5-flash-image"; // ✅ Standardized to match /ask-ai image model
     const combinedPrompt = `Based on this description: "${imageDescription}"
 
 Apply this edit: ${editPrompt}
@@ -1561,7 +1628,7 @@ app.post(
       // For mask-based editing, we'll use vision model to analyze BOTH images and generate a new one
 
       // Step 1: Describe the original image
-      const visionModel = "gemini-2.5-flash";
+      const visionModel = "gemini-2.5-flash-image";
       const descriptionResponse = await ai.models.generateContent({
         model: visionModel,
         contents: [
@@ -1608,7 +1675,7 @@ app.post(
         "marked areas";
 
       // Step 3: Generate new image with edits applied to masked areas
-      const imageModel = model ?? "gemini-2.0-flash-exp"; // ✅ Gemini 2.0 with image generation
+  const imageModel = model ?? "gemini-2.5-flash-image"; // ✅ Standardized to match /ask-ai image model
       const combinedPrompt = `Original image: ${imageDescription}
 
 Masked areas to edit: ${maskDescription}
@@ -2461,16 +2528,25 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
         }
 
         const chat = chatGroups.get(chatId);
+        const baseTimestamp = new Date(turn.timestamp).toISOString();
+
         chat.messages.push(
           {
+            id: `${turn.id}-user`,
             role: "user",
             content: turn.userPrompt,
-            timestamp: new Date(turn.timestamp).toISOString(),
+            timestamp: baseTimestamp,
           },
           {
+            id: `${turn.id}-assistant`,
             role: "assistant",
             content: turn.aiResponse,
-            timestamp: new Date(turn.timestamp).toISOString(),
+            timestamp: baseTimestamp,
+            attachments:
+              turn.hasImage && turn.imageUrl
+                ? [turn.imageUrl]
+                : undefined,
+            imagePrompt: turn.imagePrompt,
           }
         );
       });
@@ -2496,15 +2572,19 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
         const storedChats = await pineconeStorage.getUserChats(userId, 200);
 
         // Convert to API response format
-        const pineconeChats = storedChats.map((chat: any) => ({
+          const pineconeChats = storedChats.map((chat: any) => ({
           id: chat.chatId,
           title: chat.title,
           timestamp: new Date(chat.createdAt).toISOString(),
           userId: userId,
           messages: chat.messages.map((msg: any) => ({
+              id: msg.id,
             role: msg.role,
             content: msg.content,
-            timestamp: new Date(msg.timestamp).toISOString(),
+              timestamp: new Date(msg.timestamp).toISOString(),
+              attachments:
+                msg.hasImage && msg.imageUrl ? [msg.imageUrl] : undefined,
+              imagePrompt: msg.imagePrompt,
           })),
           source: "pinecone", // Mark source
         }));

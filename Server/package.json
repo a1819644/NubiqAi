@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "nodemon index.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clear-history": "ts-node clear-all-history.ts",
+    "clear-pinecone": "ts-node delete-all-pinecone-data.ts"
   },
   "keywords": [],
   "author": "",
@@ -13,17 +15,21 @@
   "dependencies": {
     "@google/genai": "^1.21.0",
     "@pinecone-database/pinecone": "^6.1.2",
+    "ai-dashboard-portal-mockup": "file:..",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "firebase-admin": "^13.5.0",
-    "node-fetch": "^3.3.2"
+    "mammoth": "^1.7.0",
+    "node-fetch": "^3.3.2",
+    "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
     "@types/node": "^24.6.2",
+    "@types/pdf-parse": "^1.1.5",
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"

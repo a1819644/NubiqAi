@@ -207,6 +207,32 @@ class ImageStorageService {
   }
 
   /**
+   * Get an image by its Firebase Storage URL
+   */
+  async getImageByFirebaseUrl(firebaseUrl: string): Promise<CachedImage | null> {
+    await this.init();
+    if (!this.db) return null;
+
+    return new Promise((resolve, reject) => {
+      const transaction = this.db!.transaction([this.storeName], 'readonly');
+      const objectStore = transaction.objectStore(this.storeName);
+      const request = objectStore.getAll();
+
+      request.onsuccess = () => {
+        const images = request.result as CachedImage[];
+        const found = images.find(img => img.firebaseUrl === firebaseUrl);
+        resolve(found || null);
+        
+      };
+
+      request.onerror = () => {
+        console.error('❌ Failed to search by Firebase URL:', request.error);
+        reject(request.error);
+      };
+    });
+  }
+
+  /**
    * Delete an image from IndexedDB
    */
   async deleteImage(id: string): Promise<void> {

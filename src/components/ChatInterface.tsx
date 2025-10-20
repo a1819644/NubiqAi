@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect } from "react";
 import { Send, Paperclip, Mic, Download, Eye, Copy, Check, Square, Pencil } from "lucide-react";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
-import { Badge } from "./ui/badge";
 import { toast } from "sonner";
 import type { ChatHistory as Chat, ChatMessage as Message, User } from "../types"; // UPDATED: Use centralized types
 import { apiService, handleApiError } from "../services/api";
@@ -20,6 +19,106 @@ import { imageStorageService } from "../services/imageStorageService";
 // Using a placeholder for image icon
 const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTIgMkgxNFYxNEgyVjJaIiBzdHJva2U9IiM2NjY2NjYiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIvPgo8cGF0aCBkPSJNMiAxMkw2IDhMOCAxMEwxMiA2TDE0IDhWMTJIMloiIGZpbGw9IiM2NjY2NjYiLz4KPC9zdmc+';
 
+const IMAGE_STOP_WORDS = new Set([
+  "generate",
+  "generating",
+  "create",
+  "creating",
+  "draw",
+  "drawing",
+  "make",
+  "making",
+  "produce",
+  "producing",
+  "render",
+  "rendering",
+  "design",
+  "designing",
+  "show",
+  "showing",
+  "give",
+  "giving",
+  "send",
+  "sending",
+  "want",
+  "needs",
+  "need",
+  "like",
+  "please",
+  "can",
+  "could",
+  "would",
+  "you",
+  "me",
+  "an",
+  "a",
+  "the",
+  "some",
+  "any",
+  "another",
+  "more",
+  "again",
+  "one",
+  "something",
+  "anything",
+  "image",
+  "images",
+  "picture",
+  "pictures",
+  "photo",
+  "photos",
+  "drawing",
+  "drawings",
+  "illustration",
+  "illustrations",
+  "art",
+  "artwork",
+  "sketch",
+  "sketches",
+  "logo",
+  "logos",
+  "icon",
+  "icons",
+  "of",
+  "for",
+  "to",
+]);
+
+const GENERIC_IMAGE_PATTERNS = [
+  /^generate( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^create( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^make( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^draw( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^i (need|want|would like)( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^can you (generate|create|make|draw)( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+];
+
+const analyzeImageIntent = (raw: string) => {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { wantsImage: false, needsDetails: false, isImagineCommand: false };
+  }
+
+  const lower = trimmed.toLowerCase();
+  const isImagineCommand = lower.startsWith('/imagine');
+  const hasImageWord = /(image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)/.test(lower);
+  const hasVerb = /(generate|create|draw|make|produce|design|render|show|give|send|need|want|would like)/.test(lower);
+  const wantsImage = isImagineCommand || (hasImageWord && hasVerb);
+
+  if (!wantsImage) {
+    return { wantsImage: false, needsDetails: false, isImagineCommand };
+  }
+
+  const isGeneric = GENERIC_IMAGE_PATTERNS.some((pattern) => pattern.test(lower));
+
+  const tokens = lower.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const descriptiveTokens = tokens.filter((token) => !IMAGE_STOP_WORDS.has(token));
+  const hasSubject = descriptiveTokens.length > 0;
+  const needsDetails = !isImagineCommand && (isGeneric || !hasSubject);
+
+  return { wantsImage: true, needsDetails, isImagineCommand };
+};
+
 interface ChatInterfaceProps {
   activeChat: Chat | null;
   user: User | null;
@@ -31,24 +130,10 @@ export function ChatInterface({
   user,
   onUpdateChat,
 }: ChatInterfaceProps) {
-  // Small inline helper to show truncated text with Show more/less
-  const ExpandableText = ({ text, maxLength }: { text: string; maxLength: number }) => {
-    const [expanded, setExpanded] = useState(false);
-    if (text.length <= maxLength) return <pre className="whitespace-pre-wrap text-xs">{text}</pre>;
-    return (
-      <div>
-        <pre className="whitespace-pre-wrap text-xs">{expanded ? text : text.slice(0, maxLength) + '...'}</pre>
-        <Button size="sm" variant="ghost" onClick={() => setExpanded((s) => !s)}>
-          {expanded ? 'Show less' : 'Show more'}
-        </Button>
-      </div>
-    );
-  };
   
   const [input, setInput] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
-  const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB
-  const MAX_PREVIEW_LENGTH = 800; // chars before truncation
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
@@ -58,6 +143,8 @@ export function ChatInterface({
   // State for message editing
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editedContent, setEditedContent] = useState<string>("");
+  const [imageStatus, setImageStatus] = useState<Record<string, 'loading' | 'success' | 'error'>>({});
+  const [imageRetryTokens, setImageRetryTokens] = useState<Record<string, number>>({});
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -96,9 +183,15 @@ export function ChatInterface({
             
             if (cachedImage && msg.attachments) {
               // Replace Firebase URL with cached base64 for instant loading
-              const hasFirebaseUrl = msg.attachments.some(att => 
-                typeof att === 'string' && att.startsWith('https://storage.googleapis.com')
-              );
+              const hasFirebaseUrl = msg.attachments.some(att => {
+                if (typeof att !== 'string') return false;
+                // Support multiple storage hostnames and signed URLs
+                return (
+                  att.startsWith('https://firebasestorage.googleapis.com') ||
+                  att.startsWith('https://storage.googleapis.com') ||
+                  att.includes('/o/') // Firebases signed URL pattern
+                );
+              });
               
               if (hasFirebaseUrl) {
                 return {
@@ -156,18 +249,42 @@ export function ChatInterface({
     const files = Array.from(event.target.files || []);
     const accepted: File[] = [];
     const rejected: string[] = [];
+    const unsupported: string[] = [];
+
+    // Define supported file types
+    const SUPPORTED_TYPES = [
+      'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
+      'text/plain', 'text/markdown', 'text/csv',
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/json',
+    ];
 
     for (const f of files) {
+      // Check file type first
+      if (!SUPPORTED_TYPES.includes(f.type)) {
+        unsupported.push(f.name);
+        continue;
+      }
+      
+      // Check file size
       if (f.size > MAX_FILE_SIZE) {
         rejected.push(f.name);
         continue;
       }
+      
       accepted.push(f);
     }
 
     if (accepted.length > 0) {
       setAttachedFiles((prev) => [...prev, ...accepted]);
       toast.success(`${accepted.length} file(s) attached`);
+    }
+
+    if (unsupported.length > 0) {
+      toast.error(`Unsupported file type(s): ${unsupported.join(', ')}\nSupported: PDF, DOCX, DOC, TXT, MD, CSV, JSON, XLSX, Images`);
     }
 
     if (rejected.length > 0) {
@@ -177,6 +294,28 @@ export function ChatInterface({
 
   const removeFile = (index: number) => {
     setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const getAttachmentId = (messageId: string | undefined, timestamp: Date, index: number) => {
+    const baseId = messageId ?? `${timestamp.getTime()}`;
+    return `${baseId}-${index}`;
+  };
+
+  const buildImageSrc = (original: string, attachmentId: string) => {
+    if (original.startsWith('data:')) {
+      return original;
+    }
+    const retryToken = imageRetryTokens[attachmentId];
+    if (!retryToken) {
+      return original;
+    }
+    const separator = original.includes('?') ? '&' : '?';
+    return `${original}${separator}retry=${retryToken}`;
+  };
+
+  const handleRetryImage = (attachmentId: string) => {
+    setImageStatus((prev) => ({ ...prev, [attachmentId]: 'loading' }));
+    setImageRetryTokens((prev) => ({ ...prev, [attachmentId]: Date.now() }));
   };
 
   const startRecording = () => {
@@ -280,20 +419,33 @@ export function ChatInterface({
 
     try {
       // --- LOGIC CONFIRMATION IMAGE---
-      // More precise image generation detection - require explicit image-related phrases
-      const imageKeywords = [
-        'generate image', 'generate an image', 'generate a picture',
-        'create image', 'create an image', 'create a picture',
-        'draw image', 'draw an image', 'draw a picture', 'draw me',
-        'make image', 'make an image', 'make a picture',
-        'gambar', 'buatkan gambar'
-      ];
-      const textLower = text.toLowerCase();
-      const containsImageKeyword = imageKeywords.some(keyword => textLower.includes(keyword));
+      const intent = analyzeImageIntent(text);
+      const shouldHandleNaturalImage = intent.wantsImage && !intent.isImagineCommand && !isImageModeActive && !skipConfirmation;
       const isImagineCommand = text.trim().startsWith('/imagine');
 
-      // 🎨 Direct image generation without confirmation
-      if (containsImageKeyword && !isImagineCommand && !isImageModeActive && !skipConfirmation) {
+      if (shouldHandleNaturalImage) {
+        if (intent.needsDetails) {
+          const clarificationMessage: Message = {
+            id: `clarify-${Date.now()}`,
+            content: 'I can definitely generate something for you! What would you like the image to show?',
+            role: 'assistant',
+            timestamp: new Date(),
+          };
+
+          const chatWithClarification = {
+            ...updatedChat,
+            messages: [...updatedChat.messages, clarificationMessage],
+            updatedAt: new Date(),
+          };
+
+          safeUpdateChat(() => chatWithClarification);
+          setIsLoading(false);
+          controller.abort();
+          abortControllerRef.current = null;
+          toast.info('Tell me what you want the image to depict.');
+          return;
+        }
+
         console.log('🎨 Detected image generation request - processing directly!');
         console.log('🖼️ Generating image with prompt:', text);
         
@@ -313,14 +465,22 @@ export function ChatInterface({
 
         safeUpdateChat(() => chatWithPlaceholder);
 
-        // Build conversation history from current chat for context
-        const history = updatedChat.messages
-          .filter(m => m.role === 'user' || m.role === 'assistant')
-          .slice(-10) // Last 10 messages for context
-          .map(m => ({
-            role: m.role as 'user' | 'assistant',
-            content: m.content
-          }));
+        // Build conversation history from this chat only - limit to last 2 exchanges (4 messages)
+        const contextMessages = updatedChat.messages
+          .slice(0, Math.max(updatedChat.messages.length - 1, 0)) // Exclude the current prompt
+          .filter(m => m.role === 'user' || m.role === 'assistant');
+
+        const historyWindow = contextMessages.slice(-4); // Up to two user/assistant pairs
+        const history = historyWindow.map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content
+        }));
+
+        if (history.length > 0) {
+          console.log(`💡 Image context: Using last ${history.length} message(s) from chat ${targetChatId}`);
+        } else {
+          console.log(`💡 Image context: No prior history in chat ${targetChatId}; using prompt only`);
+        }
 
         // Call backend image generation with user context AND conversation history
         const imgResp = await apiService.generateImage(
@@ -328,7 +488,7 @@ export function ChatInterface({
           user?.id,
           targetChatId,
           user?.name,
-          history // 🎯 Pass conversation context!
+          history.length > 0 ? history : undefined // 🎯 Pass context only when we have prior chat history
         );
 
         console.log('📥 Image generation response:', {
@@ -339,12 +499,13 @@ export function ChatInterface({
 
         if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
           // Store image in IndexedDB for persistence
-          const imageUrl = imgResp.imageUri || imgResp.imageBase64!;
-          const imageId = `${user?.id}_${targetChatId}_${Date.now()}`;
+          const imageUrl = imgResp.imageUri || (imgResp.imageBase64 ? `data:image/png;base64,${imgResp.imageBase64}` : '');
+          // Use the SAME message ID for cache and chat message so preload can map them
+          const messageId = `img-${Date.now()}`;
 
           try {
             await imageStorageService.storeImage(
-              imageId,
+              messageId,
               user?.id || 'anonymous',
               targetChatId,
               imageUrl,
@@ -356,13 +517,17 @@ export function ChatInterface({
             console.warn('⚠️ Failed to cache image in IndexedDB:', cacheError);
           }
 
-          // Create the actual image message
+          // Create the actual image message with metadata
           const imageMessage: Message = {
-            id: `img-${Date.now()}`,
+            id: messageId,
             content: imgResp.altText || text,
             role: 'assistant',
             timestamp: new Date(),
             attachments: [imageUrl],
+            metadata: imgResp.metadata ? {
+              tokens: imgResp.metadata.tokens,
+              duration: imgResp.metadata.duration,
+            } : undefined,
           };
 
           const finalChat = {
@@ -476,6 +641,10 @@ export function ChatInterface({
             role: 'assistant',
             timestamp: new Date(),
             attachments: [imageUrl],
+            metadata: imgResp.metadata ? {
+              tokens: imgResp.metadata.tokens,
+              duration: imgResp.metadata.duration,
+            } : undefined,
           };
 
           console.log('✅ Image message created, updating chat...');
@@ -524,12 +693,41 @@ export function ChatInterface({
         promptPreview: text.substring(0, 50) + (text.length > 50 ? '...' : '')
       });
       console.groupEnd();
+
+      // 📝 Smart conversation history: Last 5 messages + summary of older ones
+      const RECENT_MESSAGE_LIMIT = 5;
+      const totalMessages = targetChatSnapshot.messages.length;
       
-      // 📝 Prepare conversation history (previous messages for context)
-      const conversationHistory = targetChatSnapshot.messages.map(msg => ({
-        role: msg.role,
-        content: msg.content
-      }));
+      let conversationHistory;
+      let conversationSummary = '';
+      
+      if (totalMessages <= RECENT_MESSAGE_LIMIT) {
+        // Short conversation: send all messages
+        conversationHistory = targetChatSnapshot.messages.map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }));
+      } else {
+        // Long conversation: send last 20 + summary of older messages
+        const olderMessages = targetChatSnapshot.messages.slice(0, totalMessages - RECENT_MESSAGE_LIMIT);
+        const recentMessages = targetChatSnapshot.messages.slice(-RECENT_MESSAGE_LIMIT);
+        
+        // Create summary of older messages
+        const olderMessagesPreview = olderMessages
+          .filter(msg => msg.role === 'user' || msg.role === 'assistant')
+          .slice(-10) // Look at last 10 of the older messages for summary
+          .map(msg => `${msg.role === 'user' ? 'User' : 'AI'}: ${msg.content.substring(0, 100)}...`)
+          .join('\n');
+        
+        conversationSummary = `[Earlier conversation summary: ${olderMessages.length} messages from the start of this chat. Most recent older topics: ${olderMessagesPreview}]`;
+        
+        conversationHistory = recentMessages.map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }));
+        
+        console.log(`💡 Optimized context: Sending ${conversationHistory.length} recent messages + summary of ${olderMessages.length} older messages`);
+      }
       
       // Call the backend API with chat-scoped memory
       const response = await apiService.askAI({
@@ -537,7 +735,8 @@ export function ChatInterface({
         image: imageFile,
         chatId: targetChatId,                          // 🎯 NEW! For chat-scoped memory
         messageCount: targetChatSnapshot.messages.length, // 🎯 NEW! Detect new vs continuing chat
-        conversationHistory,                           // 🎯 NEW! Send previous messages for context
+        conversationHistory,                           // 🎯 Last 20 messages
+        conversationSummary,                           // 🎯 Summary of older messages (if any)
         userId: user?.id,                              // 🎯 NEW! Pass actual user ID from auth
         userName: user?.name,                          // 🎯 NEW! Pass user name for auto-profile creation
         useMemory: true
@@ -591,6 +790,10 @@ export function ChatInterface({
             role: "assistant",
             timestamp: new Date(),
             attachments: [imageUrl], // Include the image as attachment
+            metadata: response.metadata ? {
+              tokens: response.metadata.tokens,
+              duration: response.metadata.duration,
+            } : undefined,
           };
 
           const finalChat = {
@@ -615,6 +818,10 @@ export function ChatInterface({
           content: response.text,
           role: "assistant",
           timestamp: new Date(),
+          metadata: response.metadata ? {
+            tokens: response.metadata.tokens,
+            duration: response.metadata.duration,
+          } : undefined,
         };
 
         const finalChat = {
@@ -639,27 +846,10 @@ export function ChatInterface({
         throw new Error('Failed to get AI response');
       }
       
-      // If there are non-image files attached, process them using processDocument
+      // If there are non-image files attached, process them silently in background
       const nonImageFiles = files.filter(f => !f.type.startsWith('image/'));
       for (const file of nonImageFiles) {
-        // create placeholder
-        const placeholder: Message = {
-          id: `proc-${Date.now()}`,
-          content: `Processing file: ${file.name}`,
-          role: 'assistant',
-          timestamp: new Date(),
-          attachments: ['__processing_file__']
-        };
-
-        const withPlaceholder = {
-          ...updatedChat,
-          messages: [...updatedChat.messages, placeholder],
-        };
-
-        // Check if this request is still the active one before updating UI
-        if (abortControllerRef.current !== controller) return;
-
-        safeUpdateChat(() => withPlaceholder);
+        console.log(`📄 Processing document in background: ${file.name}`);
 
         // convert file to base64
         const buffer = await file.arrayBuffer();
@@ -673,59 +863,52 @@ export function ChatInterface({
         try {
           const procResp = await apiService.processDocument({ fileBase64: base64, mimeType: file.type });
           if (procResp.success && procResp.extractedText) {
-            const resultMessage: Message = {
-              id: (Date.now() + 3).toString(),
-              content: `Extracted from ${file.name}:\n\n${procResp.extractedText}`,
-              role: 'assistant',
+            console.log(`✅ Document processed: ${file.name} (${procResp.extractedText.length} characters)`);
+            
+            // Store extracted text in a hidden system message for context
+            // This will be available for future questions but not displayed in UI
+            const contextMessage: Message = {
+              id: `doc-context-${Date.now()}`,
+              content: `[Document: ${file.name}]\n${procResp.extractedText}`,
+              role: 'system', // System messages are used for context but not displayed
               timestamp: new Date(),
+              metadata: {
+                documentName: file.name,
+                documentType: file.type,
+                isDocumentContext: true,
+              } as any,
             };
 
-            const replacedMessages = withPlaceholder.messages
-              .filter(m => !(m.attachments && m.attachments.includes('__processing_file__')))
-              .concat(resultMessage);
+            // Add to chat history silently
+            safeUpdateChat((chat) => ({
+              ...chat,
+              messages: [...chat.messages, contextMessage],
+            }));
 
-            // Check if this request is still the active one before updating UI
-            if (abortControllerRef.current !== controller) return;
-
-            safeUpdateChat((chat) => ({ ...chat, messages: replacedMessages }));
-            // If the request was aborted while we were processing, the controller would be null.
-            // We should stop here to prevent further execution.
-            if (!abortControllerRef.current) {
-              console.log("File processing was stopped by user.");
-              return;
-            }
+            toast.success(`📄 ${file.name} processed and ready for questions`);
           } else {
             throw new Error(procResp.error || 'Document processing failed');
           }
         } catch (err) {
           // Check if the error is due to the request being aborted
           if ((err as Error).name === 'AbortError') {
-            // Don't add an error message to the chat if the user cancelled it.
-            // The handleStopGeneration function will show a toast.
             return;
           }
           const errorMessage = handleApiError(err);
-          // Provide a more helpful message if it's a timeout
+          
+          // Provide user-friendly messages based on error type
           let friendly = `Failed to process ${file.name}: ${errorMessage}`;
-          if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
-            friendly += ' — processing timed out. Try a smaller file (under 4MB), or try again later.';
+          
+          if (errorMessage.includes("don't have the capability")) {
+            friendly = `${errorMessage}`;
+          } else if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
+            friendly += ' — Try a smaller file (under 10MB).';
+          } else if (errorMessage.toLowerCase().includes('too large') || errorMessage.toLowerCase().includes('size')) {
+            friendly = `${file.name} is too large. Please use files under 10MB.`;
           }
 
-          const errorMsg: Message = {
-            id: (Date.now() + 4).toString(),
-            content: friendly,
-            role: 'assistant',
-            timestamp: new Date(),
-          };
-
-          const replacedMessages = withPlaceholder.messages
-            .filter(m => !(m.attachments && m.attachments.includes('__processing_file__')))
-            .concat(errorMsg);
-
-          // Check if this request is still the active one before updating UI
-          if (abortControllerRef.current !== controller) return;
-
-          safeUpdateChat((chat) => ({ ...chat, messages: replacedMessages }));
+          toast.error(friendly);
+          console.error(`❌ Document processing failed:`, err);
         }
       }
     } catch (error) {
@@ -1207,9 +1390,11 @@ export function ChatInterface({
           </div>
         ) : (
           <div className="p-6 space-y-6 max-w-4xl mx-auto">
-            {chat.messages.map((message) => (
+            {chat.messages
+              .filter(message => message.role !== 'system') // Hide system messages (document context)
+              .map((message, messageIndex) => (
               <div
-                key={message.id}
+                key={message.id ?? `${message.timestamp.getTime()}-${message.role}-${messageIndex}`}
                 className={`group flex ${
                   message.role === "user" ? "justify-end" : "justify-start"
                 }`}
@@ -1266,20 +1451,37 @@ export function ChatInterface({
                           {/* Attachment handling */}
                           {message.attachments && message.attachments.length > 0 && editingMessageId !== message.id && (
                             <div className="mt-2 space-y-1">
-                              {message.attachments.map((file, idx) => (
-                                <React.Fragment key={idx}>
+                              {message.attachments.map((file, idx) => {
+                                const attachmentId = getAttachmentId(message.id, message.timestamp, idx);
+                                const status = imageStatus[attachmentId] ?? 'loading';
+                                return (
+                                  <React.Fragment key={`${message.id}:${idx}:${typeof file === 'string' ? file.slice(0, 24) : 'file'}`}>
                                   {typeof file === 'string' && file === '__generating_image__' ? (
                                     <div className="w-64 h-40 bg-gray-100 rounded-md animate-pulse flex items-center justify-center">
                                       <div className="text-sm text-muted-foreground">Generating image...</div>
                                     </div>
-                                  ) : typeof file === 'string' && file.startsWith('data:image') ? (
+                                  ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.includes('.firebasestorage.app')) ? (
                                     <div className="flex flex-col gap-2">
-                                      <img
-                                        src={file}
-                                        alt={`generated-${idx}`}
-                                        className="max-w-xs rounded-md cursor-pointer hover:opacity-90 transition-opacity"
-                                        onClick={() => openImageViewer(file, message.content)}
-                                      />
+                                      {status === 'error' ? (
+                                        <div className="w-64 h-40 bg-gray-100 border border-dashed border-border rounded-md flex flex-col items-center justify-center gap-2 text-center p-4">
+                                          <div className="text-sm text-muted-foreground">Image unavailable</div>
+                                          <Button size="sm" onClick={() => handleRetryImage(attachmentId)}>
+                                            Retry
+                                          </Button>
+                                        </div>
+                                      ) : (
+                                        <img
+                                          src={buildImageSrc(file, attachmentId)}
+                                          alt={`generated-${idx}`}
+                                          className="max-w-xs rounded-md cursor-pointer hover:opacity-90 transition-opacity"
+                                          onClick={() => openImageViewer(file, message.content)}
+                                          onLoad={() => setImageStatus((prev) => ({ ...prev, [attachmentId]: 'success' }))}
+                                          onError={() => {
+                                            console.error('Failed to load image:', file);
+                                            setImageStatus((prev) => ({ ...prev, [attachmentId]: 'error' }));
+                                          }}
+                                        />
+                                      )}
                                       <div className="flex gap-2">
                                         <Button size="sm" variant="outline" onClick={() => openImageViewer(file, message.content)}>
                                           <Eye className="mr-2 h-4 w-4" /> Open
@@ -1287,19 +1489,45 @@ export function ChatInterface({
                                         <Button size="sm" variant="secondary" onClick={() => downloadImage(file)}>
                                           <Download className="mr-2 h-4 w-4" /> Download
                                         </Button>
+                                        {status === 'error' && (
+                                          <Button size="sm" variant="ghost" onClick={() => handleRetryImage(attachmentId)}>
+                                            Retry load
+                                          </Button>
+                                        )}
                                       </div>
                                     </div>
                                   ) : (
                                     <div className="text-xs opacity-80">📎 {file}</div>
                                   )}
                                 </React.Fragment>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
                         </div>
                       </div>
                       <div className="flex items-center gap-2 text-xs text-muted-foreground mt-2 px-1">
                           <span>{message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}</span>
+                          {/* Metadata display */}
+                          {message.role === 'assistant' && message.metadata && (
+                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-muted/50 text-xs">
+                              {message.metadata.tokens && (
+                                <span className="flex items-center gap-0.5">
+                                  <span className="font-mono">{message.metadata.tokens.toLocaleString()}</span>
+                                  <span className="text-muted-foreground/70">tokens</span>
+                                </span>
+                              )}
+                              {message.metadata.duration && (
+                                <>
+                                  {message.metadata.tokens && <span className="text-muted-foreground/50">•</span>}
+                                  <span className="flex items-center gap-0.5">
+                                    <span className="font-mono">{message.metadata.duration.toFixed(2)}</span>
+                                    <span className="text-muted-foreground/70">s</span>
+                                  </span>
+                                </>
+                              )}
+                            </span>
+                          )}
                           {/* Action Buttons */}
                           {(message.content && message.content.trim()) && (
                             <div>
@@ -1335,32 +1563,6 @@ export function ChatInterface({
                       </div>
                     </div>
                 )}
-                {/* This block is kept for extracted text, but image rendering is moved */}
-                {/*
-                  {message.content?.startsWith?.('Extracted from') && (
-                    <div className="mt-2 p-3 bg-gray-50 rounded-md border border-border">
-                      {message.content.length > MAX_PREVIEW_LENGTH ? (
-                        <ExpandableText text={message.content} maxLength={MAX_PREVIEW_LENGTH} />
-                      ) : (
-                        <pre className="whitespace-pre-wrap text-xs">{message.content}</pre>
-                      )}
-                      <div className="mt-2 flex gap-2">
-                        <Button size="sm" onClick={() => { navigator.clipboard.writeText(message.content); toast.success('Copied'); }}>
-                          Copy
-                        </Button>
-                        <Button size="sm" variant="secondary" onClick={() => {
-                          // Download as .txt
-                          const blob = new Blob([message.content], { type: 'text/plain' });
-                          const url = URL.createObjectURL(blob);
-                          downloadImage(url, `${message.id || 'extracted'}.txt`);
-                          URL.revokeObjectURL(url);
-                        }}>
-                          Download
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-                */}
               </div>
             ))}
             {isLoading && (
@@ -1387,7 +1589,7 @@ export function ChatInterface({
           <div className="max-w-4xl mx-auto mb-3 flex flex-wrap gap-2">
             {attachedFiles.map((file, index) => (
               <Button
-                key={index}
+                key={`${file.name}-${file.size}-${(file as any).lastModified ?? index}`}
                 variant="secondary"
                 className="cursor-pointer h-auto py-1 px-2"
                 onClick={() => removeFile(index)}
@@ -1500,7 +1702,7 @@ export function ChatInterface({
           multiple
           className="hidden"
           onChange={handleFileAttach}
-          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json"
+          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx"
         />
       </div>
       {/* Image viewer modal */}

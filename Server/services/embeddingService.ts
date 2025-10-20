@@ -210,18 +210,80 @@ export class EmbeddingService {
 
       const results: SearchResult[] = searchResponse.matches
         ?.filter(match => (match.score || 0) >= threshold)
-        .map(match => ({
-          id: match.id || '',
-          content: (match.metadata?.content as string) || '',
-          score: match.score || 0,
-          metadata: {
-            timestamp: (match.metadata?.timestamp as number) || Date.now(),
-            type: (match.metadata?.type as 'conversation' | 'document' | 'note') || 'note',
-            source: match.metadata?.source as string,
-            userId: match.metadata?.userId as string,
-            tags: match.metadata?.tags as string[]
+        .map(match => {
+          const rawMetadata = (match.metadata || {}) as Record<string, unknown>;
+
+          const rawType = rawMetadata.type as string | undefined;
+          const allowedTypes: Array<MemoryItem['metadata']['type']> = [
+            'conversation',
+            'document',
+            'note',
+            'conversation_summary',
+          ];
+          const metadataType = allowedTypes.includes(rawType as any)
+            ? (rawType as MemoryItem['metadata']['type'])
+            : 'note';
+
+          const metadata: MemoryItem['metadata'] = {
+            timestamp:
+              typeof rawMetadata.timestamp === 'number'
+                ? (rawMetadata.timestamp as number)
+                : Date.now(),
+            type: metadataType,
+          };
+
+          if (typeof rawMetadata.source === 'string') {
+            metadata.source = rawMetadata.source;
           }
-        })) || [];
+          if (typeof rawMetadata.userId === 'string') {
+            metadata.userId = rawMetadata.userId;
+          }
+          if (typeof rawMetadata.chatId === 'string') {
+            metadata.chatId = rawMetadata.chatId;
+          }
+          if (Array.isArray(rawMetadata.tags)) {
+            metadata.tags = rawMetadata.tags.filter(
+              (tag): tag is string => typeof tag === 'string'
+            );
+          }
+          if (typeof rawMetadata.sessionId === 'string') {
+            metadata.sessionId = rawMetadata.sessionId;
+          }
+          if (typeof rawMetadata.turnCount === 'number') {
+            metadata.turnCount = rawMetadata.turnCount;
+          }
+          if (typeof rawMetadata.timespanStart === 'number') {
+            metadata.timespanStart = rawMetadata.timespanStart;
+          }
+          if (typeof rawMetadata.timespanEnd === 'number') {
+            metadata.timespanEnd = rawMetadata.timespanEnd;
+          }
+          if (typeof rawMetadata.isFirstMessage === 'boolean') {
+            metadata.isFirstMessage = rawMetadata.isFirstMessage;
+          }
+          if (rawMetadata.role === 'user' || rawMetadata.role === 'assistant') {
+            metadata.role = rawMetadata.role;
+          }
+          if (typeof rawMetadata.turnId === 'string') {
+            metadata.turnId = rawMetadata.turnId;
+          }
+          if (typeof rawMetadata.imageUrl === 'string') {
+            metadata.imageUrl = rawMetadata.imageUrl;
+          }
+          if (typeof rawMetadata.imagePrompt === 'string') {
+            metadata.imagePrompt = rawMetadata.imagePrompt;
+          }
+          if (typeof rawMetadata.hasImage === 'boolean') {
+            metadata.hasImage = rawMetadata.hasImage;
+          }
+
+          return {
+            id: match.id || '',
+            content: (rawMetadata.content as string) || '',
+            score: match.score || 0,
+            metadata,
+          };
+        }) || [];
 
       console.log(`Found ${results.length} relevant memories for query: "${query}"`);
       return results;

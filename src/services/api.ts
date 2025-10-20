@@ -174,9 +174,20 @@ class ApiService {
     userName?: string; // 🎯 NEW! User name for auto-profile creation
     chatId?: string; // 🎯 NEW! Chat ID for chat-scoped memory
     messageCount?: number; // 🎯 NEW! Message count to detect new vs continuing chat
-    conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>; // 🎯 NEW! Previous messages for context
+    conversationHistory?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>; // 🎯 Includes system messages for document context
+    conversationSummary?: string; // 🎯 NEW! Summary of older messages to save tokens
     useMemory?: boolean; // Enable/disable memory
-  }): Promise<{ success: boolean; text?: string; error?: string }> {
+  }): Promise<{ 
+    success: boolean; 
+    text?: string; 
+    error?: string;
+    metadata?: {
+      tokens?: number;
+      candidatesTokenCount?: number;
+      promptTokenCount?: number;
+      duration?: number;
+    };
+  }> {
     if (data.image) {
       // For images, use FormData (if backend supports it)
       const formData = new FormData();
@@ -206,6 +217,7 @@ class ApiService {
           chatId: data.chatId,                    // 🎯 NEW! For chat-scoped memory
           messageCount: data.messageCount,        // 🎯 NEW! Detect new vs continuing
           conversationHistory: data.conversationHistory, // 🎯 NEW! Previous messages for context
+          conversationSummary: data.conversationSummary, // 🎯 NEW! Summary of older messages
           useMemory: data.useMemory !== false // Default to true if not specified
         }),
       });
@@ -221,13 +233,19 @@ class ApiService {
     userId?: string, 
     chatId?: string, 
     userName?: string,
-    conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }> // 🎯 NEW! Pass conversation context
+    conversationHistory?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> // 🎯 Includes system messages for document context
   ): Promise<{
     success: boolean;
     imageBase64?: string | null;
     imageUri?: string | null;
     altText?: string | null;
     error?: string;
+    metadata?: {
+      tokens?: number;
+      candidatesTokenCount?: number;
+      promptTokenCount?: number;
+      duration?: number;
+    };
   }> {
     // Image generation can take 30-90 seconds, use longer timeout
     const url = `${this.baseURL}/ask-ai`;

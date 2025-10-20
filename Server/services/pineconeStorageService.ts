@@ -34,6 +34,61 @@ export class PineconeStorageService {
   
   // 🎯 OPTIMIZATION: Track what's already been uploaded to avoid duplicates
   private uploadedTurns: Map<string, Set<string>> = new Map(); // chatId -> Set of turnIds
+  private checkedChats: Set<string> = new Set(); // Chats we've verified against Pinecone
+
+  /**
+   * Check Pinecone directly for existing messages to avoid duplicate uploads
+   * Only called once per chat session (cached in checkedChats)
+   */
+  private async syncUploadedTurnsFromPinecone(chatId: string, userId: string): Promise<void> {
+    // Skip if we've already checked this chat
+    if (this.checkedChats.has(chatId)) {
+      return;
+    }
+
+    console.log(`🔍 Checking Pinecone for existing messages in chat ${chatId}...`);
+    
+    try {
+      // Query Pinecone for all messages in this chat
+      const index = await this.embeddingService.getIndex();
+      
+      // Fetch vectors with this chatId (using metadata filter)
+      const queryResponse = await index.query({
+        vector: Array(768).fill(0), // Dummy vector for metadata-only query
+        topK: 10000, // Get many results to catch all messages
+        includeMetadata: true,
+        filter: {
+          chatId: { $eq: chatId },
+          userId: { $eq: userId }
+        }
+      });
+
+      // Extract turn IDs from existing vectors
+      const existingTurnIds = new Set<string>();
+      if (queryResponse.matches) {
+        for (const match of queryResponse.matches) {
+          const turnId = match.metadata?.turnId;
+          if (turnId) {
+            existingTurnIds.add(turnId as string);
+          }
+        }
+      }
+
+      // Update our tracking map
+      if (existingTurnIds.size > 0) {
+        this.uploadedTurns.set(chatId, existingTurnIds);
+        console.log(`   ✅ Found ${existingTurnIds.size} existing turns in Pinecone for chat ${chatId}`);
+      } else {
+        console.log(`   📭 No existing messages found in Pinecone for chat ${chatId}`);
+      }
+
+      // Mark as checked
+      this.checkedChats.add(chatId);
+    } catch (error) {
+      console.warn(`   ⚠️ Failed to check Pinecone for existing messages:`, error);
+      // Don't fail the upload, just proceed without checking
+    }
+  }
 
   /**
    * Check if specific turns have already been uploaded to Pinecone
@@ -87,6 +142,11 @@ export class PineconeStorageService {
     console.log(`💾 Preparing to store ${turns.length} conversation turns to Pinecone...`);
     console.log(`   📁 User: ${userId}, Chat: ${chatId}`);
 
+    // 🎯 OPTIMIZATION: Check Pinecone for existing messages (only once per chat)
+    if (!force) {
+      await this.syncUploadedTurnsFromPinecone(chatId, userId);
+    }
+
     // 🎯 OPTIMIZATION: Filter out already-uploaded turns
     let turnsToUpload = turns;
     if (!force) {
@@ -98,13 +158,15 @@ export class PineconeStorageService {
       turnsToUpload = turns.filter(t => unuploadedTurnIds.includes(t.id));
       
       if (turnsToUpload.length === 0) {
-        console.log(`✅ All turns already uploaded to Pinecone, skipping`);
+        console.log(`✅ All ${turns.length} turns already uploaded to Pinecone, skipping`);
         return;
       }
       
       if (turnsToUpload.length < turns.length) {
         console.log(`   🔍 Filtered: ${turns.length} total → ${turnsToUpload.length} new (${turns.length - turnsToUpload.length} already uploaded)`);
       }
+    } else {
+      console.log(`   🚨 Force upload: Uploading all ${turns.length} turns (may overwrite existing)`);
     }
 
     const memoryItems: MemoryItem[] = [];
