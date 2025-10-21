@@ -151,3 +151,32 @@ local.*
 security-report.*
 vulnerability-report.*
 .vercel
+
+# ---------------------------------------------------------
+# Hardened secrets ignore (env files & credential JSONs)
+# Ensures secrets are ignored no matter where they live
+# ---------------------------------------------------------
+
+# .env files anywhere (covers nested packages and subfolders)
+**/.env
+**/.env.*
+*.env
+.env
+.env.local
+.env.*.local
+
+# Credential/Key JSONs anywhere (common names)
+**/*serviceAccount*.json
+**/*credentials*.json
+**/*-key.json
+**/*-keys.json
+**/google-credentials*.json
+
+# Typical secrets folders
+keys/
+**/keys/*.json
+**/keys/**/*.json
+
+# Private PEM/KEY files (explicit)
+**/*.pem
+**/*.key
