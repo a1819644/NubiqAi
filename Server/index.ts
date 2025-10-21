@@ -3,8 +3,8 @@ require("dotenv").config();
 import express from "express";
 import cors from "cors";
 import type { CorsOptions } from "cors";
+import { VertexAI } from "@google-cloud/vertexai";
 import { GoogleGenAI } from "@google/genai";
-import type { Part } from "@google/genai";
 import {
   getEmbeddingService,
   MemoryItem,
@@ -23,6 +23,8 @@ import {
   SecurityValidator,
   logSecurityEvent,
 } from "./services/securityMiddleware";
+import { firestoreChatService } from "./services/firestoreChatService";
+import { getJobQueue } from "./services/jobQueue";
 
 // Import performance optimizations with error handling
 let profileCache: any;
@@ -153,20 +155,95 @@ app.use((req, res, next) => {
   next();
 });
 
-// init Gemini client safely
+// Initialize Vertex AI client (preferred for scalability)
+let vertex: VertexAI | undefined;
+try {
+  const projectId =
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GCLOUD_PROJECT ||
+    process.env.GCP_PROJECT;
+  const location =
+    process.env.VERTEX_LOCATION ||
+    process.env.GOOGLE_CLOUD_REGION ||
+    process.env.GOOGLE_CLOUD_LOCATION ||
+    "us-central1";
+
+  if (projectId) {
+    vertex = new VertexAI({ project: projectId, location });
+    console.log(
+      `Vertex AI client initialized. project=${projectId}, location=${location}`
+    );
+  } else {
+    console.warn(
+      "GOOGLE_CLOUD_PROJECT not set; Vertex AI client not initialized. Set GOOGLE_CLOUD_PROJECT and GOOGLE_APPLICATION_CREDENTIALS to use Vertex AI."
+    );
+  }
+} catch (err) {
+  console.error("Failed to initialize Vertex AI client:", err);
+}
+
+// Initialize Google AI Studio client as a fallback (optional)
 let ai: GoogleGenAI | undefined;
 try {
   if (process.env.GEMINI_API_KEY) {
     ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    console.log("GoogleGenAI client initialized.");
+    console.log("GoogleGenAI client initialized (fallback).");
   } else {
-    console.warn(
-      "GEMINI_API_KEY missing from .env; Gemini client not initialized."
-    );
+    console.warn("GEMINI_API_KEY not set; Google client disabled.");
   }
 } catch (err) {
   console.error("Failed to initialize GoogleGenAI client:", err);
 }
+
+// Unified generation helper using Vertex first, then Google as fallback
+type GenResult = { parts: any[]; raw: any; usage?: any };
+async function generateContent(args: { model: string; contents: any[] }): Promise<GenResult> {
+  const { model, contents } = args;
+  // Try Vertex first
+  if (vertex) {
+    try {
+      const gm = vertex.getGenerativeModel({ model });
+      // Normalize contents to Vertex format
+      let vContents: any[];
+      if (typeof contents[0] === "string") {
+        vContents = [
+          {
+            role: "user",
+            parts: contents.map((t) => ({ text: String(t) })),
+          },
+        ];
+      } else if (contents[0] && typeof contents[0] === "object" && "parts" in contents[0]) {
+        vContents = [
+          {
+            role: "user",
+            parts: (contents[0] as any).parts,
+          },
+        ];
+      } else {
+        vContents = contents as any[];
+      }
+      const resp: any = await gm.generateContent({ contents: vContents });
+      const parts: any[] = resp?.response?.candidates?.[0]?.content?.parts ?? [];
+      const usage = resp?.response?.usageMetadata;
+      return { parts, raw: resp, usage };
+    } catch (err) {
+      console.warn("Vertex generateContent failed, will try Google fallback:", err);
+    }
+  }
+
+  // Fallback: Google AI Studio client
+  if (ai) {
+    const resp: any = await (ai as any).models.generateContent({ model, contents });
+    const parts: any[] = resp?.candidates?.[0]?.content?.parts ?? [];
+    const usage = resp?.usageMetadata;
+    return { parts, raw: resp, usage };
+  }
+
+  throw new Error("No AI client initialized");
+}
+
+// In-flight request locks per user/chat to prevent concurrent generations
+const inFlightChatRequests: Map<string, NodeJS.Timeout> = new Map();
 
 // Home / health
 app.get("/api", (req, res) => res.json({ ok: true }));
@@ -190,8 +267,8 @@ process.on("unhandledRejection", (reason, promise) => {
  * 🔒 SECURITY: Rate limited, input validated
  */
 app.post("/api/ask-ai", rateLimitMiddleware("general"), async (req, res) => {
-  if (!ai)
-    return res.status(500).json({ error: "Gemini client not initialized" });
+  if (!vertex && !ai)
+    return res.status(500).json({ error: "AI client not initialized" });
 
   try {
     console.log("📥 Request received at /api/ask-ai");
@@ -209,7 +286,24 @@ app.post("/api/ask-ai", rateLimitMiddleware("general"), async (req, res) => {
     } = req.body;
     console.log("📦 Request body parsed successfully");
 
-    // 🔒 Validate prompt
+    // � Concurrency guard per user/chat
+    const keyUser = userId || "anonymous";
+    const keyChat = chatId || "global";
+    const inFlightKey = `${keyUser}:${keyChat}`;
+    if (inFlightChatRequests.has(inFlightKey)) {
+      return res.status(409).json({
+        success: false,
+        error: "Another request is already processing for this chat. Please wait for it to finish.",
+      });
+    }
+    // Set a TTL to avoid stale locks (e.g., 2 minutes)
+    const ttl = setTimeout(() => {
+      inFlightChatRequests.delete(inFlightKey);
+      console.warn(`⏱️ Cleared stale lock for ${inFlightKey}`);
+    }, 2 * 60 * 1000);
+    inFlightChatRequests.set(inFlightKey, ttl);
+
+    // �🔒 Validate prompt
     const promptValidation = SecurityValidator.validatePrompt(prompt);
     if (!promptValidation.valid) {
       logSecurityEvent("Invalid prompt blocked", {
@@ -878,12 +972,12 @@ Create a detailed, visually compelling image that captures the essence and conte
             `\n\nIMPORTANT: Generate an actual IMAGE, not text. Do not describe the image, CREATE it.`;
         }
 
-        response = await ai.models.generateContent({
+        response = await generateContent({
           model: imageModel,
           contents: [imagePrompt],
         });
 
-        const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+        const parts: any[] = (response as any)?.parts ?? [];
 
         // Check if we got an actual image
         const hasImage = parts.some(
@@ -910,7 +1004,7 @@ Create a detailed, visually compelling image that captures the essence and conte
         }
       }
 
-      const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+  const parts: any[] = (response as any)?.parts ?? [];
   let imageBase64: string | null = null;
   let imageUri: string | null = null;
       let altText: string | null = null;
@@ -1014,8 +1108,10 @@ Create a detailed, visually compelling image that captures the essence and conte
               prompt, // User's prompt
               altText || "Image generated", // AI's response (alt text or placeholder)
               effectiveChatId,
-              { url: firebaseImageUrl, prompt: prompt } // � Store Firebase URL
+              { url: firebaseImageUrl, prompt: prompt } // Store Firebase URL
             );
+
+            await firestoreChatService.saveTurn(conversationTurn);
 
             console.log(
               `🖼️ [BACKGROUND] Stored image URL in conversation history`
@@ -1036,9 +1132,9 @@ Create a detailed, visually compelling image that captures the essence and conte
         altText,
         raw: response,
         metadata: {
-          tokens: response?.usageMetadata?.totalTokenCount || 0,
-          candidatesTokenCount: response?.usageMetadata?.candidatesTokenCount || 0,
-          promptTokenCount: response?.usageMetadata?.promptTokenCount || 0,
+          tokens: (response as any)?.usage?.totalTokenCount || 0,
+          candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+          promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
         },
       });
     }
@@ -1049,12 +1145,9 @@ Create a detailed, visually compelling image that captures the essence and conte
 
     // Normal text response
     const startTime = Date.now();
-    const response = await ai.models.generateContent({
-      model: textModel,
-      contents: [enhancedPrompt],
-    });
+    const response = await generateContent({ model: textModel, contents: [enhancedPrompt] });
     const duration = (Date.now() - startTime) / 1000; // Convert to seconds
-    const parts = response?.candidates?.[0]?.content?.parts ?? [];
+    const parts = (response as any)?.parts ?? [];
     const text = parts.map((p: any) => p.text ?? "").join("");
 
     console.log(
@@ -1069,9 +1162,9 @@ Create a detailed, visually compelling image that captures the essence and conte
       text, 
       raw: response,
       metadata: {
-        tokens: response?.usageMetadata?.totalTokenCount || 0,
-        candidatesTokenCount: response?.usageMetadata?.candidatesTokenCount || 0,
-        promptTokenCount: response?.usageMetadata?.promptTokenCount || 0,
+        tokens: (response as any)?.usage?.totalTokenCount || 0,
+        candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+        promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
         duration: parseFloat(duration.toFixed(2)),
       },
     };
@@ -1083,7 +1176,7 @@ Create a detailed, visually compelling image that captures the essence and conte
     // Pinecone upload happens only when user switches chats (see /api/end-chat endpoint)
     // ═══════════════════════════════════════════════════════════════════════
     if (useMemory && text && effectiveUserId) {
-      setImmediate(() => {
+      setImmediate(async () => {
         try {
           const hybridMemoryService = getHybridMemoryService();
 
@@ -1094,6 +1187,8 @@ Create a detailed, visually compelling image that captures the essence and conte
             text,
             effectiveChatId
           );
+
+          await firestoreChatService.saveTurn(conversationTurn);
 
           console.log(
             `💬 [BACKGROUND] Stored turn in session (chat: ${effectiveChatId}): "${prompt.substring(0, 50)}..."`
@@ -1133,6 +1228,15 @@ Create a detailed, visually compelling image that captures the essence and conte
           process.env.NODE_ENV === "development" ? err?.stack : undefined,
       });
     }
+  } finally {
+    try {
+      const keyUser = req.body?.userId || "anonymous";
+      const keyChat = req.body?.chatId || "global";
+      const inFlightKey = `${keyUser}:${keyChat}`;
+      const existing = inFlightChatRequests.get(inFlightKey);
+      if (existing) clearTimeout(existing);
+      inFlightChatRequests.delete(inFlightKey);
+    } catch {}
   }
 });
 
@@ -1144,10 +1248,10 @@ app.post(
   "/api/process-document",
   rateLimitMiddleware("general"),
   async (req, res) => {
-    if (!ai)
+    if (!vertex && !ai)
       return res
         .status(500)
-        .json({ error: "Gemini process-document client not initialized" });
+        .json({ error: "AI client not initialized" });
 
     try {
       const {
@@ -1264,7 +1368,7 @@ app.post(
       }
 
       // Use Gemini for document processing
-      const DOC_MODEL = "gemini-2.5-flash";
+  const DOC_MODEL = "gemini-2.5-flash";
       const defaultPrompt =
         "Extract all text content from this document. Provide a clean, well-formatted extraction of the text.";
       const userPrompt =
@@ -1304,84 +1408,18 @@ app.post(
         }
       }
 
-      // Gemini processing for PDF and other supported types
-      if (!extractedText) {
-        // For PDF, use the Files API to upload then reference via fileData
-        let parts: Part[] = [{ text: userPrompt }];
-
-        if (mimeType === "text/plain") {
-          // If text/plain wasn't decoded above for some reason, send as a text part
+      // AI-based extraction step removed for scale; use local extractors for PDFs
+      if (!extractedText && mimeType === "application/pdf") {
+        try {
           const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
-          const textContent = Buffer.from(cleanedBase64, "base64").toString(
-            "utf8"
-          );
-          parts.push({ text: `Document content:\n\n${textContent}` });
-        } else if (GEMINI_SUPPORTED_TYPES.includes(mimeType)) {
-          // Only upload to Gemini Files API if the type is supported (PDF)
-          try {
-            const extByMime: Record<string, string> = {
-              "application/pdf": "pdf",
-            };
-            const displayName = `document_${Date.now()}.${
-              extByMime[mimeType] || "bin"
-            }`;
-
-            // Clean base64 before decoding
-            const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
-
-            console.log(`📤 Uploading ${mimeType} to Gemini Files API...`);
-            
-            // Use Files API (cast to any to avoid SDK type mismatch across versions)
-            const upload: any = await (ai as any).files.upload({
-              file: {
-                data: Buffer.from(cleanedBase64, "base64"),
-                mimeType,
-              },
-              displayName,
-            } as any);
-
-            if (upload && upload.file && upload.file.uri) {
-              console.log(`✅ File uploaded successfully: ${upload.file.uri}`);
-              parts.push({
-                fileData: {
-                  fileUri: upload.file.uri,
-                  mimeType,
-                },
-              } as any);
-            } else {
-              throw new Error("Files API upload returned no URI");
-            }
-          } catch (uploadErr) {
-            console.error(
-              "Files API upload failed:",
-              uploadErr
-            );
-            // Don't try inlineData - it won't work for unsupported types
-            throw new Error(`Failed to upload ${mimeType} to Gemini. This file type may not be supported.`);
+          const buffer = Buffer.from(cleanedBase64, "base64");
+          const local = await extractTextFromDocument(buffer, mimeType);
+          if (local.text && local.text.trim()) {
+            extractedText = local.text;
+            console.log(`✅ PDF extracted locally via ${local.method}`);
           }
-        } else {
-          // This shouldn't happen as we check SUPPORTED_MIME_TYPES earlier
-          throw new Error(`Unsupported MIME type for Gemini processing: ${mimeType}`);
-        }
-
-        // Only call Gemini if we have file data to send (PDF)
-        if (parts.length > 1) {
-          console.log(`🤖 Sending to Gemini for AI extraction...`);
-          const response = await ai.models.generateContent({
-            model: DOC_MODEL,
-            contents: [
-              {
-                parts,
-              },
-            ],
-          });
-
-          extractedText =
-            (response as any)?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-          
-          if (extractedText) {
-            console.log(`✅ Gemini extraction successful, length: ${extractedText.length}`);
-          }
+        } catch (pdfErr) {
+          console.warn("Local PDF extraction failed:", pdfErr);
         }
       }
 
@@ -1472,8 +1510,8 @@ app.post(
  * body: { imageBase64: string, editPrompt: string, model?: string, userId?: string }
  */
 app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
-  if (!ai)
-    return res.status(500).json({ error: "Gemini client not initialized" });
+  if (!vertex && !ai)
+    return res.status(500).json({ error: "AI client not initialized" });
 
   try {
     const { imageBase64, editPrompt, model, userId } = req.body;
@@ -1508,44 +1546,29 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
     // For "editing", we'll use the vision model to analyze the image and generate a new one based on the edit instruction
 
     // Step 1: Use vision model to describe the image
-    const visionModel = "gemini-2.5-flash-image"; // ✅ Gemini 2.5 with vision capabilities
-    const descriptionResponse = await ai.models.generateContent({
+    const visionModel = "gemini-2.5-flash"; // vision model for description
+    const descriptionResponse = await generateContent({
       model: visionModel,
       contents: [
-        {
-          parts: [
-            {
-              text: "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.",
-            },
-            {
-              inlineData: {
-                data: imageBase64,
-                mimeType: "image/png",
-              },
-            },
-          ],
-        },
+        "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.",
+        { inlineData: { data: imageBase64, mimeType: "image/png" } },
       ],
     });
-
-    const imageDescription =
-      descriptionResponse?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      "an image";
+    const imageDescription = ((descriptionResponse as any)?.parts ?? [])
+      .map((p: any) => p.text)
+      .filter(Boolean)
+      .join(" ") || "an image";
 
     // Step 2: Generate a new image based on the description + edit instruction
-  const imageModel = model ?? "gemini-2.5-flash-image"; // ✅ Standardized to match /ask-ai image model
+    const imageModel = model ?? "gemini-2.5-flash-image"; // image generation model
     const combinedPrompt = `Based on this description: "${imageDescription}"
 
 Apply this edit: ${editPrompt}
 
 Generate a new image that matches the original description but with the requested edits applied.`;
 
-    const response = await ai.models.generateContent({
-      model: imageModel,
-      contents: [combinedPrompt],
-    });
-
-    const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+    const response = await generateContent({ model: imageModel, contents: [combinedPrompt] });
+    const parts: any[] = (response as any)?.parts ?? [];
     let newImageBase64: string | null = null;
     let imageUri: string | null = null;
     let altText: string | null = null;
@@ -1581,8 +1604,8 @@ app.post(
   "/api/edit-image-with-mask",
   rateLimitMiddleware("image"),
   async (req, res) => {
-    if (!ai)
-      return res.status(500).json({ error: "Gemini client not initialized" });
+    if (!vertex && !ai)
+      return res.status(500).json({ error: "AI client not initialized" });
 
     try {
       const { imageBase64, maskBase64, editPrompt, model, userId } = req.body;
@@ -1628,54 +1651,34 @@ app.post(
       // For mask-based editing, we'll use vision model to analyze BOTH images and generate a new one
 
       // Step 1: Describe the original image
-      const visionModel = "gemini-2.5-flash-image";
-      const descriptionResponse = await ai.models.generateContent({
+      const visionModel = "gemini-2.5-flash";
+      const descriptionResponse = await generateContent({
         model: visionModel,
         contents: [
-          {
-            parts: [
-              { text: "Describe this image in detail." },
-              {
-                inlineData: {
-                  data: imageBase64,
-                  mimeType: "image/png",
-                },
-              },
-            ],
-          },
+          "Describe this image in detail.",
+          { inlineData: { data: imageBase64, mimeType: "image/png" } },
         ],
       });
-
-      const imageDescription =
-        descriptionResponse?.candidates?.[0]?.content?.parts?.[0]?.text ||
-        "an image";
+      const imageDescription = ((descriptionResponse as any)?.parts ?? [])
+        .map((p: any) => p.text)
+        .filter(Boolean)
+        .join(" ") || "an image";
 
       // Step 2: Analyze the mask to understand what areas to edit
-      const maskResponse = await ai.models.generateContent({
+      const maskResponse = await generateContent({
         model: visionModel,
         contents: [
-          {
-            parts: [
-              {
-                text: "Describe the colored/marked areas in this mask image. Where are they located and what parts of the image do they cover?",
-              },
-              {
-                inlineData: {
-                  data: maskBase64,
-                  mimeType: "image/png",
-                },
-              },
-            ],
-          },
+          "Describe the colored/marked areas in this mask image. Where are they located and what parts of the image do they cover?",
+          { inlineData: { data: maskBase64, mimeType: "image/png" } },
         ],
       });
-
-      const maskDescription =
-        maskResponse?.candidates?.[0]?.content?.parts?.[0]?.text ||
-        "marked areas";
+      const maskDescription = ((maskResponse as any)?.parts ?? [])
+        .map((p: any) => p.text)
+        .filter(Boolean)
+        .join(" ") || "marked areas";
 
       // Step 3: Generate new image with edits applied to masked areas
-  const imageModel = model ?? "gemini-2.5-flash-image"; // ✅ Standardized to match /ask-ai image model
+    const imageModel = model ?? "gemini-2.5-flash-image";
       const combinedPrompt = `Original image: ${imageDescription}
 
 Masked areas to edit: ${maskDescription}
@@ -1684,12 +1687,8 @@ Edit instruction for the masked areas ONLY: ${editPrompt}
 
 Generate a new version of the image with the edit applied ONLY to the masked areas. Keep everything else the same as the original.`;
 
-      const response = await ai.models.generateContent({
-        model: imageModel,
-        contents: [combinedPrompt],
-      });
-
-      const parts: Part[] = response?.candidates?.[0]?.content?.parts ?? [];
+  const response = await generateContent({ model: imageModel, contents: [combinedPrompt] });
+  const parts: any[] = (response as any)?.parts ?? [];
       let newImageBase64: string | null = null;
       let imageUri: string | null = null;
       let altText: string | null = null;
@@ -2341,27 +2340,9 @@ app.post("/api/end-chat", rateLimitMiddleware("general"), async (req, res) => {
       `\n🔚 End chat request - User: ${userId}, Chat: ${chatId}, Force: ${force || false}`
     );
 
-    // Persist this chat session to Pinecone in the background
-    setImmediate(async () => {
-      try {
-        console.log(`💾 [BACKGROUND] Persisting chat ${chatId} to Pinecone...`);
-        const hybridMemoryService = getHybridMemoryService();
-
-        // Upload with optional force flag (bypasses cooldown)
-        if (force) {
-          await hybridMemoryService.forceUpload(userId, chatId);
-        } else {
-          await hybridMemoryService.persistChatSession(userId, chatId);
-        }
-
-        console.log(`✅ [BACKGROUND] Chat ${chatId} processed\n`);
-      } catch (error) {
-        console.error(
-          `❌ [BACKGROUND] Failed to persist chat ${chatId}:`,
-          error
-        );
-      }
-    });
+    // Enqueue background persistence job with retry/backoff
+    const queue = getJobQueue();
+    queue.enqueue('persist-chat', { userId, chatId, force: !!force });
 
     // Respond immediately (don't make user wait for Pinecone upload)
     return res.json({
@@ -2434,29 +2415,23 @@ app.post(
         `\n💾 Force save all chats - User: ${userId}, Chats: ${chatIds.length}`
       );
 
-      // Save all chats in background (with force flag)
-      setImmediate(async () => {
+      // Enqueue background persistence jobs (with force flag)
+      const queue = getJobQueue();
+      let enqueued = 0;
+      for (const chatId of chatIds) {
         try {
-          const hybridMemoryService = getHybridMemoryService();
-
-          for (const chatId of chatIds) {
-            try {
-              await hybridMemoryService.forceUpload(userId, chatId);
-            } catch (error) {
-              console.error(`❌ Failed to save chat ${chatId}:`, error);
-              // Continue with other chats
-            }
-          }
-
-          console.log(`✅ [BACKGROUND] All chats saved successfully\n`);
+          queue.enqueue('persist-chat', { userId, chatId, force: true });
+          enqueued += 1;
         } catch (error) {
-          console.error(`❌ [BACKGROUND] Error in batch save:`, error);
+          console.error(`❌ Failed to enqueue save for chat ${chatId}:`, error);
         }
-      });
+      }
 
       return res.json({
         success: true,
-        message: `${chatIds.length} chats will be saved in background`,
+        message: `${enqueued} chat(s) queued for background save`,
+        queued: enqueued,
+        total: chatIds.length,
       });
     } catch (err: any) {
       console.error("save-all-chats error:", err);
@@ -2498,63 +2473,13 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
     const embeddingService = getEmbeddingService();
     const allChats: any[] = [];
 
-    // STEP 1: Load from LOCAL MEMORY (instant - no network delay)
+    // STEP 1: Load from Firestore (shared state across instances)
     if (source === "local" || source === "all") {
-      console.log("   ⚡ Loading from local memory (instant)...");
-      const conversationService = (hybridMemoryService as any)
-        .conversationService;
-      const recentTurns = conversationService.getRecentConversations(
-        userId,
-        100
-      );
-
-      // Group conversations by chatId
-      const chatGroups = new Map<string, any>();
-
-      recentTurns.forEach((turn: any) => {
-        const chatId = turn.chatId || "default";
-
-        if (!chatGroups.has(chatId)) {
-          chatGroups.set(chatId, {
-            id: chatId,
-            title:
-              turn.userPrompt.substring(0, 50) +
-              (turn.userPrompt.length > 50 ? "..." : ""),
-            timestamp: new Date(turn.timestamp).toISOString(),
-            userId: userId,
-            messages: [],
-            source: "local", // Mark source for debugging
-          });
-        }
-
-        const chat = chatGroups.get(chatId);
-        const baseTimestamp = new Date(turn.timestamp).toISOString();
-
-        chat.messages.push(
-          {
-            id: `${turn.id}-user`,
-            role: "user",
-            content: turn.userPrompt,
-            timestamp: baseTimestamp,
-          },
-          {
-            id: `${turn.id}-assistant`,
-            role: "assistant",
-            content: turn.aiResponse,
-            timestamp: baseTimestamp,
-            attachments:
-              turn.hasImage && turn.imageUrl
-                ? [turn.imageUrl]
-                : undefined,
-            imagePrompt: turn.imagePrompt,
-          }
-        );
-      });
-
-      const localChats = Array.from(chatGroups.values());
-      allChats.push(...localChats);
+      console.log("   🔥 Loading active chats from Firestore...");
+      const firestoreChats = await firestoreChatService.listActiveChats(userId);
+      allChats.push(...firestoreChats);
       console.log(
-        `   ✅ Found ${localChats.length} local chat sessions (${recentTurns.length} turns)`
+        `   ✅ Found ${firestoreChats.length} active chat session(s) in Firestore`
       );
     }
 
@@ -2629,6 +2554,44 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
       error: err?.message ?? String(err),
       data: [], // Return empty array on error
     });
+  }
+});
+
+// Register job handlers (once at module load time)
+(() => {
+  const queue = getJobQueue();
+  queue.register('persist-chat', async ({ userId, chatId, force }: { userId: string; chatId: string; force: boolean }) => {
+    console.log(`💾 [QUEUE] Persisting chat ${chatId} (force=${force})...`);
+    const hybridMemoryService = getHybridMemoryService();
+    if (force) {
+      await hybridMemoryService.forceUpload(userId, chatId);
+    } else {
+      await hybridMemoryService.persistChatSession(userId, chatId);
+    }
+    await firestoreChatService.markChatPersisted(userId, chatId);
+    console.log(`✅ [QUEUE] Chat ${chatId} persisted`);
+  });
+})();
+
+// Queue stats endpoint for debugging
+app.get('/api/queue-stats', rateLimitMiddleware('general'), (req, res) => {
+  try {
+    const stats = getJobQueue().getStats();
+    return res.json({ success: true, stats });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// Dead-letter inspection endpoint (debug only)
+app.get('/api/queue-dead-letter', rateLimitMiddleware('general'), (req, res) => {
+  try {
+    const limitParam = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitParam) && limitParam! > 0 ? limitParam! : 20;
+    const dead = getJobQueue().getDeadLetter(limit);
+    return res.json({ success: true, dead });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
 

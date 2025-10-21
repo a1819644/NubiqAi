@@ -63,7 +63,15 @@ class ApiService {
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          // Try to parse JSON error to get message and success flag
+          let errMessage = `HTTP error! status: ${response.status}`;
+          try {
+            const maybeJson = await response.json();
+            if (maybeJson?.error) errMessage = String(maybeJson.error);
+          } catch {}
+          const err: any = new Error(errMessage);
+          err.status = response.status;
+          throw err;
         }
 
         const data = await response.json();
@@ -301,6 +309,8 @@ class ApiService {
     fileBase64: string;
     mimeType?: string;
     prompt?: string;
+    userId?: string;
+    storeInMemory?: boolean;
   }): Promise<{ success: boolean; extractedText?: string; error?: string }> {
     // Use a longer timeout for document processing (3 minutes)
     const url = `${this.baseURL}/process-document`;
@@ -312,7 +322,13 @@ class ApiService {
       const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileBase64: options.fileBase64, mimeType: options.mimeType, prompt: options.prompt }),
+        body: JSON.stringify({
+          fileBase64: options.fileBase64,
+          mimeType: options.mimeType,
+          prompt: options.prompt,
+          userId: options.userId,
+          storeInMemory: options.storeInMemory,
+        }),
         signal: controller.signal,
       });
 
@@ -554,23 +570,28 @@ class ApiService {
       body: JSON.stringify(data),
     });
   }
+
+  // Friendly error mapping for UI
+  public static toFriendlyError(err: any): string {
+    if (!err) return 'Unknown error';
+    const msg = (typeof err === 'string' ? err : err.message) || 'Unknown error';
+    const status = (err as any)?.status;
+    if (status === 409) {
+      return 'Another request is already processing for this chat. Please wait for it to finish.';
+    }
+    if (/timeout|timed out|abort/i.test(msg)) {
+      return 'Request timed out. The server is taking too long to respond.';
+    }
+    if (/network/i.test(msg)) {
+      return 'Network error. Check your connection and try again.';
+    }
+    return msg;
+  }
 }
 
 // Create singleton instance
 export const apiService = new ApiService();
-
-// Helper functions for common patterns
-export const handleApiError = (error: any): string => {
-  if (error.message) {
-    return error.message;
-  }
-  
-  if (typeof error === 'string') {
-    return error;
-  }
-  
-  return 'An unexpected error occurred';
-};
+export const handleApiError = (err: any) => ApiService.toFriendlyError(err);
 
 export const withApiErrorHandling = async <T>(
   apiCall: () => Promise<T>,

@@ -367,6 +367,10 @@ export function ChatInterface({
     continuationChat?: Chat // Optional chat state for continuations
   ) => {
     if (!activeChat) return;
+    if (isLoading && !isContinuation) {
+      toast.info('Hold on—finish the current response before asking something new.');
+      return;
+    }
     if (!text.trim() && files.length === 0 && !isVoice) return;
 
     // 🔒 CAPTURE THE CHAT ID AND STATE AT THE TIME OF SENDING
@@ -419,9 +423,8 @@ export function ChatInterface({
 
     try {
       // --- LOGIC CONFIRMATION IMAGE---
-      const intent = analyzeImageIntent(text);
-      const shouldHandleNaturalImage = intent.wantsImage && !intent.isImagineCommand && !isImageModeActive && !skipConfirmation;
-      const isImagineCommand = text.trim().startsWith('/imagine');
+  const intent = analyzeImageIntent(text);
+  const shouldHandleNaturalImage = intent.wantsImage && !intent.isImagineCommand && !isImageModeActive && !skipConfirmation;
 
       if (shouldHandleNaturalImage) {
         if (intent.needsDetails) {
@@ -694,7 +697,93 @@ export function ChatInterface({
       });
       console.groupEnd();
 
-      // 📝 Smart conversation history: Last 5 messages + summary of older ones
+      // � Pre-process any attached documents before calling the model
+      const nonImageFiles = files.filter(f => !f.type.startsWith('image/'));
+      if (nonImageFiles.length > 0) {
+        const fileToBase64 = async (file: File) => {
+          const buffer = await file.arrayBuffer();
+          const bytes = new Uint8Array(buffer);
+          let binary = '';
+          for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          return btoa(binary);
+        };
+
+        for (const file of nonImageFiles) {
+          const alreadyProcessed = targetChatSnapshot.messages.some((msg) => {
+            const meta = (msg.metadata as any) || {};
+            return meta.isDocumentContext && meta.documentName === file.name && meta.documentSize === file.size;
+          });
+          if (alreadyProcessed) {
+            console.log(`ℹ️ Skipping previously processed document: ${file.name}`);
+            continue;
+          }
+
+          console.log(`📄 Processing document before AI call: ${file.name}`);
+
+          try {
+            const base64 = await fileToBase64(file);
+            const procResp = await apiService.processDocument({
+              fileBase64: base64,
+              mimeType: file.type,
+              userId: user?.id,
+              storeInMemory: true,
+            });
+
+            if (!procResp.success || !procResp.extractedText) {
+              throw new Error(procResp.error || 'Document processing failed');
+            }
+
+            console.log(`✅ Document processed: ${file.name} (${procResp.extractedText.length} characters)`);
+
+            const contextMessage: Message = {
+              id: `doc-context-${Date.now()}`,
+              content: `[Document: ${file.name}]
+${procResp.extractedText}`,
+              role: 'system',
+              timestamp: new Date(),
+              metadata: {
+                documentName: file.name,
+                documentType: file.type,
+                documentSize: file.size,
+                isDocumentContext: true,
+              } as any,
+            };
+
+            safeUpdateChat((chat) => ({
+              ...chat,
+              messages: [...chat.messages, contextMessage],
+            }));
+
+            // Keep local references in sync with the snapshot updates
+            updatedChat = { ...targetChatSnapshot };
+
+            toast.success(`📄 ${file.name} processed and ready for questions`);
+          } catch (err) {
+            if ((err as Error).name === 'AbortError') {
+              console.log(`⚠️ Document processing aborted for ${file.name}`);
+              return;
+            }
+
+            const errorMessage = handleApiError(err);
+            let friendly = `Failed to process ${file.name}: ${errorMessage}`;
+
+            if (errorMessage.includes("don't have the capability")) {
+              friendly = errorMessage;
+            } else if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
+              friendly += ' — Try a smaller file (under 10MB).';
+            } else if (errorMessage.toLowerCase().includes('too large') || errorMessage.toLowerCase().includes('size')) {
+              friendly = `${file.name} is too large. Please use files under 10MB.`;
+            }
+
+            toast.error(friendly);
+            console.error('❌ Document processing failed:', err);
+          }
+        }
+      }
+
+      // �📝 Smart conversation history: Last 5 messages + summary of older ones
       const RECENT_MESSAGE_LIMIT = 5;
       const totalMessages = targetChatSnapshot.messages.length;
       
@@ -846,71 +935,6 @@ export function ChatInterface({
         throw new Error('Failed to get AI response');
       }
       
-      // If there are non-image files attached, process them silently in background
-      const nonImageFiles = files.filter(f => !f.type.startsWith('image/'));
-      for (const file of nonImageFiles) {
-        console.log(`📄 Processing document in background: ${file.name}`);
-
-        // convert file to base64
-        const buffer = await file.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-        let binary = '';
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        const base64 = btoa(binary);
-
-        try {
-          const procResp = await apiService.processDocument({ fileBase64: base64, mimeType: file.type });
-          if (procResp.success && procResp.extractedText) {
-            console.log(`✅ Document processed: ${file.name} (${procResp.extractedText.length} characters)`);
-            
-            // Store extracted text in a hidden system message for context
-            // This will be available for future questions but not displayed in UI
-            const contextMessage: Message = {
-              id: `doc-context-${Date.now()}`,
-              content: `[Document: ${file.name}]\n${procResp.extractedText}`,
-              role: 'system', // System messages are used for context but not displayed
-              timestamp: new Date(),
-              metadata: {
-                documentName: file.name,
-                documentType: file.type,
-                isDocumentContext: true,
-              } as any,
-            };
-
-            // Add to chat history silently
-            safeUpdateChat((chat) => ({
-              ...chat,
-              messages: [...chat.messages, contextMessage],
-            }));
-
-            toast.success(`📄 ${file.name} processed and ready for questions`);
-          } else {
-            throw new Error(procResp.error || 'Document processing failed');
-          }
-        } catch (err) {
-          // Check if the error is due to the request being aborted
-          if ((err as Error).name === 'AbortError') {
-            return;
-          }
-          const errorMessage = handleApiError(err);
-          
-          // Provide user-friendly messages based on error type
-          let friendly = `Failed to process ${file.name}: ${errorMessage}`;
-          
-          if (errorMessage.includes("don't have the capability")) {
-            friendly = `${errorMessage}`;
-          } else if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
-            friendly += ' — Try a smaller file (under 10MB).';
-          } else if (errorMessage.toLowerCase().includes('too large') || errorMessage.toLowerCase().includes('size')) {
-            friendly = `${file.name} is too large. Please use files under 10MB.`;
-          }
-
-          toast.error(friendly);
-          console.error(`❌ Document processing failed:`, err);
-        }
-      }
     } catch (error) {
       console.error('Error sending message:', error);
       // Check if the error is due to the request being aborted
@@ -1631,7 +1655,8 @@ export function ChatInterface({
                   handleSendMessage();
                 }
               }}
-              placeholder="Give a prompt"
+              disabled={isLoading}
+              placeholder={isLoading ? 'Please wait for the current response to finish…' : 'Give a prompt'}
               className="min-h-[44px] max-h-32 pr-28 resize-none border-input focus:border-ring focus:ring-1 focus:ring-ring"
               rows={1}
             />
@@ -1642,6 +1667,7 @@ export function ChatInterface({
                 variant="ghost"
                 className="h-8 w-8 p-0 text-muted-foreground hover:bg-accent"
                 onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
               >
                 <Paperclip className="h-4 w-4 text-gray-500" />
               </Button>
@@ -1653,6 +1679,7 @@ export function ChatInterface({
                   isImageModeActive ? 'bg-blue-100 hover:bg-blue-200' : ''
                 }`}
                 onClick={handleImageClick}
+                disabled={isLoading}
                 title="Toggle Image Generation Mode"
               >
                 <img 
@@ -1671,6 +1698,7 @@ export function ChatInterface({
                   isRecording ? "bg-red-100 hover:bg-red-200" : ""
                 }`}
                 onClick={isRecording ? stopRecording : startRecording}
+                disabled={isLoading && !isRecording}
               >
                 <Mic
                   className={`h-4 w-4 text-muted-foreground ${
@@ -1690,7 +1718,7 @@ export function ChatInterface({
               <Square className="h-4 w-4 text-white" />
             </Button>
           ) : (
-            <Button type="submit" disabled={!input.trim() && attachedFiles.length === 0} className="h-11 w-11 p-0 bg-black hover:bg-gray-800 rounded-lg">
+            <Button type="submit" disabled={isLoading || (!input.trim() && attachedFiles.length === 0)} className="h-11 w-11 p-0 bg-black hover:bg-gray-800 rounded-lg">
               <Send className="h-4 w-4 text-white" />
             </Button>
           )}

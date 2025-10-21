@@ -45,6 +45,33 @@ async function clearPineconeData() {
   }
 }
 
+async function deleteCollection(
+  collectionRef: FirebaseFirestore.CollectionReference,
+  description: string,
+  batchSize = 500
+) {
+  const db = collectionRef.firestore;
+  let deleted = 0;
+
+  while (true) {
+    const snapshot = await collectionRef.limit(batchSize).get();
+    if (snapshot.empty) {
+      break;
+    }
+
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+    deleted += snapshot.size;
+  }
+
+  if (deleted > 0) {
+    console.log(`✅ ${description}: deleted ${deleted}`);
+  } else {
+    console.log(`   No ${description} found`);
+  }
+}
+
 async function clearFirebaseData() {
   console.log('\n🧹 === FIREBASE CLEANUP ===\n');
 
@@ -67,25 +94,36 @@ async function clearFirebaseData() {
 
     const db = admin.firestore();
 
-    // Delete all chat histories
-    console.log('🗑️  Deleting chat histories...');
-    const chatsSnapshot = await db.collection('chatHistories').get();
-    console.log(`   Found ${chatsSnapshot.size} chat(s)`);
-    
-    const chatBatch = db.batch();
-    chatsSnapshot.docs.forEach(doc => chatBatch.delete(doc.ref));
-    await chatBatch.commit();
-    console.log('✅ Chat histories deleted!');
+    // Legacy cleanup (pre-Firestore migration)
+    console.log('🗑️  Deleting legacy chat histories (chatHistories collection)...');
+    await deleteCollection(db.collection('chatHistories'), 'legacy chat record(s)');
 
-    // Delete all user profiles
-    console.log('🗑️  Deleting user profiles...');
-    const profilesSnapshot = await db.collection('userProfiles').get();
-    console.log(`   Found ${profilesSnapshot.size} profile(s)`);
-    
-    const profileBatch = db.batch();
-    profilesSnapshot.docs.forEach(doc => profileBatch.delete(doc.ref));
-    await profileBatch.commit();
-    console.log('✅ User profiles deleted!');
+    console.log('🗑️  Deleting legacy user profiles (userProfiles collection)...');
+    await deleteCollection(db.collection('userProfiles'), 'legacy profile(s)');
+
+    // Current schema cleanup
+    console.log('🗑️  Deleting user chat sessions (users/*/activeChats)...');
+    const usersSnapshot = await db.collection('users').get();
+    console.log(`   Found ${usersSnapshot.size} user document(s)`);
+
+    for (const userDoc of usersSnapshot.docs) {
+      console.log(`   ➤ Clearing data for user: ${userDoc.id}`);
+      const subCollections = await userDoc.ref.listCollections();
+
+      for (const subCol of subCollections) {
+        await deleteCollection(
+          subCol,
+          `${subCol.id} record(s) for ${userDoc.id}`
+        );
+      }
+
+      await userDoc.ref.delete();
+      console.log(`   ✅ User document removed: ${userDoc.id}`);
+    }
+
+    if (usersSnapshot.empty) {
+      console.log('   No user chat documents found');
+    }
 
     // Note: Firebase Storage images would need separate cleanup
     console.log('ℹ️  Note: Firebase Storage images not deleted (manual cleanup if needed)');
