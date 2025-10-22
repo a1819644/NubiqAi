@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Send, Paperclip, Mic, Download, Eye, Copy, Check, Square, Pencil } from "lucide-react";
+import { Send, Paperclip, Mic, Download, Eye, Copy, Check, Square, Pencil, FileText } from "lucide-react";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { toast } from "sonner";
@@ -14,6 +14,7 @@ import {
 } from "./ui/dialog";
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
+import { Badge } from "./ui/badge";
 import { imageStorageService } from "../services/imageStorageService";
 
 // Using a placeholder for image icon
@@ -131,9 +132,24 @@ export function ChatInterface({
   onUpdateChat,
 }: ChatInterfaceProps) {
   
+  // Small inline helper to show truncated text with Show more/less
+  const ExpandableText = ({ text, maxLength }: { text: string; maxLength: number }) => {
+    const [expanded, setExpanded] = useState(false);
+    if (text.length <= maxLength) return <pre className="whitespace-pre-wrap text-xs">{text}</pre>;
+    return (
+      <div>
+        <pre className="whitespace-pre-wrap text-xs">{expanded ? text : text.slice(0, maxLength) + '...'}</pre>
+        <Button size="sm" variant="ghost" onClick={() => setExpanded((s) => !s)}>
+          {expanded ? 'Show less' : 'Show more'}
+        </Button>
+      </div>
+    );
+  };
+  
   const [input, setInput] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
-  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 4MB
+  const MAX_PREVIEW_LENGTH = 800; // chars before truncation
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
@@ -1511,19 +1527,14 @@ ${procResp.extractedText}`,
                                       </div>
                                     </div>
                                   ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.startsWith('https://storage.googleapis.com') || file.includes('.firebasestorage.app') || file.includes('/o/')) ? (
-                                    <div className="flex flex-col gap-2">
-                                      {status === 'error' ? (
-                                        <div className="w-64 h-40 bg-gray-100 border border-dashed border-border rounded-md flex flex-col items-center justify-center gap-2 text-center p-4">
-                                          <div className="text-sm text-muted-foreground">Image unavailable</div>
-                                          <Button size="sm" onClick={() => handleRetryImage(attachmentId)}>
-                                            Retry
-                                          </Button>
-                                        </div>
-                                      ) : (
+                                    // --- Redesigned Image Card ---
+                                    <div className="bg-muted/50 rounded-xl border border-border/20 shadow-sm overflow-hidden w-full max-w-md">
+                                      {/* Image Preview */}
+                                      <div className="bg-muted p-2">
                                         <img
                                           src={buildImageSrc(file, attachmentId)}
-                                          alt={`generated-${idx}`}
-                                          className="max-w-xs rounded-md cursor-pointer hover:opacity-90 transition-opacity"
+                                          alt={message.content || `generated-${idx}`}
+                                          className="w-full h-auto object-contain rounded-lg cursor-pointer transition-opacity hover:opacity-90"
                                           onClick={() => openImageViewer(file, message.content)}
                                           onLoad={() => setImageStatus((prev) => ({ ...prev, [attachmentId]: 'success' }))}
                                           onError={() => {
@@ -1531,19 +1542,18 @@ ${procResp.extractedText}`,
                                             setImageStatus((prev) => ({ ...prev, [attachmentId]: 'error' }));
                                           }}
                                         />
-                                      )}
-                                      <div className="flex gap-2">
-                                        <Button size="sm" variant="outline" onClick={() => openImageViewer(file, message.content)}>
-                                          <Eye className="mr-2 h-4 w-4" /> Open
-                                        </Button>
-                                        <Button size="sm" variant="secondary" onClick={() => downloadImage(file)}>
-                                          <Download className="mr-2 h-4 w-4" /> Download
-                                        </Button>
-                                        {status === 'error' && (
-                                          <Button size="sm" variant="ghost" onClick={() => handleRetryImage(attachmentId)}>
-                                            Retry load
+                                      </div>
+                                      {/* Prompt and Actions */}
+                                      <div className="p-4 pt-2">
+                                        <p className="text-sm text-muted-foreground line-clamp-2 mb-3">{message.content}</p>
+                                        <div className="flex items-center justify-end gap-2">
+                                          <Button size="sm" variant="outline" className="h-8" onClick={() => openImageViewer(file, message.content)}>
+                                            <Eye className="mr-1.5 h-4 w-4" /> Open
                                           </Button>
-                                        )}
+                                          <Button size="sm" variant="outline" className="h-8" onClick={() => downloadImage(file)}>
+                                            <Download className="mr-1.5 h-4 w-4" /> Download
+                                          </Button>
+                                        </div>
                                       </div>
                                     </div>
                                   ) : (
@@ -1552,6 +1562,16 @@ ${procResp.extractedText}`,
                                 </React.Fragment>
                                 );
                               })}
+                            </div>
+                          )}
+                          {/* Document content preview */}
+                          {message.role === 'assistant' && message.content?.startsWith('Extracted from') && (
+                            <div className="mt-2 p-3 bg-background/50 rounded-lg border border-border/50">
+                              <div className="flex items-center gap-2 mb-2">
+                                <FileText className="w-4 h-4 text-muted-foreground" />
+                                <Badge variant="secondary">Document Content</Badge>
+                              </div>
+                              <ExpandableText text={message.content} maxLength={MAX_PREVIEW_LENGTH} />
                             </div>
                           )}
                         </div>
@@ -1743,7 +1763,7 @@ ${procResp.extractedText}`,
           multiple
           className="hidden"
           onChange={handleFileAttach}
-          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx"
+          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json"
         />
       </div>
       {/* Image viewer modal */}
