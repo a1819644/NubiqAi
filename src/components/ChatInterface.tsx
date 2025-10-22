@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect } from "react";
 import { Send, Paperclip, Mic, Download, Eye, Copy, Check, Square, Pencil } from "lucide-react";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
-import { Badge } from "./ui/badge";
 import { toast } from "sonner";
 import type { ChatHistory as Chat, ChatMessage as Message, User } from "../types"; // UPDATED: Use centralized types
 import { apiService, handleApiError } from "../services/api";
@@ -15,10 +14,110 @@ import {
 } from "./ui/dialog";
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
-import { ImageMessage } from "../ImageMessage";
+import { imageStorageService } from "../services/imageStorageService";
 
 // Using a placeholder for image icon
 const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTIgMkgxNFYxNEgyVjJaIiBzdHJva2U9IiM2NjY2NjYiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIvPgo8cGF0aCBkPSJNMiAxMkw2IDhMOCAxMEwxMiA2TDE0IDhWMTJIMloiIGZpbGw9IiM2NjY2NjYiLz4KPC9zdmc+';
+
+const IMAGE_STOP_WORDS = new Set([
+  "generate",
+  "generating",
+  "create",
+  "creating",
+  "draw",
+  "drawing",
+  "make",
+  "making",
+  "produce",
+  "producing",
+  "render",
+  "rendering",
+  "design",
+  "designing",
+  "show",
+  "showing",
+  "give",
+  "giving",
+  "send",
+  "sending",
+  "want",
+  "needs",
+  "need",
+  "like",
+  "please",
+  "can",
+  "could",
+  "would",
+  "you",
+  "me",
+  "an",
+  "a",
+  "the",
+  "some",
+  "any",
+  "another",
+  "more",
+  "again",
+  "one",
+  "something",
+  "anything",
+  "image",
+  "images",
+  "picture",
+  "pictures",
+  "photo",
+  "photos",
+  "drawing",
+  "drawings",
+  "illustration",
+  "illustrations",
+  "art",
+  "artwork",
+  "sketch",
+  "sketches",
+  "logo",
+  "logos",
+  "icon",
+  "icons",
+  "of",
+  "for",
+  "to",
+]);
+
+const GENERIC_IMAGE_PATTERNS = [
+  /^generate( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^create( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^make( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^draw( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^i (need|want|would like)( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+  /^can you (generate|create|make|draw)( me)?( an?| the)? (image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)s?\.?$/i,
+];
+
+const analyzeImageIntent = (raw: string) => {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { wantsImage: false, needsDetails: false, isImagineCommand: false };
+  }
+
+  const lower = trimmed.toLowerCase();
+  const isImagineCommand = lower.startsWith('/imagine');
+  const hasImageWord = /(image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)/.test(lower);
+  const hasVerb = /(generate|create|draw|make|produce|design|render|show|give|send|need|want|would like)/.test(lower);
+  const wantsImage = isImagineCommand || (hasImageWord && hasVerb);
+
+  if (!wantsImage) {
+    return { wantsImage: false, needsDetails: false, isImagineCommand };
+  }
+
+  const isGeneric = GENERIC_IMAGE_PATTERNS.some((pattern) => pattern.test(lower));
+
+  const tokens = lower.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const descriptiveTokens = tokens.filter((token) => !IMAGE_STOP_WORDS.has(token));
+  const hasSubject = descriptiveTokens.length > 0;
+  const needsDetails = !isImagineCommand && (isGeneric || !hasSubject);
+
+  return { wantsImage: true, needsDetails, isImagineCommand };
+};
 
 interface ChatInterfaceProps {
   activeChat: Chat | null;
@@ -31,24 +130,10 @@ export function ChatInterface({
   user,
   onUpdateChat,
 }: ChatInterfaceProps) {
-  // Small inline helper to show truncated text with Show more/less
-  const ExpandableText = ({ text, maxLength }: { text: string; maxLength: number }) => {
-    const [expanded, setExpanded] = useState(false);
-    if (text.length <= maxLength) return <pre className="whitespace-pre-wrap text-xs">{text}</pre>;
-    return (
-      <div>
-        <pre className="whitespace-pre-wrap text-xs">{expanded ? text : text.slice(0, maxLength) + '...'}</pre>
-        <Button size="sm" variant="ghost" onClick={() => setExpanded((s) => !s)}>
-          {expanded ? 'Show less' : 'Show more'}
-        </Button>
-      </div>
-    );
-  };
   
   const [input, setInput] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
-  const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB
-  const MAX_PREVIEW_LENGTH = 800; // chars before truncation
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
@@ -58,15 +143,83 @@ export function ChatInterface({
   // State for message editing
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editedContent, setEditedContent] = useState<string>("");
+  const [imageStatus, setImageStatus] = useState<Record<string, 'loading' | 'success' | 'error'>>({});
+  const [imageRetryTokens, setImageRetryTokens] = useState<Record<string, number>>({});
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // Create a stable reference to avoid issues with null activeChat
+  const chat = activeChat || {
+    id: 'temp',
+    title: 'New Chat',
+    messages: [],
+    createdAt: new Date(), // Should be overwritten by real chat
+    updatedAt: new Date(), // Should be overwritten by real chat
+  };
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeChat?.messages]);
+  }, [chat.messages]);
+
+  // 💾 Preload images from IndexedDB when chat loads
+  useEffect(() => {
+    const preloadChatImages = async () => {
+      if (!activeChat?.id || !user?.id) return;
+
+      try {
+        console.log(`🔍 Checking IndexedDB for cached images in chat ${activeChat.id}...`);
+        const cachedImages = await imageStorageService.getChatImages(activeChat.id);
+        
+        if (cachedImages.length > 0) {
+          console.log(`✅ Found ${cachedImages.length} cached images in IndexedDB`);
+          
+          // Update messages with cached images (if they're not already loaded)
+          const updatedMessages = activeChat.messages.map(msg => {
+            const cachedImage = cachedImages.find(img => img.id === msg.id);
+            
+            if (cachedImage && msg.attachments) {
+              // Replace Firebase URL with cached base64 for instant loading
+              const hasFirebaseUrl = msg.attachments.some(att => {
+                if (typeof att !== 'string') return false;
+                // Support multiple storage hostnames and signed URLs
+                return (
+                  att.startsWith('https://firebasestorage.googleapis.com') ||
+                  att.startsWith('https://storage.googleapis.com') ||
+                  att.includes('/o/') // Firebases signed URL pattern
+                );
+              });
+              
+              if (hasFirebaseUrl) {
+                return {
+                  ...msg,
+                  attachments: [cachedImage.imageData] // Use cached base64
+                };
+              }
+            }
+            
+            return msg;
+          });
+          
+          // Only update if we actually replaced some URLs
+          const hasChanges = updatedMessages.some((msg, idx) => 
+            msg.attachments !== activeChat.messages[idx].attachments
+          );
+          
+          if (hasChanges) {
+            onUpdateChat({ ...activeChat, messages: updatedMessages });
+            console.log('✅ Loaded images from IndexedDB cache (instant)');
+          }
+        }
+      } catch (error) {
+        console.warn('⚠️ Failed to preload images from IndexedDB:', error);
+      }
+    };
+
+    preloadChatImages();
+  }, [activeChat?.id, user?.id]);
 
   useEffect(() => {
     const handleBeforeUnload = () => {
@@ -92,18 +245,42 @@ export function ChatInterface({
     const files = Array.from(event.target.files || []);
     const accepted: File[] = [];
     const rejected: string[] = [];
+    const unsupported: string[] = [];
+
+    // Define supported file types
+    const SUPPORTED_TYPES = [
+      'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
+      'text/plain', 'text/markdown', 'text/csv',
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/json',
+    ];
 
     for (const f of files) {
+      // Check file type first
+      if (!SUPPORTED_TYPES.includes(f.type)) {
+        unsupported.push(f.name);
+        continue;
+      }
+      
+      // Check file size
       if (f.size > MAX_FILE_SIZE) {
         rejected.push(f.name);
         continue;
       }
+      
       accepted.push(f);
     }
 
     if (accepted.length > 0) {
       setAttachedFiles((prev) => [...prev, ...accepted]);
       toast.success(`${accepted.length} file(s) attached`);
+    }
+
+    if (unsupported.length > 0) {
+      toast.error(`Unsupported file type(s): ${unsupported.join(', ')}\nSupported: PDF, DOCX, DOC, TXT, MD, CSV, JSON, XLSX, Images`);
     }
 
     if (rejected.length > 0) {
@@ -113,6 +290,28 @@ export function ChatInterface({
 
   const removeFile = (index: number) => {
     setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const getAttachmentId = (messageId: string | undefined, timestamp: Date, index: number) => {
+    const baseId = messageId ?? `${timestamp.getTime()}`;
+    return `${baseId}-${index}`;
+  };
+
+  const buildImageSrc = (original: string, attachmentId: string) => {
+    if (original.startsWith('data:')) {
+      return original;
+    }
+    const retryToken = imageRetryTokens[attachmentId];
+    if (!retryToken) {
+      return original;
+    }
+    const separator = original.includes('?') ? '&' : '?';
+    return `${original}${separator}retry=${retryToken}`;
+  };
+
+  const handleRetryImage = (attachmentId: string) => {
+    setImageStatus((prev) => ({ ...prev, [attachmentId]: 'loading' }));
+    setImageRetryTokens((prev) => ({ ...prev, [attachmentId]: Date.now() }));
   };
 
   const startRecording = () => {
@@ -170,6 +369,10 @@ export function ChatInterface({
     continuationChat?: Chat // Optional chat state for continuations
   ) => {
     if (!activeChat) return;
+    if (isLoading && !isContinuation) {
+      toast.info('Hold on—finish the current response before asking something new.');
+      return;
+    }
     if (!text.trim() && files.length === 0 && !isVoice) return;
 
     // 🔒 CAPTURE THE CHAT ID AND STATE AT THE TIME OF SENDING
@@ -221,25 +424,151 @@ export function ChatInterface({
     const signal = controller.signal;
 
     try {
-      const imageKeywords = ['generate', 'draw', 'create', 'image', 'gambar', 'buatkan'];
-      const containsImageKeyword = imageKeywords.some(keyword => text.toLowerCase().includes(keyword));
-      const isImagineCommand = text.trim().startsWith('/imagine');
+      // --- LOGIC CONFIRMATION IMAGE---
+      const intent = analyzeImageIntent(text);
+      const shouldHandleNaturalImage = intent.wantsImage && !intent.isImagineCommand && !isImageModeActive && !skipConfirmation;
 
-      // Only show confirmation if not skipping and conditions are met
-      if (containsImageKeyword && !isImagineCommand && !isImageModeActive && !skipConfirmation) {
-        setPendingImagePrompt(text); // SAVE REAL PROMPT FOR IMAGE MODE
-        const confirmationId = `confirm-${Date.now()}`;
-        const confirmationMessage: Message = {
-          id: confirmationId,
+      if (shouldHandleNaturalImage) {
+        if (intent.needsDetails) {
+          const clarificationMessage: Message = {
+            id: `clarify-${Date.now()}`,
+            content: 'I can definitely generate something for you! What would you like the image to show?',
+            role: 'assistant',
+            timestamp: new Date(),
+          };
+
+          const chatWithClarification = {
+            ...updatedChat,
+            messages: [...updatedChat.messages, clarificationMessage],
+            updatedAt: new Date(),
+          };
+
+          safeUpdateChat(() => chatWithClarification);
+          setIsLoading(false);
+          controller.abort();
+          abortControllerRef.current = null;
+          toast.info('Tell me what you want the image to depict.');
+          return;
+        }
+
+        console.log('🎨 Detected image generation request - processing directly!');
+        console.log('🖼️ Generating image with prompt:', text);
+        
+        // Insert a placeholder AI message to show a skeleton while image generates
+        const placeholderMessage: Message = {
+          id: `gen-${Date.now()}`,
+          content: 'Generating your image...',
           role: 'assistant',
-          type: 'confirmation',
-          content: `It looks like you want to generate an image. Would you like to proceed?`,
           timestamp: new Date(),
-          confirmationId: confirmationId,
+          attachments: ['__generating_image__'],
         };
-        safeUpdateChat((chat) => ({ ...chat, messages: [...chat.messages, confirmationMessage] }));
-        setIsLoading(false); // Stop loading as we are waiting for user confirmation
-        return;
+
+        const chatWithPlaceholder = {
+          ...updatedChat,
+          messages: [...updatedChat.messages, placeholderMessage],
+        };
+
+        safeUpdateChat(() => chatWithPlaceholder);
+
+        // Build conversation history from this chat only - limit to last 2 exchanges (4 messages)
+        const contextMessages = updatedChat.messages
+          .slice(0, Math.max(updatedChat.messages.length - 1, 0)) // Exclude the current prompt
+          .filter(m => m.role === 'user' || m.role === 'assistant');
+
+        const historyWindow = contextMessages.slice(-4); // Up to two user/assistant pairs
+        const history = historyWindow.map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content
+        }));
+
+        if (history.length > 0) {
+          console.log(`💡 Image context: Using last ${history.length} message(s) from chat ${targetChatId}`);
+        } else {
+          console.log(`💡 Image context: No prior history in chat ${targetChatId}; using prompt only`);
+        }
+
+        // Call backend image generation with user context AND conversation history
+        const imgResp = await apiService.generateImage(
+          text,
+          user?.id,
+          targetChatId,
+          user?.name,
+          history.length > 0 ? history : undefined // 🎯 Pass context only when we have prior chat history
+        );
+
+        console.log('📥 Image generation response:', {
+          success: imgResp.success,
+          hasImageBase64: !!imgResp.imageBase64,
+          hasImageUri: !!imgResp.imageUri,
+        });
+
+        if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
+          // Store image in IndexedDB for persistence
+          const imageUrl = imgResp.imageUri || (imgResp.imageBase64 ? `data:image/png;base64,${imgResp.imageBase64}` : '');
+          // Use the SAME message ID for cache and chat message so preload can map them
+          const messageId = `img-${Date.now()}`;
+
+          try {
+            await imageStorageService.storeImage(
+              messageId,
+              user?.id || 'anonymous',
+              targetChatId,
+              imageUrl,
+              text,
+              imgResp.imageUri || undefined
+            );
+            console.log('💾 Image cached in IndexedDB for instant loading');
+          } catch (cacheError) {
+            console.warn('⚠️ Failed to cache image in IndexedDB:', cacheError);
+          }
+
+          // Create the actual image message with metadata
+          const imageMessage: Message = {
+            id: messageId,
+            content: imgResp.altText || text,
+            role: 'assistant',
+            timestamp: new Date(),
+            attachments: [imageUrl],
+            metadata: imgResp.metadata ? {
+              tokens: imgResp.metadata.tokens,
+              duration: imgResp.metadata.duration,
+            } : undefined,
+          };
+
+          const finalChat = {
+            ...chatWithPlaceholder,
+            messages: [
+              ...chatWithPlaceholder.messages.filter(m => m.id !== placeholderMessage.id),
+              imageMessage
+            ]
+          };
+
+          safeUpdateChat(() => finalChat);
+          setIsLoading(false);
+          toast.success('✨ Image generated successfully!');
+          return;
+        } else {
+          // Image generation failed
+          const errorMessage: Message = {
+            id: `err-${Date.now()}`,
+            content: imgResp.error || 'Failed to generate image. Please try again.',
+            role: 'assistant',
+            timestamp: new Date(),
+          };
+
+          const errorChat = {
+            ...chatWithPlaceholder,
+            messages: [
+              ...chatWithPlaceholder.messages.filter(m => m.id !== placeholderMessage.id),
+              errorMessage
+            ]
+          };
+
+          safeUpdateChat(() => errorChat);
+          setIsLoading(false);
+          toast.error('Failed to generate image');
+          return;
+        }
       }
 
       // Check if this request is still the active one before updating UI
@@ -272,21 +601,61 @@ export function ChatInterface({
 
         safeUpdateChat(() => chatWithPlaceholder);
 
-        // Call backend image generation
-        const imgResp = await apiService.generateImage(prompt);
+        // Call backend image generation with user context
+        const imgResp = await apiService.generateImage(
+          prompt,
+          user?.id,
+          targetChatId,
+          user?.name
+        );
+
+        console.log('📥 Image generation response:', {
+          success: imgResp.success,
+          hasImageBase64: !!imgResp.imageBase64,
+          imageBase64Length: imgResp.imageBase64?.length || 0,
+          hasImageUri: !!imgResp.imageUri,
+          imageUri: imgResp.imageUri,
+          altText: imgResp.altText
+        });
 
         if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
           const imageUrl = imgResp.imageBase64
             ? `data:image/png;base64,${imgResp.imageBase64}`
             : imgResp.imageUri!;
 
+          console.log('🖼️ Creating image URL:', imageUrl.substring(0, 100) + '...');
+
+          // 💾 Store image in IndexedDB for instant loading on page reload
+          const messageId = (Date.now() + 2).toString();
+          try {
+            if (user?.id && imageUrl) {
+              await imageStorageService.storeImage(
+                messageId,
+                user.id,
+                targetChatId,
+                imageUrl,
+                prompt,
+                imgResp.imageUri || undefined // Firebase Storage URL
+              );
+              console.log('💾 Image cached in IndexedDB for instant loading');
+            }
+          } catch (cacheError) {
+            console.warn('⚠️ Failed to cache image in IndexedDB (non-critical):', cacheError);
+          }
+
           const aiImageMessage: Message = {
-            id: (Date.now() + 2).toString(),
+            id: messageId,
             content: imgResp.altText || `Image generated for: ${prompt}`,
             role: 'assistant',
             timestamp: new Date(),
             attachments: [imageUrl],
+            metadata: imgResp.metadata ? {
+              tokens: imgResp.metadata.tokens,
+              duration: imgResp.metadata.duration,
+            } : undefined,
           };
+
+          console.log('✅ Image message created, updating chat...');
 
           // Replace placeholder with actual image message
           const finalMessages = chatWithPlaceholder.messages
@@ -321,6 +690,137 @@ export function ChatInterface({
 
       // Find image file if any
       const imageFile = files.find(file => file.type.startsWith('image/'));
+      // 🧠 MEMORY SYSTEM LOGGING
+      console.group('🧠 Memory System - Request');
+      console.log('📤 Sending to AI:', {
+        chatId: targetChatId,
+        messageCount: targetChatSnapshot.messages.length,
+        isNewChat: targetChatSnapshot.messages.length === 0,
+        useMemory: true,
+        promptPreview: text.substring(0, 50) + (text.length > 50 ? '...' : '')
+      });
+      console.groupEnd();
+
+      // � Pre-process any attached documents before calling the model
+      const nonImageFiles = files.filter(f => !f.type.startsWith('image/'));
+      if (nonImageFiles.length > 0) {
+        const fileToBase64 = async (file: File) => {
+          const buffer = await file.arrayBuffer();
+          const bytes = new Uint8Array(buffer);
+          let binary = '';
+          for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          return btoa(binary);
+        };
+
+        for (const file of nonImageFiles) {
+          const alreadyProcessed = targetChatSnapshot.messages.some((msg) => {
+            const meta = (msg.metadata as any) || {};
+            return meta.isDocumentContext && meta.documentName === file.name && meta.documentSize === file.size;
+          });
+          if (alreadyProcessed) {
+            console.log(`ℹ️ Skipping previously processed document: ${file.name}`);
+            continue;
+          }
+
+          console.log(`📄 Processing document before AI call: ${file.name}`);
+
+          try {
+            const base64 = await fileToBase64(file);
+            const procResp = await apiService.processDocument({
+              fileBase64: base64,
+              mimeType: file.type,
+              userId: user?.id,
+              storeInMemory: true,
+            });
+
+            if (!procResp.success || !procResp.extractedText) {
+              throw new Error(procResp.error || 'Document processing failed');
+            }
+
+            console.log(`✅ Document processed: ${file.name} (${procResp.extractedText.length} characters)`);
+
+            const contextMessage: Message = {
+              id: `doc-context-${Date.now()}`,
+              content: `[Document: ${file.name}]
+${procResp.extractedText}`,
+              role: 'system',
+              timestamp: new Date(),
+              metadata: {
+                documentName: file.name,
+                documentType: file.type,
+                documentSize: file.size,
+                isDocumentContext: true,
+              } as any,
+            };
+
+            safeUpdateChat((chat) => ({
+              ...chat,
+              messages: [...chat.messages, contextMessage],
+            }));
+
+            // Keep local references in sync with the snapshot updates
+            updatedChat = { ...targetChatSnapshot };
+
+            toast.success(`📄 ${file.name} processed and ready for questions`);
+          } catch (err) {
+            if ((err as Error).name === 'AbortError') {
+              console.log(`⚠️ Document processing aborted for ${file.name}`);
+              return;
+            }
+
+            const errorMessage = handleApiError(err);
+            let friendly = `Failed to process ${file.name}: ${errorMessage}`;
+
+            if (errorMessage.includes("don't have the capability")) {
+              friendly = errorMessage;
+            } else if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
+              friendly += ' — Try a smaller file (under 10MB).';
+            } else if (errorMessage.toLowerCase().includes('too large') || errorMessage.toLowerCase().includes('size')) {
+              friendly = `${file.name} is too large. Please use files under 10MB.`;
+            }
+
+            toast.error(friendly);
+            console.error('❌ Document processing failed:', err);
+          }
+        }
+      }
+
+      // �📝 Smart conversation history: Last 5 messages + summary of older ones
+      const RECENT_MESSAGE_LIMIT = 5;
+      const totalMessages = targetChatSnapshot.messages.length;
+      
+      let conversationHistory;
+      let conversationSummary = '';
+      
+      if (totalMessages <= RECENT_MESSAGE_LIMIT) {
+        // Short conversation: send all messages
+        conversationHistory = targetChatSnapshot.messages.map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }));
+      } else {
+        // Long conversation: send last 20 + summary of older messages
+        const olderMessages = targetChatSnapshot.messages.slice(0, totalMessages - RECENT_MESSAGE_LIMIT);
+        const recentMessages = targetChatSnapshot.messages.slice(-RECENT_MESSAGE_LIMIT);
+        
+        // Create summary of older messages
+        const olderMessagesPreview = olderMessages
+          .filter(msg => msg.role === 'user' || msg.role === 'assistant')
+          .slice(-10) // Look at last 10 of the older messages for summary
+          .map(msg => `${msg.role === 'user' ? 'User' : 'AI'}: ${msg.content.substring(0, 100)}...`)
+          .join('\n');
+        
+        conversationSummary = `[Earlier conversation summary: ${olderMessages.length} messages from the start of this chat. Most recent older topics: ${olderMessagesPreview}]`;
+        
+        conversationHistory = recentMessages.map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }));
+        
+        console.log(`💡 Optimized context: Sending ${conversationHistory.length} recent messages + summary of ${olderMessages.length} older messages`);
+      }
       
       // Call the backend API with chat-scoped memory
       const response = await apiService.askAI({
@@ -328,17 +828,83 @@ export function ChatInterface({
         image: imageFile,
         chatId: targetChatId,                          // 🎯 NEW! For chat-scoped memory
         messageCount: targetChatSnapshot.messages.length, // 🎯 NEW! Detect new vs continuing chat
+        conversationHistory,                           // 🎯 Last 20 messages
+        conversationSummary,                           // 🎯 Summary of older messages (if any)
         userId: user?.id,                              // 🎯 NEW! Pass actual user ID from auth
         userName: user?.name,                          // 🎯 NEW! Pass user name for auto-profile creation
         useMemory: true
       });
 
       if (response.success && response.text) {
+        // Check if response includes an image (AI detected image request)
+        const hasImage = (response as any).isImageGeneration && 
+                        ((response as any).imageBase64 || (response as any).imageUri);
+        
+        if (hasImage) {
+          console.log('🖼️ AI response includes generated image!');
+          
+          // Create image URL
+          const imageUrl = (response as any).imageBase64
+            ? `data:image/png;base64,${(response as any).imageBase64}`
+            : (response as any).imageUri!;
+          
+          const messageId = (Date.now() + 1).toString();
+          
+          // 💾 Store image in IndexedDB for instant loading on page reload
+          try {
+            if (user?.id && imageUrl) {
+              await imageStorageService.storeImage(
+                messageId,
+                user.id,
+                targetChatId,
+                imageUrl,
+                text, // Original user prompt
+                (response as any).imageUri || undefined
+              );
+              console.log('💾 Image cached in IndexedDB for instant loading');
+            }
+          } catch (cacheError) {
+            console.warn('⚠️ Failed to cache image in IndexedDB (non-critical):', cacheError);
+          }
+          
+          const aiMessage: Message = {
+            id: messageId,
+            content: response.text,
+            role: "assistant",
+            timestamp: new Date(),
+            attachments: [imageUrl], // Include the image as attachment
+            metadata: response.metadata ? {
+              tokens: response.metadata.tokens,
+              duration: response.metadata.duration,
+            } : undefined,
+          };
+
+          const finalChat = {
+            ...updatedChat,
+            messages: [...updatedChat.messages, aiMessage],
+            title: isFirstMessage
+              ? (text || "New Chat").slice(0, 40) + (text.length > 40 ? "..." : "")
+              : updatedChat.title,
+          };
+
+          // Check if this request is still the active one before updating UI
+          if (abortControllerRef.current !== controller) return;
+
+          safeUpdateChat(() => finalChat);
+          setIsLoading(false);
+          return;
+        }
+        
+        // Regular text response (no image)
         const aiMessage: Message = {
           id: (Date.now() + 1).toString(),
           content: response.text,
           role: "assistant",
           timestamp: new Date(),
+          metadata: response.metadata ? {
+            tokens: response.metadata.tokens,
+            duration: response.metadata.duration,
+          } : undefined,
         };
 
         const finalChat = {
@@ -362,94 +928,6 @@ export function ChatInterface({
         throw new Error('Failed to get AI response');
       }
       
-      // If there are non-image files attached, process them using processDocument
-      const nonImageFiles = files.filter(f => !f.type.startsWith('image/'));
-      for (const file of nonImageFiles) {
-        // create placeholder
-        const placeholder: Message = {
-          id: `proc-${Date.now()}`,
-          content: `Processing file: ${file.name}`,
-          role: 'assistant',
-          timestamp: new Date(),
-          attachments: ['__processing_file__']
-        };
-
-        const withPlaceholder = {
-          ...updatedChat,
-          messages: [...updatedChat.messages, placeholder],
-        };
-
-        // Check if this request is still the active one before updating UI
-        if (abortControllerRef.current !== controller) return;
-
-        safeUpdateChat(() => withPlaceholder);
-
-        // convert file to base64
-        const buffer = await file.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-        let binary = '';
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        const base64 = btoa(binary);
-
-        try {
-          const procResp = await apiService.processDocument({ fileBase64: base64, mimeType: file.type });
-          if (procResp.success && procResp.extractedText) {
-            const resultMessage: Message = {
-              id: (Date.now() + 3).toString(),
-              content: `Extracted from ${file.name}:\n\n${procResp.extractedText}`,
-              role: 'assistant',
-              timestamp: new Date(),
-            };
-
-            const replacedMessages = withPlaceholder.messages
-              .filter(m => !(m.attachments && m.attachments.includes('__processing_file__')))
-              .concat(resultMessage);
-
-            // Check if this request is still the active one before updating UI
-            if (abortControllerRef.current !== controller) return;
-
-            safeUpdateChat((chat) => ({ ...chat, messages: replacedMessages }));
-            // If the request was aborted while we were processing, the controller would be null.
-            // We should stop here to prevent further execution.
-            if (!abortControllerRef.current) {
-              return;
-            }
-          } else {
-            throw new Error(procResp.error || 'Document processing failed');
-          }
-        } catch (err) {
-          // Check if the error is due to the request being aborted
-          if ((err as Error).name === 'AbortError') {
-            // Don't add an error message to the chat if the user cancelled it.
-            // The handleStopGeneration function will show a toast.
-            return;
-          }
-          const errorMessage = handleApiError(err);
-          // Provide a more helpful message if it's a timeout
-          let friendly = `Failed to process ${file.name}: ${errorMessage}`;
-          if (errorMessage.toLowerCase().includes('timeout') || errorMessage.toLowerCase().includes('timed out')) {
-            friendly += ' — processing timed out. Try a smaller file (under 4MB), or try again later.';
-          }
-
-          const errorMsg: Message = {
-            id: (Date.now() + 4).toString(),
-            content: friendly,
-            role: 'assistant',
-            timestamp: new Date(),
-          };
-
-          const replacedMessages = withPlaceholder.messages
-            .filter(m => !(m.attachments && m.attachments.includes('__processing_file__')))
-            .concat(errorMsg);
-
-          // Check if this request is still the active one before updating UI
-          if (abortControllerRef.current !== controller) return;
-
-          safeUpdateChat((chat) => ({ ...chat, messages: replacedMessages }));
-        }
-      }
     } catch (error) {
       // Check if the error is due to the request being aborted
       // Also check our custom flag to ensure it was a user-initiated stop
@@ -483,6 +961,7 @@ export function ChatInterface({
       toast.error(`Failed to send message: ${errorMessage}`);
     } finally {
       setIsLoading(false);
+      setIsImageModeActive(false); // 🔧 FIX: Always reset image mode, even on error
       abortControllerRef.current = null; // Clean up controller
     }
   };
@@ -859,24 +1338,13 @@ export function ChatInterface({
     }
   };
 
-  if (!activeChat) {
-    return (
-      <div className="flex-1 flex items-center justify-center">
-        <div className="text-center">
-          <h3 className="text-lg font-medium mb-2">Welcome to AI Portal</h3>
-          <p className="text-muted-foreground">Start a new chat to begin</p>
-        </div>
-      </div>
-    );
-  }
-
   // This effect handles sending a message after image mode is confirmed and activated.
   useEffect(() => {
     // Only run if image mode is active and there's a prompt waiting.
     if (isImageModeActive && pendingImagePrompt) {
       // Use isContinuation: true to prevent duplicating the user's message.
       // The original message that triggered the confirmation is already in the chat.
-      handleSendMessage(pendingImagePrompt, [], false, true, false, activeChat);
+      handleSendMessage(pendingImagePrompt, [], false, true, false, chat);
       setPendingImagePrompt(null); // Clear the prompt after sending.
     }
   }, [isImageModeActive, pendingImagePrompt]); // Dependencies are correct
@@ -903,19 +1371,28 @@ export function ChatInterface({
     return () => document.removeEventListener('keydown', handleGlobalKeyDown);
   }, [activeChat?.messages]); // Rerun when messages change
 
+  // If no active chat, show a placeholder
+  if (!activeChat) {
+    return (
+      <div className="flex flex-col h-full bg-background text-foreground items-center justify-center">
+        <p className="text-muted-foreground">No active chat. Click "New Chat" to start.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-full bg-background text-foreground">
       {/* Header */}
       <div className="border-b border-border p-4">
-        <h1 className="text-xl font-medium">{activeChat.title}</h1>
+        <h1 className="text-xl font-medium">{chat.title}</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          {activeChat.messages.length} messages
+          {chat.messages.length} messages
         </p>
       </div>
 
       {/* Messages Area */}
       <div className="flex-1 overflow-auto">
-        {activeChat.messages.length === 0 ? (
+        {chat.messages.length === 0 ? (
           <div className="h-full flex items-center justify-center bg-background">
             <div className="text-center max-w-md px-6">
               <div className="mb-6">
@@ -957,10 +1434,12 @@ export function ChatInterface({
           </div>
         ) : (
           <div className="p-6 space-y-6 max-w-4xl mx-auto">
-            {activeChat.messages.map((message) => (
-              <div
-                key={message.id}
-                className={`group flex ${ 
+            {chat.messages
+              .filter(message => message.role !== 'system') // Hide system messages (document context)
+              .map((message, messageIndex) => (
+              <div 
+                key={message.id ?? `${message.timestamp.getTime()}-${message.role}-${messageIndex}`}
+                className={`group flex ${
                   message.role === "user" ? "justify-end" : "justify-start"
                 }`}
               >
@@ -1018,8 +1497,11 @@ export function ChatInterface({
                           )}
                           {message.attachments && message.attachments.length > 0 && editingMessageId !== message.id && (
                             <div className="mt-2 space-y-1">
-                              {message.attachments.map((file, idx) => (
-                                <React.Fragment key={idx}>
+                              {message.attachments.map((file, idx) => {
+                                const attachmentId = getAttachmentId(message.id, message.timestamp, idx);
+                                const status = imageStatus[attachmentId] ?? 'loading';
+                                return (
+                                  <React.Fragment key={`${message.id}:${idx}:${typeof file === 'string' ? file.slice(0, 24) : 'file'}`}>
                                   {typeof file === 'string' && (file === '__generating_image__' || file === '__editing_image__') ? (
                                     <div className="w-64 h-40 bg-gray-100 rounded-md animate-pulse flex items-center justify-center">
                                       <div className="text-sm text-muted-foreground">
@@ -1028,42 +1510,74 @@ export function ChatInterface({
                                           : 'Generating image...'}
                                       </div>
                                     </div>
-                                  ) : typeof file === 'string' && file.startsWith('data:image') ? (
-                                    // --- Redesigned Image Card ---
-                                    <div className="bg-muted/50 rounded-xl border border-border/20 shadow-sm overflow-hidden w-full max-w-md">
-                                      {/* Image Preview */}
-                                      <div className="bg-muted p-2">
-                                        <img
-                                          src={file}
-                                          alt={message.content || `generated-${idx}`}
-                                          className="w-full h-auto object-contain rounded-lg cursor-pointer transition-opacity hover:opacity-90"
-                                          onClick={() => openImageViewer(file, message.content)}
-                                        />
-                                      </div>
-                                      {/* Prompt and Actions */}
-                                      <div className="p-4 pt-2">
-                                        <p className="text-sm text-muted-foreground line-clamp-2 mb-3">{message.content}</p>
-                                        <div className="flex items-center justify-end gap-2">
-                                          <Button size="sm" variant="outline" className="h-8" onClick={() => openImageViewer(file, message.content)}>
-                                            <Eye className="mr-1.5 h-4 w-4" /> Open
-                                          </Button>
-                                          <Button size="sm" variant="outline" className="h-8" onClick={() => downloadImage(file)}>
-                                            <Download className="mr-1.5 h-4 w-4" /> Download
+                                  ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.startsWith('https://storage.googleapis.com') || file.includes('.firebasestorage.app') || file.includes('/o/')) ? (
+                                    <div className="flex flex-col gap-2">
+                                      {status === 'error' ? (
+                                        <div className="w-64 h-40 bg-gray-100 border border-dashed border-border rounded-md flex flex-col items-center justify-center gap-2 text-center p-4">
+                                          <div className="text-sm text-muted-foreground">Image unavailable</div>
+                                          <Button size="sm" onClick={() => handleRetryImage(attachmentId)}>
+                                            Retry
                                           </Button>
                                         </div>
+                                      ) : (
+                                        <img
+                                          src={buildImageSrc(file, attachmentId)}
+                                          alt={`generated-${idx}`}
+                                          className="max-w-xs rounded-md cursor-pointer hover:opacity-90 transition-opacity"
+                                          onClick={() => openImageViewer(file, message.content)}
+                                          onLoad={() => setImageStatus((prev) => ({ ...prev, [attachmentId]: 'success' }))}
+                                          onError={() => {
+                                            console.error('Failed to load image:', file);
+                                            setImageStatus((prev) => ({ ...prev, [attachmentId]: 'error' }));
+                                          }}
+                                        />
+                                      )}
+                                      <div className="flex gap-2">
+                                        <Button size="sm" variant="outline" onClick={() => openImageViewer(file, message.content)}>
+                                          <Eye className="mr-2 h-4 w-4" /> Open
+                                        </Button>
+                                        <Button size="sm" variant="secondary" onClick={() => downloadImage(file)}>
+                                          <Download className="mr-2 h-4 w-4" /> Download
+                                        </Button>
+                                        {status === 'error' && (
+                                          <Button size="sm" variant="ghost" onClick={() => handleRetryImage(attachmentId)}>
+                                            Retry load
+                                          </Button>
+                                        )}
                                       </div>
                                     </div>
                                   ) : (
                                     <div className="text-xs opacity-80">📎 {file}</div>
                                   )}
                                 </React.Fragment>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
                         </div>
                       </div>
                       <div className="flex items-center gap-2 text-xs text-muted-foreground mt-2 px-1">
                           <span>{message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}</span>
+                          {/* Metadata display */}
+                          {message.role === 'assistant' && message.metadata && (
+                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-muted/50 text-xs">
+                              {message.metadata.tokens && (
+                                <span className="flex items-center gap-0.5">
+                                  <span className="font-mono">{message.metadata.tokens.toLocaleString()}</span>
+                                  <span className="text-muted-foreground/70">tokens</span>
+                                </span>
+                              )}
+                              {message.metadata.duration && (
+                                <>
+                                  {message.metadata.tokens && <span className="text-muted-foreground/50">•</span>}
+                                  <span className="flex items-center gap-0.5">
+                                    <span className="font-mono">{message.metadata.duration.toFixed(2)}</span>
+                                    <span className="text-muted-foreground/70">s</span>
+                                  </span>
+                                </>
+                              )}
+                            </span>
+                          )}
                           {/* Action Buttons */}
                           {(message.content && message.content.trim()) && (
                             <div>
@@ -1125,7 +1639,7 @@ export function ChatInterface({
           <div className="max-w-4xl mx-auto mb-3 flex flex-wrap gap-2">
             {attachedFiles.map((file, index) => (
               <Button
-                key={index}
+                key={`${file.name}-${file.size}-${(file as any).lastModified ?? index}`}
                 variant="secondary"
                 className="cursor-pointer h-auto py-1 px-2"
                 onClick={() => removeFile(index)}
@@ -1154,7 +1668,8 @@ export function ChatInterface({
                   handleSendMessage();
                 }
               }}
-              placeholder="Give a prompt"
+              disabled={isLoading}
+              placeholder={isLoading ? 'Please wait for the current response to finish…' : 'Give a prompt'}
               className="min-h-[44px] max-h-32 pr-28 resize-none border-input focus:border-ring focus:ring-1 focus:ring-ring"
               rows={1}
             />
@@ -1165,6 +1680,7 @@ export function ChatInterface({
                 variant="ghost"
                 className="h-8 w-8 p-0 text-muted-foreground hover:bg-accent"
                 onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
               >
                 <Paperclip className="h-4 w-4 text-gray-500" />
               </Button>
@@ -1176,6 +1692,7 @@ export function ChatInterface({
                   isImageModeActive ? 'bg-blue-100 hover:bg-blue-200' : ''
                 }`}
                 onClick={handleImageClick}
+                disabled={isLoading}
                 title="Toggle Image Generation Mode"
               >
                 <img 
@@ -1194,6 +1711,7 @@ export function ChatInterface({
                   isRecording ? "bg-red-100 hover:bg-red-200" : "" 
                 }`}
                 onClick={isRecording ? stopRecording : startRecording}
+                disabled={isLoading && !isRecording}
               >
                 <Mic
                   className={`h-4 w-4 text-muted-foreground ${ 
@@ -1213,7 +1731,7 @@ export function ChatInterface({
               <Square className="h-4 w-4 text-white" />
             </Button>
           ) : (
-            <Button type="submit" disabled={!input.trim() && attachedFiles.length === 0} className="h-11 w-11 p-0 bg-black hover:bg-gray-800 rounded-lg">
+            <Button type="submit" disabled={isLoading || (!input.trim() && attachedFiles.length === 0)} className="h-11 w-11 p-0 bg-black hover:bg-gray-800 rounded-lg">
               <Send className="h-4 w-4 text-white" />
             </Button>
           )}
@@ -1225,7 +1743,7 @@ export function ChatInterface({
           multiple
           className="hidden"
           onChange={handleFileAttach}
-          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json"
+          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx"
         />
       </div>
       {/* Image viewer modal */}

@@ -9,7 +9,10 @@ export interface ConversationTurn {
   aiResponse: string;
   timestamp: number;
   userId: string;
-  chatId?: string;  // 🎯 NEW! Chat-scoped memory
+  chatId?: string;  // 🎯 Chat-scoped memory
+  imageUrl?: string; // 🖼️ NEW! Generated image (base64 or URL)
+  imagePrompt?: string; // 🎨 NEW! Original image generation prompt
+  hasImage?: boolean; // 🖼️ NEW! Flag for quick checking
 }
 
 export interface ConversationSession {
@@ -55,8 +58,15 @@ class ConversationService {
    * NOTE: This should be called AFTER the response is sent to the user (async)
    * to avoid delaying the response. Memory storage is done in the background.
    * 🎯 UPDATED: Now requires chatId for chat-scoped memory optimization
+   * 🖼️ UPDATED: Now supports image attachments
    */
-  addConversationTurn(userId: string, userPrompt: string, aiResponse: string, chatId?: string): ConversationTurn {
+  addConversationTurn(
+    userId: string, 
+    userPrompt: string, 
+    aiResponse: string, 
+    chatId?: string,
+    imageData?: { url: string; prompt?: string } // 🖼️ NEW! Optional image data
+  ): ConversationTurn {
     const sessionId = this.getActiveSessionId(userId, chatId);
     const turn: ConversationTurn = {
       id: `turn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -64,7 +74,10 @@ class ConversationService {
       aiResponse,
       timestamp: Date.now(),
       userId,
-      chatId  // 🎯 NEW! Track which chat this turn belongs to
+      chatId,  // 🎯 Track which chat this turn belongs to
+      imageUrl: imageData?.url, // 🖼️ Store image URL/base64
+      imagePrompt: imageData?.prompt, // 🎨 Store original image prompt
+      hasImage: !!imageData?.url // 🖼️ Quick flag for filtering
     };
 
     let session = this.conversations.get(sessionId);

@@ -71,7 +71,7 @@ export interface User {
 export interface ChatMessage {
   id: string;
   content: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system'; // Added 'system' for background document context
   timestamp: Date;
   files?: UploadedFile[];
   type?: 'text' | 'confirmation' | 'image' | 'loading';
@@ -79,6 +79,13 @@ export interface ChatMessage {
   isConfirmation?: boolean;
   confirmationId?: string;
   attachments?: string[]; // 🎯 For file names and image URLs
+  metadata?: {
+    tokens?: number;
+    duration?: number; // in seconds
+    documentName?: string;
+    documentType?: string;
+    isDocumentContext?: boolean;
+  };
 }
 
 export interface ChatHistory {

@@ -1,19 +1,44 @@
-# Environment variables and secrets
+# Environment variables and secrets - NEVER COMMIT THESE!
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-*.env
 .env.*
+.env.local
+.env.development
+.env.development.local
+.env.test
+.env.test.local
+.env.production
+.env.production.local
+.env.production.example
+*.env
+.env.backup
 
-# API Keys and Service Account Files
+# API Keys and Service Account Files - CRITICAL SECURITY
 *.key
 *.pem
+*.p12
+*.pfx
 serviceAccountKey.json
 *serviceAccount*.json
+firebase-admin-sdk.json
+*firebase*.json
 *-key.json
 /Server/serviceAccountKey.json
+/Server/*.json
+/Server/.env
+Server/.env
+Server/.env.*
+
+# Vercel
+.vercel
+.vercel.json
+
+# Railway
+.railway
+
+# AWS Secrets
+.aws/
+credentials
+config
 
 # Node.js dependencies and cache
 node_modules/
@@ -90,7 +115,7 @@ models/
 checkpoints/
 
 # Firebase
-.firebase/
+/firebase/
 .firebaserc
 firebase-debug.log*
 firebase-debug.*.log*
@@ -125,3 +150,33 @@ local.*
 # Security scan results
 security-report.*
 vulnerability-report.*
+.vercel
+
+# ---------------------------------------------------------
+# Hardened secrets ignore (env files & credential JSONs)
+# Ensures secrets are ignored no matter where they live
+# ---------------------------------------------------------
+
+# .env files anywhere (covers nested packages and subfolders)
+**/.env
+**/.env.*
+*.env
+.env
+.env.local
+.env.*.local
+
+# Credential/Key JSONs anywhere (common names)
+**/*serviceAccount*.json
+**/*credentials*.json
+**/*-key.json
+**/*-keys.json
+**/google-credentials*.json
+
+# Typical secrets folders
+keys/
+**/keys/*.json
+**/keys/**/*.json
+
+# Private PEM/KEY files (explicit)
+**/*.pem
+**/*.key

@@ -63,7 +63,15 @@ class ApiService {
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          // Try to parse JSON error to get message and success flag
+          let errMessage = `HTTP error! status: ${response.status}`;
+          try {
+            const maybeJson = await response.json();
+            if (maybeJson?.error) errMessage = String(maybeJson.error);
+          } catch {}
+          const err: any = new Error(errMessage);
+          err.status = response.status;
+          throw err;
         }
 
         const data = await response.json();
@@ -129,8 +137,9 @@ class ApiService {
   }
 
   // Chat endpoints
-  async getChats(): Promise<ApiResponse<any[]>> {
-    return this.request('/chats');
+  // Smart two-tier loading: local first (instant), then Pinecone (background)
+  async getChats(userId: string, source: 'local' | 'pinecone' | 'all' = 'local'): Promise<ApiResponse<any[]>> {
+    return this.request(`/chats?userId=${encodeURIComponent(userId)}&source=${source}`);
   }
 
   async createChat(title: string): Promise<ApiResponse<any>> {
@@ -173,8 +182,20 @@ class ApiService {
     userName?: string; // 🎯 NEW! User name for auto-profile creation
     chatId?: string; // 🎯 NEW! Chat ID for chat-scoped memory
     messageCount?: number; // 🎯 NEW! Message count to detect new vs continuing chat
+    conversationHistory?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>; // 🎯 Includes system messages for document context
+    conversationSummary?: string; // 🎯 NEW! Summary of older messages to save tokens
     useMemory?: boolean; // Enable/disable memory
-  }): Promise<{ success: boolean; text?: string; error?: string }> {
+  }): Promise<{ 
+    success: boolean; 
+    text?: string; 
+    error?: string;
+    metadata?: {
+      tokens?: number;
+      candidatesTokenCount?: number;
+      promptTokenCount?: number;
+      duration?: number;
+    };
+  }> {
     if (data.image) {
       // For images, use FormData (if backend supports it)
       const formData = new FormData();
@@ -203,6 +224,8 @@ class ApiService {
           userName: data.userName,                // 🎯 NEW! For auto-profile creation
           chatId: data.chatId,                    // 🎯 NEW! For chat-scoped memory
           messageCount: data.messageCount,        // 🎯 NEW! Detect new vs continuing
+          conversationHistory: data.conversationHistory, // 🎯 NEW! Previous messages for context
+          conversationSummary: data.conversationSummary, // 🎯 NEW! Summary of older messages
           useMemory: data.useMemory !== false // Default to true if not specified
         }),
       });
@@ -211,18 +234,72 @@ class ApiService {
 
   /**
    * Generate an image from prompt using the backend /ask-ai endpoint with type=image
+   * Image generation can take 30-90 seconds, so we use a longer timeout
    */
-  async generateImage(prompt: string): Promise<{
+  async generateImage(
+    prompt: string, 
+    userId?: string, 
+    chatId?: string, 
+    userName?: string,
+    conversationHistory?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> // 🎯 Includes system messages for document context
+  ): Promise<{
     success: boolean;
     imageBase64?: string | null;
     imageUri?: string | null;
     altText?: string | null;
     error?: string;
+    metadata?: {
+      tokens?: number;
+      candidatesTokenCount?: number;
+      promptTokenCount?: number;
+      duration?: number;
+    };
   }> {
-    return this.request('/ask-ai', {
-      method: 'POST',
-      body: JSON.stringify({ prompt, type: 'image' }),
-    });
+    // Image generation can take 30-90 seconds, use longer timeout
+    const url = `${this.baseURL}/ask-ai`;
+    const controller = new AbortController();
+    const timeoutMs = 90 * 1000; // 90 seconds timeout for image generation
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          prompt, 
+          type: 'image',
+          userId,
+          chatId,
+          userName,
+          conversationHistory // 🎯 NEW! Include conversation context
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      
+      if (err.name === 'AbortError') {
+        return {
+          success: false,
+          error: 'Image generation timed out (90 seconds). The AI model may be busy. Please try again.'
+        };
+      }
+      
+      console.error('Image generation error:', err);
+      return {
+        success: false,
+        error: err.message || 'Failed to generate image'
+      };
+    }
   }
 
   /**
@@ -232,6 +309,8 @@ class ApiService {
     fileBase64: string;
     mimeType?: string;
     prompt?: string;
+    userId?: string;
+    storeInMemory?: boolean;
   }): Promise<{ success: boolean; extractedText?: string; error?: string }> {
     // Use a longer timeout for document processing (3 minutes)
     const url = `${this.baseURL}/process-document`;
@@ -243,7 +322,13 @@ class ApiService {
       const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileBase64: options.fileBase64, mimeType: options.mimeType, prompt: options.prompt }),
+        body: JSON.stringify({
+          fileBase64: options.fileBase64,
+          mimeType: options.mimeType,
+          prompt: options.prompt,
+          userId: options.userId,
+          storeInMemory: options.storeInMemory,
+        }),
         signal: controller.signal,
       });
 
@@ -473,23 +558,40 @@ class ApiService {
       body: JSON.stringify(data),
     });
   }
+
+  /**
+   * Save all chats at once (batch operation) - bypasses cooldown
+   * Use for critical events: sign-out, app close, etc.
+   * 🎯 NEW: Ensures all conversations + images are saved to Pinecone
+   */
+  async saveAllChats(data: { userId: string; chatIds: string[] }): Promise<{ success: boolean; message?: string }> {
+    return this.request('/save-all-chats', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  // Friendly error mapping for UI
+  public static toFriendlyError(err: any): string {
+    if (!err) return 'Unknown error';
+    const msg = (typeof err === 'string' ? err : err.message) || 'Unknown error';
+    const status = (err as any)?.status;
+    if (status === 409) {
+      return 'Another request is already processing for this chat. Please wait for it to finish.';
+    }
+    if (/timeout|timed out|abort/i.test(msg)) {
+      return 'Request timed out. The server is taking too long to respond.';
+    }
+    if (/network/i.test(msg)) {
+      return 'Network error. Check your connection and try again.';
+    }
+    return msg;
+  }
 }
 
 // Create singleton instance
 export const apiService = new ApiService();
-
-// Helper functions for common patterns
-export const handleApiError = (error: any): string => {
-  if (error.message) {
-    return error.message;
-  }
-  
-  if (typeof error === 'string') {
-    return error;
-  }
-  
-  return 'An unexpected error occurred';
-};
+export const handleApiError = (err: any) => ApiService.toFriendlyError(err);
 
 export const withApiErrorHandling = async <T>(
   apiCall: () => Promise<T>,

@@ -1,6 +1,7 @@
 // hybridMemoryService.ts - Smart memory system combining local and Pinecone storage
 import { getConversationService, ConversationTurn, ConversationSummary } from './conversationService';
 import { getEmbeddingService, SearchResult } from './embeddingService';
+import { getPineconeStorageService } from './pineconeStorageService';
 import { userProfileService } from './userProfileService';
 
 export interface HybridMemoryResult {
@@ -30,9 +31,34 @@ export interface MemorySearchOptions {
 class HybridMemoryService {
   private conversationService = getConversationService();
   private embeddingService = getEmbeddingService();
+  
+  // 🎯 OPTIMIZATION: Track last upload time per chat to avoid frequent uploads
+  private lastUploadTime: Map<string, number> = new Map(); // chatId -> timestamp
+  private readonly UPLOAD_COOLDOWN_MS = 60000; // 1 minute cooldown between uploads
 
   constructor() {
     console.log('🔄 HybridMemoryService initialized - combining local and long-term memory');
+  }
+
+  /**
+   * Check if enough time has passed since last upload
+   * @param chatId - Chat session ID
+   * @returns true if upload should be allowed
+   */
+  private shouldUpload(chatId: string): boolean {
+    const lastUpload = this.lastUploadTime.get(chatId);
+    if (!lastUpload) return true; // Never uploaded
+    
+    const timeSinceUpload = Date.now() - lastUpload;
+    return timeSinceUpload >= this.UPLOAD_COOLDOWN_MS;
+  }
+
+  /**
+   * Mark that an upload was performed
+   * @param chatId - Chat session ID
+   */
+  private markUploadTime(chatId: string): void {
+    this.lastUploadTime.set(chatId, Date.now());
   }
 
   /**
@@ -261,9 +287,16 @@ class HybridMemoryService {
   /**
    * Store a conversation turn in local memory
    * 🎯 UPDATED: Now accepts optional chatId for chat-scoped memory
+   * 🖼️ UPDATED: Now accepts optional imageData for image storage
    */
-  storeConversationTurn(userId: string, userPrompt: string, aiResponse: string, chatId?: string): ConversationTurn {
-    return this.conversationService.addConversationTurn(userId, userPrompt, aiResponse, chatId);
+  storeConversationTurn(
+    userId: string, 
+    userPrompt: string, 
+    aiResponse: string, 
+    chatId?: string,
+    imageData?: { url: string; prompt?: string } // 🖼️ NEW! Optional image data
+  ): ConversationTurn {
+    return this.conversationService.addConversationTurn(userId, userPrompt, aiResponse, chatId, imageData);
   }
 
   /**
@@ -381,15 +414,96 @@ class HybridMemoryService {
 
   /**
    * Persist a chat session to Pinecone (called when user switches chats)
-   * This is the heavy operation we avoid doing on every message
+   * 🎯 OPTIMIZED: 
+   * - Only uploads NEW turns (deduplication)
+   * - Respects cooldown period (prevents spam uploads)
+   * - Batches for efficiency
+   * 
+   * @param userId - User's unique ID
+   * @param chatId - Chat session ID
+   * @param force - Force upload ignoring cooldown (default: false)
    */
-  async persistChatSession(userId: string, chatId: string): Promise<void> {
-    console.log(`📦 Persisting chat session ${chatId} for user ${userId}...`);
+  async persistChatSession(userId: string, chatId: string, force: boolean = false): Promise<void> {
+    console.log(`📦 Persist request for chat ${chatId} (user: ${userId}, force: ${force})`);
     
-    // Use conversationService to summarize and upload to Pinecone
-    await this.conversationService.persistChatToPinecone(userId, chatId);
+    // 🎯 OPTIMIZATION: Check cooldown to avoid frequent uploads
+    if (!force && !this.shouldUpload(chatId)) {
+      const lastUpload = this.lastUploadTime.get(chatId)!;
+      const timeSince = Math.round((Date.now() - lastUpload) / 1000);
+      console.log(`⏸️ Upload cooldown active - last upload was ${timeSince}s ago (cooldown: ${this.UPLOAD_COOLDOWN_MS / 1000}s)`);
+      console.log(`💡 Skipping upload to save costs. Chat will be uploaded when cooldown expires.`);
+      return;
+    }
+    
+    // Get the conversation service to access turns
+    const conversationService = getConversationService();
+    const pineconeStorage = getPineconeStorageService();
+    
+    // Get all turns for this chat
+    const allTurns = conversationService.getRecentConversations(userId, 1000);
+    const chatTurns = allTurns.filter(turn => turn.chatId === chatId);
+    
+    if (chatTurns.length === 0) {
+      console.log(`⚠️ No turns found for chat ${chatId}, skipping persistence`);
+      return;
+    }
+    
+    console.log(`📝 Found ${chatTurns.length} total turns for this chat`);
+    
+    // 🎯 Store individual messages to Pinecone (with auto-deduplication)
+    await pineconeStorage.storeConversationTurns(userId, chatId, chatTurns, force);
+    
+    // Mark upload time
+    this.markUploadTime(chatId);
     
     console.log(`✅ Chat session ${chatId} persisted successfully`);
+  }
+
+  /**
+   * Force immediate persistence (bypass cooldown)
+   * Use for critical events: user sign-out, app close, etc.
+   */
+  async forceUpload(userId: string, chatId: string): Promise<void> {
+    console.log(`🚨 Force upload requested for chat ${chatId}`);
+    await this.persistChatSession(userId, chatId, true);
+  }
+
+  /**
+   * Persist multiple chats at once (batch operation)
+   * Useful for sign-out or periodic backup
+   */
+  async persistMultipleChats(userId: string, chatIds: string[]): Promise<void> {
+    console.log(`📦 Batch persist: ${chatIds.length} chats for user ${userId}`);
+    
+    for (const chatId of chatIds) {
+      try {
+        await this.persistChatSession(userId, chatId, false);
+      } catch (error) {
+        console.error(`❌ Failed to persist chat ${chatId}:`, error);
+        // Continue with other chats
+      }
+    }
+    
+    console.log(`✅ Batch persist complete`);
+  }
+
+  /**
+   * Get upload cooldown stats
+   */
+  getUploadStats(): { chatsTracked: number; cooldownActive: number } {
+    const now = Date.now();
+    let cooldownActive = 0;
+    
+    this.lastUploadTime.forEach((timestamp) => {
+      if (now - timestamp < this.UPLOAD_COOLDOWN_MS) {
+        cooldownActive++;
+      }
+    });
+    
+    return {
+      chatsTracked: this.lastUploadTime.size,
+      cooldownActive
+    };
   }
 }
 
