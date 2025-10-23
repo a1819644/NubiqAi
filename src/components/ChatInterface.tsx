@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Send, Paperclip, Mic, Download, Eye, Copy, Check, Square, Pencil, FileText } from "lucide-react";
+import { Send, Paperclip, Mic, Download, Eye, Copy, Check, Square, Pencil, FileText, X, AlertCircle, UploadCloud } from "lucide-react";
 import { Button } from "./ui/button";
-import { Textarea } from "./ui/textarea";
+import Textarea from "react-textarea-autosize"; // Use auto-sizing textarea
 import { toast } from "sonner";
 import type { ChatHistory as Chat, ChatMessage as Message, User } from "../types"; // UPDATED: Use centralized types
 import { apiService, handleApiError } from "../services/api";
@@ -17,7 +17,10 @@ import {
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
 import { Badge } from "./ui/badge";
+import { useResizeObserver } from "../hooks/useResizeObserver";
+import { cn } from "./ui/utils";
 import { imageStorageService } from "../services/imageStorageService";
+import { Progress } from "./ui/progress";
 
 // Using a placeholder for image icon
 const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTIgMkgxNFYxNEgyVjJaIiBzdHJva2U9IiM2NjY2NjYiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIvPgo8cGF0aCBkPSJNMiAxMkw2IDhMOCAxMEwxMiA2TDE0IDhWMTJIMloiIGZpbGw9IiM2NjY2NjYiLz4KPC9zdmc+';
@@ -149,7 +152,7 @@ export function ChatInterface({
   };
   
   const [input, setInput] = useState("");
-  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const [attachedFiles, setAttachedFiles] = useState<AttachmentPreview[]>([]);
   const MAX_FILE_SIZE = 10 * 1024 * 1024; // 4MB
   const MAX_PREVIEW_LENGTH = 800; // chars before truncation
   const [isRecording, setIsRecording] = useState(false);
@@ -163,11 +166,17 @@ export function ChatInterface({
   const [editedContent, setEditedContent] = useState<string>("");
   const [imageStatus, setImageStatus] = useState<Record<string, 'loading' | 'success' | 'error'>>({});
   const [imageRetryTokens, setImageRetryTokens] = useState<Record<string, number>>({});
+  // State untuk header auto-hide
+  const [isHeaderVisible, setIsHeaderVisible] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
+  const [lastScrollY, setLastScrollY] = useState(0);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
+  const composerHeight = useResizeObserver(composerRef);
 
   // Create a stable reference to avoid issues with null activeChat
   const chat = activeChat || {
@@ -178,9 +187,106 @@ export function ChatInterface({
     updatedAt: new Date(), // Should be overwritten by real chat
   };
 
+  // Smart sticky header logic
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const currentScrollY = e.currentTarget.scrollTop;
+    const SCROLL_UP_THRESHOLD = 60;
+    const SCROLL_DOWN_THRESHOLD = 120;
+
+    // Always show header if near the top
+    if (currentScrollY < SCROLL_UP_THRESHOLD) {
+      setIsHeaderVisible(true);
+      setLastScrollY(currentScrollY);
+      return;
+    }
+
+    // Hide header when scrolling down past the threshold
+    if (currentScrollY > lastScrollY && currentScrollY > SCROLL_DOWN_THRESHOLD) {
+      setIsHeaderVisible(false);
+    } 
+    // Show header when scrolling up
+    else if (currentScrollY < lastScrollY) {
+      setIsHeaderVisible(true);
+    }
+
+    setLastScrollY(currentScrollY <= 0 ? 0 : currentScrollY); // For Mobile or negative scrolling
+  };
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chat.messages]);
+
+  const processFiles = (filesToProcess: FileList | null) => {
+    if (!filesToProcess) return;
+
+    const newFiles = Array.from(filesToProcess);
+    const accepted: AttachmentPreview[] = [];
+    const rejected: string[] = [];
+    const unsupported: string[] = [];
+
+    // Define supported file types
+    const SUPPORTED_TYPES = [
+      'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
+      'text/plain', 'text/markdown', 'text/csv',
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/json',
+    ];
+
+    for (const f of newFiles) {
+      // Check file type first
+      if (!SUPPORTED_TYPES.includes(f.type)) {
+        unsupported.push(f.name);
+        continue;
+      }
+      
+      // Check file size
+      if (f.size > MAX_FILE_SIZE) {
+        rejected.push(f.name);
+        continue;
+      }
+
+      const newAttachment: AttachmentPreview = {
+        id: `${f.name}-${f.size}-${f.lastModified}`,
+        file: f,
+        progress: 0, // Will be updated during upload
+      };
+
+      // Create a local URL for image thumbnails
+      if (f.type.startsWith('image/')) {
+        newAttachment.previewUrl = URL.createObjectURL(f);
+      }
+
+      accepted.push(newAttachment);
+    }
+
+    if (accepted.length > 0) {
+      // TODO: Implement actual file upload logic here and update progress.
+      setAttachedFiles((prev) => [...prev, ...accepted]);
+      toast.success(`${accepted.length} file(s) attached`);
+    }
+
+    if (unsupported.length > 0) {
+      toast.error(`Unsupported file type(s): ${unsupported.join(', ')}\nSupported: PDF, DOCX, DOC, TXT, MD, CSV, JSON, XLSX, Images`);
+    }
+
+    if (rejected.length > 0) {
+      toast.error(`Skipped ${rejected.length} file(s) exceeding ${Math.round(MAX_FILE_SIZE / (1024*1024))}MB: ${rejected.join(', ')}`);
+    }
+  };
+
+  const handleFileAttach = (event: React.ChangeEvent<HTMLInputElement>) => {
+    processFiles(event.target.files);
+  };
+
+  const handleFileDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragging(false);
+    processFiles(event.dataTransfer.files);
+  };
 
   // 💾 Preload images from IndexedDB when chat loads
   useEffect(() => {
@@ -259,55 +365,12 @@ export function ChatInterface({
     };
   }, [activeChat, user]);
 
-  const handleFileAttach = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files || []);
-    const accepted: File[] = [];
-    const rejected: string[] = [];
-    const unsupported: string[] = [];
-
-    // Define supported file types
-    const SUPPORTED_TYPES = [
-      'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
-      'text/plain', 'text/markdown', 'text/csv',
-      'application/pdf',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'application/json',
-    ];
-
-    for (const f of files) {
-      // Check file type first
-      if (!SUPPORTED_TYPES.includes(f.type)) {
-        unsupported.push(f.name);
-        continue;
-      }
-      
-      // Check file size
-      if (f.size > MAX_FILE_SIZE) {
-        rejected.push(f.name);
-        continue;
-      }
-      
-      accepted.push(f);
+  const removeFile = (id: string) => {
+    const fileToRemove = attachedFiles.find(f => f.id === id);
+    if (fileToRemove?.previewUrl) {
+      URL.revokeObjectURL(fileToRemove.previewUrl); // Clean up memory
     }
-
-    if (accepted.length > 0) {
-      setAttachedFiles((prev) => [...prev, ...accepted]);
-      toast.success(`${accepted.length} file(s) attached`);
-    }
-
-    if (unsupported.length > 0) {
-      toast.error(`Unsupported file type(s): ${unsupported.join(', ')}\nSupported: PDF, DOCX, DOC, TXT, MD, CSV, JSON, XLSX, Images`);
-    }
-
-    if (rejected.length > 0) {
-      toast.error(`Skipped ${rejected.length} file(s) exceeding ${Math.round(MAX_FILE_SIZE / (1024*1024))}MB: ${rejected.join(', ')}`);
-    }
-  };
-
-  const removeFile = (index: number) => {
-    setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachedFiles((prev) => prev.filter((f) => f.id !== id));
   };
 
   const getAttachmentId = (messageId: string | undefined, timestamp: Date, index: number) => {
@@ -380,7 +443,7 @@ export function ChatInterface({
 
   const handleSendMessage = async (
     text: string = input,
-    files: File[] = attachedFiles,
+    files: AttachmentPreview[] = attachedFiles,
     isVoice: boolean = false,
     isContinuation: boolean = false, // NEW PARAMETER FOR PREVENT DUPLICATIONS
     skipConfirmation: boolean = false, // NEW: Skip image confirmation check
@@ -419,7 +482,7 @@ export function ChatInterface({
         content: text || (files.length > 0 ? `Sent ${files.length} file(s)` : ""),
         role: "user",
         timestamp: new Date(),
-        attachments: files.map((f) => f.name),
+        attachments: files.map((f) => f.file.name),
       };
 
       updatedChat = {
@@ -715,7 +778,7 @@ export function ChatInterface({
       }
 
       // Find image file if any
-      const imageFile = files.find(file => file.type.startsWith('image/'));
+      const imageFile = files.find(att => att.file.type.startsWith('image/'))?.file;
       // 🧠 MEMORY SYSTEM LOGGING
       console.group('🧠 Memory System - Request');
       console.log('📤 Sending to AI:', {
@@ -728,7 +791,7 @@ export function ChatInterface({
       console.groupEnd();
 
       // � Pre-process any attached documents before calling the model
-      const nonImageFiles = files.filter(f => !f.type.startsWith('image/'));
+      const nonImageFiles = files.map(att => att.file).filter(f => !f.type.startsWith('image/'));
       if (nonImageFiles.length > 0) {
         const fileToBase64 = async (file: File) => {
           const buffer = await file.arrayBuffer();
@@ -1389,13 +1452,14 @@ ${procResp.extractedText}`,
   // This effect handles sending a message after image mode is confirmed and activated.
   useEffect(() => {
     // Only run if image mode is active and there's a prompt waiting.
-    if (isImageModeActive && pendingImagePrompt) {
+    if (isImageModeActive && pendingImagePrompt && activeChat) {
       // Use isContinuation: true to prevent duplicating the user's message.
       // The original message that triggered the confirmation is already in the chat.
-      handleSendMessage(pendingImagePrompt, [], false, true, false, chat);
+      // Pass the most recent activeChat state to avoid stale closures.
+      handleSendMessage(pendingImagePrompt, [], false, true, false, activeChat);
       setPendingImagePrompt(null); // Clear the prompt after sending.
     }
-  }, [isImageModeActive, pendingImagePrompt]); // Dependencies are correct
+  }, [isImageModeActive, pendingImagePrompt, activeChat]); // Add activeChat to dependencies
 
   // Effect to handle 'Enter' key for confirmation dialog globally
   useEffect(() => {
@@ -1429,17 +1493,38 @@ ${procResp.extractedText}`,
   }
 
   return (
-    <div className="flex flex-col h-full bg-background text-foreground">
-      {/* Header */}
-      <div className="border-b border-border p-4">
-        <h1 className="text-xl font-medium">{chat.title}</h1>
-        <p className="text-sm text-muted-foreground mt-1">
-          {chat.messages.length} messages
-        </p>
-      </div>
-
+    <div 
+      className="flex flex-col h-full bg-background text-foreground relative"
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(true);
+      }}
+    >
       {/* Messages Area */}
-      <div className="flex-1 overflow-auto">
+      <div
+        className="flex-1 overflow-auto relative"
+        onScroll={handleScroll}
+        style={{ paddingBottom: composerHeight ? `${composerHeight}px` : '96px' }} // Fallback height
+      >
+        {/* Sticky Header inside the scroll container */}
+        <div
+          className={cn(
+            "sticky top-0 z-10 px-6 py-5 bg-background/80 backdrop-blur-sm border-b border-black/5 dark:border-white/[.08] shadow-sm",
+            "transition-all duration-200 ease-in-out motion-reduce:transition-none",
+            isHeaderVisible
+              ? "translate-y-0 opacity-100"
+              : "-translate-y-full opacity-0 pointer-events-none"
+          )}
+        >
+          <h1 className="text-lg font-semibold text-foreground truncate">
+            {chat.title}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {chat.messages.length} messages
+          </p>
+        </div>
+
         {chat.messages.length === 0 ? (
           <div className="h-full flex items-center justify-center bg-background">
             <div className="text-center max-w-md px-6">
@@ -1481,7 +1566,7 @@ ${procResp.extractedText}`,
             </div>
           </div>
         ) : (
-          <div className="p-6 space-y-6 max-w-4xl mx-auto">
+          <div className="p-6 pb-3 space-y-6 max-w-4xl mx-auto">
             {chat.messages
               .filter(message => message.role !== 'system') // Hide system messages (document context)
               .map((message, messageIndex) => {
@@ -1491,51 +1576,60 @@ ${procResp.extractedText}`,
                 key={message.id ?? `${message.timestamp.getTime()}-${message.role}-${messageIndex}`}
                 className={`group flex ${
                   message.role === "user" ? "justify-end" : "justify-start"
-                }`}
+                } items-start gap-3 animate-fade-in`}
               >
                 {/* Handle confirmation messages */}
                 {message.type === 'confirmation' && message.confirmationId ? (
                   <ConfirmationDialog
                     key={message.id}
                     message={message.content || 'Confirm action?'}
-                    onConfirm={() => handleConfirmation(message.confirmationId!, true)}
+                    onConfirm={() => handleConfirmation(message.confirmationId!, true)}  
                     onCancel={() => handleConfirmation(message.confirmationId!, false)}
                   />
                 ) : editingMessageId === message.id ? (
                   // WIDER EDITING UI
-                  <div className="w-full flex flex-col gap-2">
+                  <div className="w-full flex flex-col gap-4">
                     <Textarea
                       value={editedContent}
                       onChange={(e) => setEditedContent(e.target.value)}
-                      className="bg-background text-foreground text-sm"
+                      className="w-full min-h-[44px] max-h-[240px] resize-none p-3 text-sm
+                                 bg-background text-foreground placeholder:text-muted-foreground
+                                 border border-gray-300 dark:border-zinc-700 rounded-lg
+                                 focus-visible:outline-none focus-visible:border-blue-500
+                                 focus-visible:ring-2 focus-visible:ring-blue-500/20
+                                 transition-all duration-200 ease-in-out"
+                      placeholder="Edit your prompt..."
                       autoFocus
+                      rows={1}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter' && !e.shiftKey) {
+                        // Cmd/Ctrl + Enter to submit
+                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                           e.preventDefault();
                           handleEditMessage(message.id);
                         } else if (e.key === 'Escape') {
+                          e.preventDefault();
                           setEditingMessageId(null);
                         }
                       }}
                     />
-                    <div className="flex justify-end gap-2">
-                      <Button size="sm" variant="secondary" onClick={() => setEditingMessageId(null)}>
+                    <div className="flex justify-end gap-4">
+                      <Button size="sm" variant="ghost" onClick={() => setEditingMessageId(null)}>
                         Cancel
                       </Button>
-                      <Button size="sm" onClick={() => handleEditMessage(message.id)}>
+                      <Button size="sm" className="hover:bg-primary/90" onClick={() => handleEditMessage(message.id)}>
                         Save & Submit
                       </Button>
                     </div>
                   </div>
                 ) : (
                   // Original message rendering logic
-                  <div className="flex flex-col max-w-lg items-end">
+                  <div className={`flex flex-col w-full max-w-2xl ${message.role === 'user' ? 'items-end' : 'items-start'}`}>
                       <div className={`relative`}>
                         <div
-                          className={`rounded-2xl px-4 py-3 ${ 
+                          className={`rounded-xl px-4 py-2.5 shadow-sm transition-colors ${ 
                             message.role === "user"
                               ? "bg-primary text-primary-foreground"
-                              : "bg-muted text-foreground"
+                              : "bg-muted/50 dark:bg-zinc-800/50"
                           }`}
                         >
                           {/* Attachment handling */}
@@ -1562,7 +1656,7 @@ ${procResp.extractedText}`,
                             <div className="mt-2 space-y-1">
                               {message.attachments.map((file, idx) => (
                                 <React.Fragment key={idx}>
-                                  {typeof file === 'string' && (file === '__generating_image__') ? (
+                                  {typeof file === 'string' && (file === '__generating_image__') ? (  
                                     <div className="w-64 h-40 bg-muted rounded-lg animate-pulse flex items-center justify-center">
                                       <p className="text-sm text-muted-foreground">Generating image...</p>
                                     </div>
@@ -1577,15 +1671,15 @@ ${procResp.extractedText}`,
                                         <p className="text-sm text-muted-foreground line-clamp-2">{message.content}</p>
                                       </div>
                                     </div>
-                                  ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.startsWith('https://storage.googleapis.com') || file.includes('.firebasestorage.app') || file.includes('/o/')) ? (
+                                  ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.startsWith('https://storage.googleapis.com') || file.includes('.firebasestorage.app') || file.includes('/o/')) ? (  
                                     // --- Redesigned Image Card ---
-                                    <div className="bg-muted/50 rounded-xl border border-border/20 shadow-sm overflow-hidden w-full max-w-md">
+                                    <div className="w-full max-w-md bg-transparent">
                                       {/* Image Preview */}
-                                      <div className="bg-muted p-2">
+                                      <div>
                                         <img
                                           src={buildImageSrc(file, attachmentId)}
                                           alt={message.content || `generated-${idx}`}
-                                          className="w-full h-auto object-contain rounded-lg cursor-pointer transition-opacity hover:opacity-90"
+                                          className="w-full h-auto object-contain rounded-xl shadow-md cursor-pointer transition-opacity hover:opacity-90"
                                           onClick={() => openImageViewer(file, message.content)}
                                           onLoad={() => setImageStatus((prev) => ({ ...prev, [attachmentId]: 'success' }))}
                                           onError={() => {
@@ -1595,16 +1689,16 @@ ${procResp.extractedText}`,
                                         />
                                       </div>
                                       {/* Prompt and Actions */}
-                                      <div className="p-4 pt-2">
-                                        <p className="text-sm text-muted-foreground line-clamp-2 mb-3">{message.content}</p>
-                                        <div className="flex items-center justify-end gap-2">
-                                          <Button size="sm" variant="outline" className="h-8" onClick={() => openImageViewer(file, message.content)}>
+                                      <div className="text-center mt-2">
+                                        <p className="text-xs text-muted-foreground/80 line-clamp-2 mb-2">{message.content}</p>
+                                        <div className="flex items-center justify-center gap-2">
+                                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => openImageViewer(file, message.content)}>
                                             <Eye className="mr-1.5 h-4 w-4" /> Open
                                           </Button>
-                                          <Button size="sm" variant="outline" className="h-8" onClick={() => openImageViewer(file, message.content)}>
+                                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => openImageViewer(file, message.content)}>
                                             <Pencil className="mr-1.5 h-4 w-4" /> Edit
                                           </Button>
-                                          <Button size="sm" variant="outline" className="h-8" onClick={() => downloadImage(file)}>
+                                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => downloadImage(file)}>
                                             <Download className="mr-1.5 h-4 w-4" /> Download
                                           </Button>
                                         </div>
@@ -1629,7 +1723,7 @@ ${procResp.extractedText}`,
                           )}
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-2 px-1">
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground/70 mt-1.5 px-1">
                           <span>{message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}</span>
                           {/* Metadata display */}
                           {message.role === 'assistant' && message.metadata && (
@@ -1690,7 +1784,7 @@ ${procResp.extractedText}`,
             })}
             {isLoading && (
               <div className="flex justify-start">
-                <div className="flex flex-col">
+                <div className="flex flex-col items-start animate-fade-in">
                   <div className="bg-gray-100 rounded-2xl px-4 py-3">
                     <div className="flex space-x-1">
                       <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
@@ -1704,23 +1798,60 @@ ${procResp.extractedText}`,
             <div ref={messagesEndRef} />
           </div>
         )}
-      </div>
+      </div> 
 
       {/* Input Area */}
-      <div className="border-t border-border p-4">
+      <div
+        ref={composerRef}
+        className="bg-transparent p-4 pt-2 sticky bottom-0 z-10"
+      >
+        {/* Attachment Preview Bar */}
         {attachedFiles.length > 0 && (
-          <div className="max-w-4xl mx-auto mb-3 flex flex-wrap gap-2">
-            {attachedFiles.map((file, index) => (
-              <Button
-                key={`${file.name}-${file.size}-${(file as any).lastModified ?? index}`}
-                variant="secondary"
-                className="cursor-pointer h-auto py-1 px-2"
-                onClick={() => removeFile(index)}
-              >
-                <span className="text-xs">{file.name}</span>
-                <span className="ml-2 font-bold">×</span>
-              </Button>
-            ))}
+          <div className="max-w-4xl mx-auto mb-3 p-2 bg-muted/50 border border-border/50 rounded-lg">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
+              {attachedFiles.map((att) => (
+                <div key={att.id} className="relative group bg-background border rounded-lg shadow-sm overflow-hidden aspect-square">
+                  {att.previewUrl ? (
+                    // Image Preview
+                    <img
+                      src={att.previewUrl}
+                      alt={att.file.name}
+                      className="w-full h-full object-cover cursor-pointer"
+                      onClick={() => openImageViewer(att.previewUrl!, att.file.name)}
+                    />
+                  ) : (
+                    // Document Preview
+                    <div className="flex flex-col items-center justify-center h-full p-2 text-center">
+                      <FileText className="w-8 h-8 text-muted-foreground mb-2" />
+                      <p className="text-xs font-medium text-foreground truncate w-full">{att.file.name}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {(att.file.size / 1024).toFixed(1)} KB
+                      </p>
+                    </div>
+                  )}
+                  {/* Remove Button */}
+                  <button
+                    onClick={() => removeFile(att.id)}
+                    className="absolute top-1 right-1 h-5 w-5 bg-black/50 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                    title="Remove file"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                  {/* Progress/Error Overlay */}
+                  {att.progress > 0 && att.progress < 100 && (
+                    <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+                      <Progress value={att.progress} className="w-3/4 h-1.5" />
+                    </div>
+                  )}
+                  {att.error && (
+                    <div className="absolute inset-0 bg-destructive/80 flex flex-col items-center justify-center p-2 text-center">
+                      <AlertCircle className="w-6 h-6 text-destructive-foreground mb-1" />
+                      <p className="text-xs text-destructive-foreground font-medium">{att.error}</p>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
@@ -1729,40 +1860,44 @@ ${procResp.extractedText}`,
             e.preventDefault();
             handleSendMessage();
           }}
-          className="flex gap-3 max-w-4xl mx-auto"
+          data-tour-id="prompt-input-area"
+          className="flex items-center gap-4 max-w-4xl mx-auto px-5 py-3 border border-gray-200 dark:border-zinc-800 rounded-[14px] bg-background shadow-[0_1px_6px_rgba(0,0,0,0.03)] focus-within:ring-1 focus-within:ring-ring transition-all"
         >
-          <div data-tour-id="prompt-input-area" className="flex-1 relative">
+          {/* The form itself is now the main container */}
             <Textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
+                if (e.key === 'Enter' && !e.shiftKey && !isLoading) {
                   e.preventDefault();
                   handleSendMessage();
                 }
               }}
               disabled={isLoading}
               placeholder={isLoading ? 'Please wait for the current response to finish…' : 'Give a prompt'}
-              className="min-h-[44px] max-h-32 pr-28 resize-none border-input focus:border-ring focus:ring-1 focus:ring-ring"
+              className="flex-1 bg-transparent resize-none border-none focus:ring-0 focus:outline-none placeholder:text-[#9CA3AF] py-1.5"
+              maxRows={8}
               rows={1}
             />
-            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
+            {/* Icons inside the input container */}
+            <div className="flex items-center gap-2">
               <Button
                 type="button"
                 size="sm"
                 variant="ghost"
-                className="h-8 w-8 p-0 text-muted-foreground hover:bg-accent"
+                className="h-8 w-8 p-0 text-[#9CA3AF] hover:bg-accent hover:text-accent-foreground"
                 data-tour-id="attach-file-button"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isLoading}
+                title="Attach file"
               >
-                <Paperclip className="h-4 w-4 text-gray-500" />
+                <Paperclip className="h-5 w-5" />
               </Button>
               <Button
                 type="button"
                 size="sm"
                 variant="ghost"
-                className={`h-8 w-8 p-0 hover:bg-gray-100 flex-shrink-0 ${ 
+                className={`h-8 w-8 p-0 text-[#9CA3AF] hover:bg-accent flex-shrink-0 ${ 
                   isImageModeActive ? 'bg-blue-100 hover:bg-blue-200' : ''
                 }`}
                 data-tour-id="image-icon-button"
@@ -1771,7 +1906,7 @@ ${procResp.extractedText}`,
                 title="Toggle Image Generation Mode"
               >
                 <img 
-                  src={imageIcon} 
+                  src={imageIcon}
                   alt="Generate Image" 
                   className={`h-4 w-4 object-contain ${ 
                     isImageModeActive ? 'opacity-100' : 'opacity-70'
@@ -1782,33 +1917,34 @@ ${procResp.extractedText}`,
                 type="button"
                 size="sm"
                 variant="ghost"
-                className={`h-8 w-8 p-0 text-muted-foreground hover:bg-accent ${ 
+                className={`h-8 w-8 p-0 text-[#9CA3AF] hover:bg-accent hover:text-accent-foreground ${ 
                   isRecording ? "bg-red-100 hover:bg-red-200" : "" 
                 }`}
                 onClick={isRecording ? stopRecording : startRecording}
                 disabled={isLoading && !isRecording}
+                title="Record voice"
               >
                 <Mic
                   className={`h-4 w-4 text-muted-foreground ${ 
-                    isRecording ? "text-red-600 animate-pulse" : "text-gray-500"
+                    isRecording ? "text-red-600 animate-pulse" : "text-inherit"
                   }`}
                 />
               </Button>
             </div>
-          </div>
+          {/* Send/Stop button outside the main input container */}
           {isLoading ? (
             <Button
               data-tour-id="stop-button"
               type="button"
               onClick={handleStopGeneration}
-              className="h-11 w-11 p-0 bg-destructive hover:bg-destructive/90 rounded-lg"
+              className="h-8 w-8 p-0 bg-destructive hover:bg-destructive/90 rounded-lg"
               title="Stop generating"
             >
-              <Square className="h-4 w-4 text-white" />
+              <Square className="h-5 w-5 text-white" />
             </Button>
           ) : (
-            <Button data-tour-id="send-button" type="submit" disabled={isLoading || (!input.trim() && attachedFiles.length === 0)} className="h-11 w-11 p-0 bg-black hover:bg-gray-800 rounded-lg">
-              <Send className="h-4 w-4 text-white" />
+            <Button data-tour-id="send-button" type="submit" disabled={isLoading || (!input.trim() && attachedFiles.length === 0)} className="h-8 w-8 p-0 bg-primary text-primary-foreground hover:bg-primary/90 dark:bg-primary-foreground dark:text-primary dark:hover:bg-primary-foreground/90 rounded-lg transition-all hover:scale-105">
+              <Send className="h-5 w-5" />
             </Button>
           )}
         </form>
@@ -1819,9 +1955,24 @@ ${procResp.extractedText}`,
           multiple
           className="hidden"
           onChange={handleFileAttach}
-          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json"
+          accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx"
         />
       </div>
+      {/* Drag and Drop Overlay */}
+      {isDragging && (
+        <div
+          className="absolute inset-0 z-20 bg-primary/10 backdrop-blur-sm flex flex-col items-center justify-center border-4 border-dashed border-primary/50 rounded-2xl transition-all"
+          onDragLeave={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setIsDragging(false);
+          }}
+          onDrop={handleFileDrop}
+        >
+          <UploadCloud className="w-16 h-16 text-primary/80 mb-4" />
+          <p className="text-lg font-semibold text-primary">Drop files here to attach</p>
+        </div>
+      )}
       {/* Image viewer modal */}
       <Dialog open={viewerOpen} onOpenChange={(open) => setViewerOpen(open)}>
         <DialogContent className="sm:max-w-2xl max-h-[95vh] flex flex-col p-0">
@@ -1829,7 +1980,7 @@ ${procResp.extractedText}`,
             <DialogTitle className="text-lg font-medium p-6 pb-2">Image Preview</DialogTitle>
             <DialogDescription className="px-6 text-sm text-muted-foreground/80">{viewerAlt}</DialogDescription>
           </DialogHeader>
-          <div className="flex-1 overflow-y-auto px-6 grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
+          <div className="flex-1 overflow-hidden px-6 grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
             {viewerSrc ? (
               <div 
                 className="relative bg-muted/50 rounded-lg flex justify-center items-center overflow-hidden border shadow-inner touch-none"
@@ -1923,12 +2074,12 @@ ${procResp.extractedText}`,
               <div>No image</div>
             )}
             {/* Controls Column */}
-            <div className="space-y-8 pt-2">
-              <div className="space-y-3">
+            <div className="flex flex-col h-full space-y-6 pt-2 md:pl-8 md:border-l border-border">
+              <div className="flex-1 flex flex-col space-y-3 overflow-hidden">
                 <label className="text-sm font-medium">Edit Prompt</label>
                 <Textarea
                   value={editPrompt}
-                  onChange={(e) => setEditPrompt(e.target.value)}
+                  onChange={(e) => setEditPrompt(e.target.value)} // This is a standard textarea, not the autosize one
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey && editPrompt && !isEditing) {
                       e.preventDefault();
@@ -1936,7 +2087,7 @@ ${procResp.extractedText}`,
                     }
                   }}
                   placeholder="e.g., 'make the background a sunset'"
-                  className="w-full min-h-[80px] text-sm placeholder:text-muted-foreground/60"
+                  className="w-full flex-1 resize-none text-sm p-2 bg-background border border-gray-300 dark:border-gray-600 rounded-md placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   rows={3}
                 />
               </div>

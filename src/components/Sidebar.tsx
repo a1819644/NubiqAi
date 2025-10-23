@@ -22,6 +22,7 @@ import {
   CollapsibleTrigger,
 } from "./ui/collapsible";
 import { ChatHistory, NavigationSection } from "../types";
+import React from "react";
 
 interface SidebarProps {
   activeSection: ActiveSection;
@@ -34,6 +35,28 @@ interface SidebarProps {
 
 // Assuming ActiveSection is NavigationSection from types
 type ActiveSection = NavigationSection;
+
+// Create a reusable NavItem component for consistent styling
+const NavItem = React.forwardRef<
+  HTMLButtonElement,
+  React.ComponentProps<typeof Button> & { isActive?: boolean }
+>(({ className, isActive, ...props }, ref) => {
+  return (
+    <Button
+      ref={ref}
+      variant="ghost"
+      className={cn(
+        "w-full justify-start text-sm transition-all duration-200 ease-in-out",
+        "text-[#4B5563] dark:text-[#9CA3AF] font-normal", // Inactive state
+        "hover:bg-[#F9FAFB] hover:dark:bg-[#383838] hover:text-[#1F2937] hover:dark:text-[#FAFAFA] hover:font-medium", // Hover state
+        isActive && "bg-[#F3F4F6] dark:bg-[#2D2D2D] text-[#111827] dark:text-white font-semibold", // Active state
+        className
+      )}
+      {...props}
+    />
+  );
+});
+NavItem.displayName = "NavItem";
 
 export function Sidebar({
   activeSection,
@@ -133,41 +156,37 @@ export function Sidebar({
   };
 
   return (
-    <div className="w-64 border-r bg-sidebar flex flex-col h-full">
+    <aside className="w-64 border-r bg-muted/20 dark:bg-zinc-900/50 flex flex-col h-full">
       <div className="flex-1 overflow-y-auto">
-        <div className="p-4 ">
-          <nav className="space-y-2">
+        <div className="p-4">
+          <nav className="space-y-1">
             {mainSidebarItems.map((item, index) => {
               if (!item.type) return null; // Skip empty item from settings move
-
+  
               if (item.type === "button") {
                 return (
-                  <Button
+                  <NavItem
                     data-tour-id="new-chat-button"
                     key={index}
                     onClick={item.onClick}
-                    variant="ghost"
-                    className="w-full justify-start bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground"
+                    className="font-semibold !text-primary dark:!text-primary hover:!bg-primary/10 dark:hover:!bg-primary/10"
                   >
                     <item.icon className="w-4 h-4 mr-3" />
                     {item.label}
-                  </Button>
+                  </NavItem>
                 );
               }
 
               if (item.type === "item") {
                 return (
-                  <Button
+                  <NavItem
                     key={index}
-                    variant={
-                      activeSection === item.section ? "secondary" : "ghost"
-                    }
-                    className="w-full justify-start hover:bg-gray-200"
+                    isActive={activeSection === item.section}
                     onClick={() => onSectionChange(item.section)}
                   >
                     <item.icon className="w-4 h-4 mr-3" />
                     {item.label}
-                  </Button>
+                  </NavItem>
                 );
               }
 
@@ -175,9 +194,9 @@ export function Sidebar({
                 return (
                   <Collapsible key={index} open={item.isExpanded}>
                     <CollapsibleTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        className="w-full justify-between hover:bg-gray-200"
+                      <NavItem
+                        isActive={item.isExpanded}
+                        className="w-full justify-between"
                         onClick={() => {
                           // Toggle between expanded state
                           if (item.isExpanded) {
@@ -197,24 +216,19 @@ export function Sidebar({
                             item.isExpanded && "rotate-90"
                           )}
                         />
-                      </Button>
+                      </NavItem>
                     </CollapsibleTrigger>
                     <CollapsibleContent className="pl-4">
-                      <div className="space-y-1">
+                      <div className="space-y-1 mt-1">
                         {item.items.map((subItem, subIndex) => (
-                          <Button
+                          <NavItem
                             key={subIndex}
-                            variant={
-                              activeSection === subItem.section
-                                ? "secondary"
-                                : "ghost"
-                            }
-                            className="w-full justify-start text-sm hover:bg-gray-200"
+                            isActive={activeSection === subItem.section}
                             onClick={() => onSectionChange(subItem.section)}
                           >
                             <subItem.icon className="w-4 h-4 mr-3" />
                             {subItem.label}
-                          </Button>
+                          </NavItem>
                         ))}
                       </div>
                     </CollapsibleContent>
@@ -223,27 +237,27 @@ export function Sidebar({
               }
 
               return null;
-            })}
+            })}  
           </nav>
         </div>
         {/* Recent Chats Section */}
-        <div className="px-4 pt-4 border-t border-border">
-          <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+        <div className="px-4 pt-3 mt-2 border-t border-white/5 dark:border-white/5">
+          <h3 className="text-xs font-medium text-muted-foreground/80 tracking-wide mb-2 px-3 text-[#9CA3AF]">
             Recent
           </h3>
           <div className="space-y-1">
             {recentChats.slice(0, 8).map(chat => (
-              <Button
+              <NavItem
                 key={chat.id}
-                variant={activeChatId === chat.id && activeSection === 'home' ? "secondary" : "ghost"}
-                className="w-full justify-start text-sm truncate"
+                isActive={activeChatId === chat.id && activeSection === 'home'}
+                className="truncate"
                 onClick={() => onSelectChat(chat)}
                 title={chat.title}
               >
                 <span className="truncate">
                   {chat.title}
                 </span>
-              </Button>
+              </NavItem>
             ))}
             {recentChats.length > 8 && (
               <Button
@@ -258,12 +272,12 @@ export function Sidebar({
         </div>
       </div>
       {/* Bottom fixed section */}
-      <div className="p-4 border-t border-border">
+      <div className="p-4 border-t border-white/5 dark:border-white/5">
         <Collapsible open={settingsItem.isExpanded}>
           <CollapsibleTrigger asChild>
-            <Button
-              variant="ghost"
-              className="w-full justify-between hover:bg-gray-200"
+            <NavItem
+              isActive={settingsItem.isExpanded}
+              className="w-full justify-between"
               onClick={() => {
                 if (settingsItem.isExpanded) {
                   onSectionChange("home");
@@ -282,27 +296,24 @@ export function Sidebar({
                   settingsItem.isExpanded && "rotate-90"
                 )}
               />
-            </Button>
+            </NavItem>
           </CollapsibleTrigger>
-          <CollapsibleContent className="pl-4">
-            <div className="space-y-1">
+          <CollapsibleContent className="pl-4 mt-1">
+            <div className="space-y-1 ">
               {settingsItem.items.map((subItem, subIndex) => (
-                <Button
+                <NavItem
                   key={subIndex}
-                  variant={
-                    activeSection === subItem.section ? "secondary" : "ghost"
-                  }
-                  className="w-full justify-start text-sm hover:bg-gray-200"
+                  isActive={activeSection === subItem.section}
                   onClick={() => onSectionChange(subItem.section)}
                 >
                   <subItem.icon className="w-4 h-4 mr-3" />
                   {subItem.label}
-                </Button>
+                </NavItem>
               ))}
             </div>
           </CollapsibleContent>
         </Collapsible>
       </div>
-    </div>
+    </aside>
   );
 }
