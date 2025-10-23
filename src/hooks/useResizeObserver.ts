@@ -21,7 +21,7 @@ export function useResizeObserver(ref: RefObject<HTMLElement>) {
     return () => {
       observer.disconnect();
     };
-  }, [ref, height]); // Tambahkan height sebagai dependensi untuk re-observe jika perlu
+  }, [ref]); // Hanya bergantung pada ref, karena observer menangani perubahan ukuran
 
   return height;
 }

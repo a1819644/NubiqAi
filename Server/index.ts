@@ -472,58 +472,9 @@ app.post("/api/ask-ai", rateLimitMiddleware("general"), async (req, res) => {
       );
       console.log(`🎯 Memory strategy selected: ${memoryStrategy}`);
 
-      let strategy: "full" | "profile-only" | "skip" = "profile-only";
-
       if (memoryStrategy === "none") {
-        strategy = "skip";
-      } else if (memoryStrategy === "search") {
-        strategy = "full";
-      } else if (memoryStrategy === "cache" && effectiveChatId) {
-        // Try to use cached context first
-        const cachedTurns = recentContextCache.get(
-          effectiveUserId,
-          effectiveChatId
-        );
-        if (
-          cachedTurns &&
-          Array.isArray(cachedTurns) &&
-          cachedTurns.length > 0
-        ) {
-          console.log(
-            `⚡ Using cached context (${cachedTurns.length} turns) - instant retrieval!`
-          );
-          // Build prompt from cached turns
-          const contextText = cachedTurns
-            .map(
-              (turn: any) =>
-                `User: ${turn.userMessage}\nAssistant: ${turn.aiResponse}`
-            )
-            .join("\n\n");
-
-          enhancedPrompt = `SYSTEM: You are NubiqAI ✨
-
-RECENT CONVERSATION:
-${contextText}
-
-USER QUESTION:
-${prompt}
-
-Respond naturally.`;
-
-          strategy = "skip"; // Skip full memory search
-        } else {
-          strategy = "profile-only"; // Fall back to profile
-        }
-      }
-
-      const originalStrategy = determineSearchStrategy(
-        prompt,
-        effectiveMessageCount || 0
-      );
-
-      if (strategy === "skip") {
         console.log("⏭️ Skipping memory - simple greeting/acknowledgment");
-      } else if (strategy === "profile-only") {
+      } else if (memoryStrategy === "profile-only") {
         // Lightweight: Only use user profile (no expensive searches)
         console.log(
           "👤 Using profile-only memory (lightweight) for user:",
@@ -578,7 +529,7 @@ ${prompt}
         } catch (error) {
           console.warn("⚠️ Profile lookup failed:", error);
         }
-      } else {
+      } else if (memoryStrategy === "search") {
         // Full search: Use hybrid memory (local + Pinecone + profile)
         try {
           const hybridMemoryService = getHybridMemoryService();
@@ -761,6 +712,33 @@ ${prompt}
             "⚠️ Hybrid memory search failed, proceeding without memory context:",
             memoryError
           );
+        }
+      } else if (memoryStrategy === "cache" && effectiveChatId) {
+        // Try to use cached context first
+        const cachedTurns = recentContextCache.get(
+          effectiveUserId,
+          effectiveChatId
+        );
+        if (
+          cachedTurns &&
+          Array.isArray(cachedTurns) &&
+          cachedTurns.length > 0
+        ) {
+          console.log(
+            `⚡ Using cached context (${cachedTurns.length} turns) - instant retrieval!`
+          );
+          // Build prompt from cached turns
+          const contextText = cachedTurns
+            .map(
+              (turn: any) =>
+                `User: ${turn.userMessage}\nAssistant: ${turn.aiResponse}`
+            )
+            .join("\n\n");
+
+          enhancedPrompt = `SYSTEM: You are NubiqAI ✨\n\nRECENT CONVERSATION:\n${contextText}\n\nUSER QUESTION:\n${prompt}\n\nRespond naturally.`;
+        } else {
+          // Fallback if cache is empty - could potentially run profile-only here
+          console.log("ℹ️ Cache was empty, proceeding without memory.");
         }
       }
     }
@@ -1642,8 +1620,14 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
     const descriptionResponse = await generateContent({
       model: visionModel,
       contents: [
-        "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.",
-        { inlineData: { data: imageBase64, mimeType: "image/png" } },
+        {
+          parts: [
+            {
+              text: "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.",
+            },
+            { inlineData: { data: imageBase64, mimeType: "image/png" } },
+          ],
+        },
       ],
     });
     const imageDescription =
@@ -1751,8 +1735,12 @@ app.post(
       const descriptionResponse = await generateContent({
         model: visionModel,
         contents: [
-          "Describe this image in detail.",
-          { inlineData: { data: imageBase64, mimeType: "image/png" } },
+          {
+            parts: [
+              { text: "Describe this image in detail." },
+              { inlineData: { data: imageBase64, mimeType: "image/png" } },
+            ],
+          },
         ],
       });
       const imageDescription =
@@ -1765,8 +1753,14 @@ app.post(
       const maskResponse = await generateContent({
         model: visionModel,
         contents: [
-          "Describe the colored/marked areas in this mask image. Where are they located and what parts of the image do they cover?",
-          { inlineData: { data: maskBase64, mimeType: "image/png" } },
+          {
+            parts: [
+              {
+                text: "Describe the colored/marked areas in this mask image. Where are they located and what parts of the image do they cover?",
+              },
+              { inlineData: { data: maskBase64, mimeType: "image/png" } },
+            ],
+          },
         ],
       });
       const maskDescription =
