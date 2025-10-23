@@ -1,5 +1,7 @@
 // server.ts (TypeScript)
-require("dotenv").config();
+import path from "path";
+// Load environment variables from .env file in the 'Server' directory
+require("dotenv").config({ path: path.resolve(__dirname, "../Server/.env") });
 import express from "express";
 import cors from "cors";
 import type { CorsOptions } from "cors";
