@@ -1,661 +1,890 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Ask AI + Document Processor</title>
-<style>
-  body { font-family: Arial, sans-serif; background:#f4f6f9; display:flex; justify-content:center; align-items:flex-start; padding:40px; min-height:100vh; }
-  .container { background:#fff; border-radius:12px; box-shadow:0 4px 15px rgba(0,0,0,0.1); padding:20px; width:100%; max-width:700px; }
-  h1 { text-align:center; color:#333; margin-bottom:12px; }
-  .input-row { display:flex; gap:10px; margin-bottom:12px; align-items:center; flex-wrap: wrap; }
-  input[type="text"], input[type="file"] { flex:1; padding:12px; border:1px solid #ccc; border-radius:8px; font-size:16px; }
-  .controls { display:flex; gap:8px; align-items:center; }
-  button { padding:12px 18px; border:none; border-radius:8px; background:#4a90e2; color:white; font-size:16px; cursor:pointer; transition:background 0.15s; }
-  button:disabled { opacity:.6; cursor:not-allowed; }
-  button:hover:not(:disabled) { background:#357abd; }
-  #result { background:#f9fafb; padding:16px; border-radius:8px; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace; font-size:14px; white-space:pre-wrap; max-height:60vh; overflow-y:auto; border:1px solid #eee; margin-top:12px; display:flex; flex-direction:column; gap:12px; align-items:flex-start; }
-  #result img { max-width:100%; height:auto; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.08); }
-  .meta { display:flex; gap:10px; align-items:center; font-size:13px; color:#666; }
-  .page { border-bottom:1px dashed #ccc; padding-bottom:8px; margin-bottom:8px; }
-  label { user-select:none; cursor:pointer; }
-  .image-container { position: relative; display: inline-block; margin: 10px 0; }
-  .image-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .edit-prompt { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; margin-top: 8px; }
-  .edit-section { background: #f8f9fa; padding: 12px; border-radius: 8px; margin-top: 10px; border: 1px solid #e9ecef; }
-  .btn-secondary { background: #6c757d; }
-  .btn-secondary:hover { background: #5a6268; }
-  .btn-edit { background: #28a745; }
-  .btn-edit:hover { background: #218838; }
-  .canvas-container { position: relative; display: inline-block; border: 2px solid #ddd; border-radius: 8px; margin: 10px 0; }
-  .edit-canvas { position: absolute; top: 0; left: 0; cursor: crosshair; border-radius: 6px; }
-  .canvas-tools { margin: 10px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .tool-group { display: flex; gap: 5px; align-items: center; }
-  .color-picker { width: 30px; height: 30px; border: none; border-radius: 4px; cursor: pointer; }
-  .brush-size { width: 80px; }
-  .btn-tool { padding: 6px 12px; font-size: 12px; }
-  .marking-instructions { background: #e7f3ff; padding: 10px; border-radius: 6px; margin: 10px 0; font-size: 14px; color: #0066cc; }
-</style>
-</head>
-<body>
-<div class="container">
-  <h1>Ask AI + Document Processor</h1>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Ask AI + Document Processor</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #f4f6f9;
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        padding: 40px;
+        min-height: 100vh;
+      }
+      .container {
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        padding: 20px;
+        width: 100%;
+        max-width: 700px;
+      }
+      h1 {
+        text-align: center;
+        color: #333;
+        margin-bottom: 12px;
+      }
+      .input-row {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      input[type="text"],
+      input[type="file"] {
+        flex: 1;
+        padding: 12px;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        font-size: 16px;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      button {
+        padding: 12px 18px;
+        border: none;
+        border-radius: 8px;
+        background: #4a90e2;
+        color: white;
+        font-size: 16px;
+        cursor: pointer;
+        transition: background 0.15s;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      button:hover:not(:disabled) {
+        background: #357abd;
+      }
+      #result {
+        background: #f9fafb;
+        padding: 16px;
+        border-radius: 8px;
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace;
+        font-size: 14px;
+        white-space: pre-wrap;
+        max-height: 60vh;
+        overflow-y: auto;
+        border: 1px solid #eee;
+        margin-top: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        align-items: flex-start;
+      }
+      #result img {
+        max-width: 100%;
+        height: auto;
+        border-radius: 8px;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+      }
+      .meta {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        font-size: 13px;
+        color: #666;
+      }
+      .page {
+        border-bottom: 1px dashed #ccc;
+        padding-bottom: 8px;
+        margin-bottom: 8px;
+      }
+      label {
+        user-select: none;
+        cursor: pointer;
+      }
+      .image-container {
+        position: relative;
+        display: inline-block;
+        margin: 10px 0;
+      }
+      .image-actions {
+        margin-top: 10px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .edit-prompt {
+        width: 100%;
+        padding: 8px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        margin-top: 8px;
+      }
+      .edit-section {
+        background: #f8f9fa;
+        padding: 12px;
+        border-radius: 8px;
+        margin-top: 10px;
+        border: 1px solid #e9ecef;
+      }
+      .btn-secondary {
+        background: #6c757d;
+      }
+      .btn-secondary:hover {
+        background: #5a6268;
+      }
+      .btn-edit {
+        background: #28a745;
+      }
+      .btn-edit:hover {
+        background: #218838;
+      }
+      .canvas-container {
+        position: relative;
+        display: inline-block;
+        border: 2px solid #ddd;
+        border-radius: 8px;
+        margin: 10px 0;
+      }
+      .edit-canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        cursor: crosshair;
+        border-radius: 6px;
+      }
+      .canvas-tools {
+        margin: 10px 0;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .tool-group {
+        display: flex;
+        gap: 5px;
+        align-items: center;
+      }
+      .color-picker {
+        width: 30px;
+        height: 30px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .brush-size {
+        width: 80px;
+      }
+      .btn-tool {
+        padding: 6px 12px;
+        font-size: 12px;
+      }
+      .marking-instructions {
+        background: #e7f3ff;
+        padding: 10px;
+        border-radius: 6px;
+        margin: 10px 0;
+        font-size: 14px;
+        color: #0066cc;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Ask AI + Document Processor</h1>
 
-  <!-- Prompt / Image -->
-  <div class="input-row">
-    <input id="prompt" type="text" placeholder="Type a prompt for AI chat or document processing..." />
-    <div class="controls">
-      <label><input id="isImage" type="checkbox" /> Generate image</label>
-      <button id="askBtn" onclick="askAI()">Ask</button>
+      <!-- Prompt / Image -->
+      <div class="input-row">
+        <input
+          id="prompt"
+          type="text"
+          placeholder="Type a prompt for AI chat or document processing..."
+        />
+        <div class="controls">
+          <label><input id="isImage" type="checkbox" /> Generate image</label>
+          <button id="askBtn" onclick="askAI()">Ask</button>
+        </div>
+      </div>
+
+      <!-- File upload -->
+      <div class="input-row">
+        <input type="file" id="docFile" accept=".pdf,.docx,.txt" />
+        <button onclick="processDocument()">Process Document</button>
+      </div>
+
+      <div id="result" aria-live="polite">Your answer will appear here...</div>
     </div>
-  </div>
 
-  <!-- File upload -->
-  <div class="input-row">
-    <input type="file" id="docFile" accept=".pdf,.docx,.txt" />
-    <button onclick="processDocument()">Process Document</button>
-  </div>
+    <script>
+      async function askAI() {
+        const btn = document.getElementById("askBtn");
+        const promptEl = document.getElementById("prompt");
+        const resultEl = document.getElementById("result");
+        const isImage = document.getElementById("isImage").checked;
+        const prompt = promptEl.value?.trim();
 
-  <div id="result" aria-live="polite">Your answer will appear here...</div>
-</div>
-
-<script>
-async function askAI() {
-  const btn = document.getElementById('askBtn');
-  const promptEl = document.getElementById('prompt');
-  const resultEl = document.getElementById('result');
-  const isImage = document.getElementById('isImage').checked;
-  const prompt = promptEl.value?.trim();
-
-  if (!prompt) {
-    resultEl.innerText = 'Please enter a prompt.';
-    return;
-  }
-
-  btn.disabled = true;
-  resultEl.innerHTML = '<div class="meta">Thinking... ⏳</div>';
-
-  try {
-    const res = await fetch('http://localhost:8000/api/ask-ai', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, type: isImage ? 'image' : 'text' })
-    });
-    const data = await res.json().catch(()=>null);
-    if(!data){ resultEl.innerText='❌ Server returned no JSON.'; return; }
-    if(data.success===false||data.error){ resultEl.innerText='❌ '+(data.error||JSON.stringify(data)); return; }
-
-    resultEl.innerHTML = '';
-
-    // IMAGE (multiple images)
-    if(data.imageBase64 || data.imageUri){
-      const images = [];
-      if(data.imageBase64) images.push({ src: `data:${detectImageMimeFromRaw(data)||'image/png'};base64,${data.imageBase64}`, alt: data.altText, base64: data.imageBase64 });
-      if(data.imageUri) images.push({ src: data.imageUri, alt: data.altText, base64: null });
-      
-      images.forEach((imgData, index)=>{
-        const imageContainer = document.createElement('div');
-        imageContainer.className = 'image-container';
-        
-        const img = document.createElement('img');
-        img.src = imgData.src;
-        img.alt = imgData.alt || 'Generated image';
-        imageContainer.appendChild(img);
-
-        const imageActions = document.createElement('div');
-        imageActions.className = 'image-actions';
-
-        const downloadLink = document.createElement('a');
-        downloadLink.href = imgData.src;
-        downloadLink.download = `generated-image-${index + 1}.png`;
-        downloadLink.textContent = 'Download';
-        downloadLink.style.display = 'inline-block';
-        downloadLink.style.padding = '8px 12px';
-        downloadLink.style.background = '#4a90e2';
-        downloadLink.style.color = 'white';
-        downloadLink.style.textDecoration = 'none';
-        downloadLink.style.borderRadius = '4px';
-        downloadLink.style.fontSize = '14px';
-        imageActions.appendChild(downloadLink);
-
-        // Add edit button only for base64 images (we have the data)
-        if(imgData.base64) {
-          const editBtn = document.createElement('button');
-          editBtn.textContent = 'Edit Image';
-          editBtn.className = 'btn-edit';
-          editBtn.style.padding = '8px 12px';
-          editBtn.style.fontSize = '14px';
-          editBtn.onclick = () => showEditInterface(imgData.base64, imageContainer);
-          imageActions.appendChild(editBtn);
+        if (!prompt) {
+          resultEl.innerText = "Please enter a prompt.";
+          return;
         }
 
-        imageContainer.appendChild(imageActions);
-        resultEl.appendChild(imageContainer);
-      });
-      
-      if(data.altText){
-        const pre = document.createElement('pre');
-        pre.style.margin='10px 0 0 0';
-        pre.textContent = data.altText;
-        resultEl.appendChild(pre);
+        btn.disabled = true;
+        resultEl.innerHTML = '<div class="meta">Thinking... ⏳</div>';
+
+        try {
+          const res = await fetch("http://localhost:8000/api/ask-ai", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt, type: isImage ? "image" : "text" }),
+          });
+          const data = await res.json().catch(() => null);
+          if (!data) {
+            resultEl.innerText = "❌ Server returned no JSON.";
+            return;
+          }
+          if (data.success === false || data.error) {
+            resultEl.innerText = "❌ " + (data.error || JSON.stringify(data));
+            return;
+          }
+
+          resultEl.innerHTML = "";
+
+          // IMAGE (multiple images)
+          if (data.imageBase64 || data.imageUri) {
+            const images = [];
+            if (data.imageBase64)
+              images.push({
+                src: `data:${detectImageMimeFromRaw(data) || "image/png"};base64,${data.imageBase64}`,
+                alt: data.altText,
+                base64: data.imageBase64,
+              });
+            if (data.imageUri)
+              images.push({
+                src: data.imageUri,
+                alt: data.altText,
+                base64: null,
+              });
+
+            images.forEach((imgData, index) => {
+              const imageContainer = document.createElement("div");
+              imageContainer.className = "image-container";
+
+              const img = document.createElement("img");
+              img.src = imgData.src;
+              img.alt = imgData.alt || "Generated image";
+              imageContainer.appendChild(img);
+
+              const imageActions = document.createElement("div");
+              imageActions.className = "image-actions";
+
+              const downloadLink = document.createElement("a");
+              downloadLink.href = imgData.src;
+              downloadLink.download = `generated-image-${index + 1}.png`;
+              downloadLink.textContent = "Download";
+              downloadLink.style.display = "inline-block";
+              downloadLink.style.padding = "8px 12px";
+              downloadLink.style.background = "#4a90e2";
+              downloadLink.style.color = "white";
+              downloadLink.style.textDecoration = "none";
+              downloadLink.style.borderRadius = "4px";
+              downloadLink.style.fontSize = "14px";
+              imageActions.appendChild(downloadLink);
+
+              // Add edit button only for base64 images (we have the data)
+              if (imgData.base64) {
+                const editBtn = document.createElement("button");
+                editBtn.textContent = "Edit Image";
+                editBtn.className = "btn-edit";
+                editBtn.style.padding = "8px 12px";
+                editBtn.style.fontSize = "14px";
+                editBtn.onclick = () =>
+                  showEditInterface(imgData.base64, imageContainer);
+                imageActions.appendChild(editBtn);
+              }
+
+              imageContainer.appendChild(imageActions);
+              resultEl.appendChild(imageContainer);
+            });
+
+            if (data.altText) {
+              const pre = document.createElement("pre");
+              pre.style.margin = "10px 0 0 0";
+              pre.textContent = data.altText;
+              resultEl.appendChild(pre);
+            }
+            const meta = document.createElement("div");
+            meta.className = "meta";
+            meta.textContent = data.imageUri
+              ? "Remote image (imageUri)"
+              : "Base64 image";
+            resultEl.appendChild(meta);
+            return;
+          }
+
+          // TEXT
+          if (typeof data.text === "string" && data.text.trim().length > 0) {
+            const pages = data.text.split(/\n{2,}/); // split on double newlines as "pages"
+            pages.forEach((p, i) => {
+              const pageDiv = document.createElement("div");
+              pageDiv.className = "page";
+              const pre = document.createElement("pre");
+              pre.textContent = p.trim();
+              pageDiv.appendChild(pre);
+              const pageMeta = document.createElement("div");
+              pageMeta.className = "meta";
+              pageMeta.textContent = `Page ${i + 1}`;
+              pageDiv.appendChild(pageMeta);
+              resultEl.appendChild(pageDiv);
+            });
+            return;
+          }
+
+          // fallback
+          resultEl.innerText = JSON.stringify(data, null, 2);
+        } catch (err) {
+          console.error(err);
+          resultEl.innerText =
+            "❌ Network or parsing error: " + (err?.message || String(err));
+        } finally {
+          btn.disabled = false;
+        }
       }
-      const meta=document.createElement('div'); meta.className='meta';
-      meta.textContent = data.imageUri ? 'Remote image (imageUri)' : 'Base64 image';
-      resultEl.appendChild(meta);
-      return;
-    }
 
-    // TEXT
-    if(typeof data.text==='string' && data.text.trim().length>0){
-      const pages = data.text.split(/\n{2,}/); // split on double newlines as "pages"
-      pages.forEach((p,i)=>{
-        const pageDiv = document.createElement('div');
-        pageDiv.className='page';
-        const pre=document.createElement('pre');
-        pre.textContent = p.trim();
-        pageDiv.appendChild(pre);
-        const pageMeta = document.createElement('div');
-        pageMeta.className='meta';
-        pageMeta.textContent=`Page ${i+1}`;
-        pageDiv.appendChild(pageMeta);
-        resultEl.appendChild(pageDiv);
-      });
-      return;
-    }
-
-    // fallback
-    resultEl.innerText=JSON.stringify(data,null,2);
-
-  } catch(err){
-    console.error(err); resultEl.innerText='❌ Network or parsing error: '+(err?.message||String(err));
-  } finally{ btn.disabled=false; }
-}
-
-function detectImageMimeFromRaw(data){
-  try{
-    const raw=data.raw; const parts=raw?.candidates?.[0]?.content?.parts||[];
-    for(const p of parts){ if(p?.inlineData?.mimeType) return p.inlineData.mimeType; if(p?.fileData?.mimeType) return p.fileData.mimeType;}
-  }catch(e){ }
-  return null;
-}
-
-// --- Document Upload ---
-async function processDocument(){
-  const fileInput = document.getElementById('docFile');
-  const promptEl = document.getElementById('prompt');
-  const resultEl = document.getElementById('result');
-  const file = fileInput.files[0];
-  if(!file){ resultEl.innerText='Please select a file.'; return; }
-
-  // Check file size (warn for files over 20MB)
-  const fileSizeMB = file.size / (1024 * 1024);
-  if(fileSizeMB > 20) {
-    const proceed = confirm(`File size is ${fileSizeMB.toFixed(1)}MB. Large files may take a long time to process or fail. Continue?`);
-    if(!proceed) return;
-  }
-
-  const customPrompt = promptEl.value?.trim();
-  resultEl.innerHTML = `<div class="meta">Processing document (${fileSizeMB.toFixed(1)}MB)... ⏳ This may take a while for large files.</div>`;
-
-  try{
-    const reader = new FileReader();
-    reader.onload = async function(){
-      const base64 = reader.result.split(',')[1]; // remove data:*/*;base64,
-      
-      const requestBody = { 
-        fileBase64: base64, 
-        mimeType: file.type 
-      };
-      
-      // Add prompt if provided
-      if(customPrompt) {
-        requestBody.prompt = customPrompt;
+      function detectImageMimeFromRaw(data) {
+        try {
+          const raw = data.raw;
+          const parts = raw?.candidates?.[0]?.content?.parts || [];
+          for (const p of parts) {
+            if (p?.inlineData?.mimeType) return p.inlineData.mimeType;
+            if (p?.fileData?.mimeType) return p.fileData.mimeType;
+          }
+        } catch (e) {}
+        return null;
       }
-      
-      const res = await fetch('http://localhost:8000/api/process-document', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(requestBody)
-      });
-      const data = await res.json();
-      resultEl.innerHTML = '';
-      if(data.success && data.extractedText){
-        // split into pages for readability
-        const pages = data.extractedText.split(/\n{2,}/);
-        pages.forEach((p,i)=>{
-          const pageDiv = document.createElement('div');
-          pageDiv.className='page';
-          const pre=document.createElement('pre');
-          pre.textContent=p.trim();
-          pageDiv.appendChild(pre);
-          const pageMeta=document.createElement('div');
-          pageMeta.className='meta';
-          pageMeta.textContent=`Page ${i+1}`;
-          pageDiv.appendChild(pageMeta);
-          resultEl.appendChild(pageDiv);
-        });
-      } else {
-        resultEl.innerText='❌ '+(data.error||'[No text extracted]');
+
+      // --- Document Upload ---
+      async function processDocument() {
+        const fileInput = document.getElementById("docFile");
+        const promptEl = document.getElementById("prompt");
+        const resultEl = document.getElementById("result");
+        const file = fileInput.files[0];
+        if (!file) {
+          resultEl.innerText = "Please select a file.";
+          return;
+        }
+
+        // Check file size (warn for files over 20MB)
+        const fileSizeMB = file.size / (1024 * 1024);
+        if (fileSizeMB > 20) {
+          const proceed = confirm(
+            `File size is ${fileSizeMB.toFixed(1)}MB. Large files may take a long time to process or fail. Continue?`
+          );
+          if (!proceed) return;
+        }
+
+        const customPrompt = promptEl.value?.trim();
+        resultEl.innerHTML = `<div class="meta">Processing document (${fileSizeMB.toFixed(1)}MB)... ⏳ This may take a while for large files.</div>`;
+
+        try {
+          const reader = new FileReader();
+          reader.onload = async function () {
+            const base64 = reader.result.split(",")[1]; // remove data:*/*;base64,
+
+            const requestBody = {
+              fileBase64: base64,
+              mimeType: file.type,
+            };
+
+            // Add prompt if provided
+            if (customPrompt) {
+              requestBody.prompt = customPrompt;
+            }
+
+            const res = await fetch(
+              "http://localhost:8000/api/process-document",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(requestBody),
+              }
+            );
+            const data = await res.json();
+            resultEl.innerHTML = "";
+            if (data.success && data.extractedText) {
+              // split into pages for readability
+              const pages = data.extractedText.split(/\n{2,}/);
+              pages.forEach((p, i) => {
+                const pageDiv = document.createElement("div");
+                pageDiv.className = "page";
+                const pre = document.createElement("pre");
+                pre.textContent = p.trim();
+                pageDiv.appendChild(pre);
+                const pageMeta = document.createElement("div");
+                pageMeta.className = "meta";
+                pageMeta.textContent = `Page ${i + 1}`;
+                pageDiv.appendChild(pageMeta);
+                resultEl.appendChild(pageDiv);
+              });
+            } else {
+              resultEl.innerText =
+                "❌ " + (data.error || "[No text extracted]");
+            }
+          };
+          reader.readAsDataURL(file);
+        } catch (err) {
+          console.error(err);
+          resultEl.innerText =
+            "❌ Network or processing error: " + (err?.message || String(err));
+        }
       }
-    };
-    reader.readAsDataURL(file);
-  }catch(err){
-    console.error(err);
-    resultEl.innerText='❌ Network or processing error: '+(err?.message||String(err));
-  }
-}
 
-// --- Image Editing Functions ---
-function showEditInterface(imageBase64, imageContainer) {
-  // Remove any existing edit interface
-  const existingEdit = imageContainer.querySelector('.edit-section');
-  if(existingEdit) {
-    existingEdit.remove();
-    return;
-  }
+      // --- Image Editing Functions ---
+      function showEditInterface(imageBase64, imageContainer) {
+        // Remove any existing edit interface
+        const existingEdit = imageContainer.querySelector(".edit-section");
+        if (existingEdit) {
+          existingEdit.remove();
+          return;
+        }
 
-  const editSection = document.createElement('div');
-  editSection.className = 'edit-section';
-  
-  const editLabel = document.createElement('div');
-  editLabel.textContent = 'Edit this image:';
-  editLabel.style.fontWeight = 'bold';
-  editLabel.style.marginBottom = '8px';
-  editSection.appendChild(editLabel);
+        const editSection = document.createElement("div");
+        editSection.className = "edit-section";
 
-  // Instructions for marking
-  const instructions = document.createElement('div');
-  instructions.className = 'marking-instructions';
-  instructions.innerHTML = `
+        const editLabel = document.createElement("div");
+        editLabel.textContent = "Edit this image:";
+        editLabel.style.fontWeight = "bold";
+        editLabel.style.marginBottom = "8px";
+        editSection.appendChild(editLabel);
+
+        // Instructions for marking
+        const instructions = document.createElement("div");
+        instructions.className = "marking-instructions";
+        instructions.innerHTML = `
     <strong>💡 How to mark areas:</strong><br>
     • Draw on the image to mark areas you want to edit<br>
     • Use different colors for different types of edits<br>
     • Clear markings if you want to start over<br>
     • Describe what changes you want in those marked areas
   `;
-  editSection.appendChild(instructions);
+        editSection.appendChild(instructions);
 
-  // Get the original image to create canvas overlay
-  const originalImg = imageContainer.querySelector('img');
-  const canvasContainer = createImageCanvas(originalImg, imageBase64);
-  editSection.appendChild(canvasContainer);
+        // Get the original image to create canvas overlay
+        const originalImg = imageContainer.querySelector("img");
+        const canvasContainer = createImageCanvas(originalImg, imageBase64);
+        editSection.appendChild(canvasContainer);
 
-  const editInput = document.createElement('input');
-  editInput.type = 'text';
-  editInput.className = 'edit-prompt';
-  editInput.placeholder = 'Describe changes for the marked areas (e.g., "make marked area darker", "change marked flowers to roses")';
-  editSection.appendChild(editInput);
+        const editInput = document.createElement("input");
+        editInput.type = "text";
+        editInput.className = "edit-prompt";
+        editInput.placeholder =
+          'Describe changes for the marked areas (e.g., "make marked area darker", "change marked flowers to roses")';
+        editSection.appendChild(editInput);
 
-  const editActions = document.createElement('div');
-  editActions.style.marginTop = '10px';
-  editActions.style.display = 'flex';
-  editActions.style.gap = '8px';
+        const editActions = document.createElement("div");
+        editActions.style.marginTop = "10px";
+        editActions.style.display = "flex";
+        editActions.style.gap = "8px";
 
-  const editBtn = document.createElement('button');
-  editBtn.textContent = 'Apply Edit';
-  editBtn.className = 'btn-edit';
-  editBtn.style.padding = '8px 16px';
-  editBtn.onclick = () => {
-    const canvas = canvasContainer.querySelector('.edit-canvas');
-    const markingData = canvas.toDataURL('image/png');
-    editImageWithMarking(imageBase64, editInput.value, markingData, editSection);
-  };
-  editActions.appendChild(editBtn);
+        const editBtn = document.createElement("button");
+        editBtn.textContent = "Loading Canvas...";
+        editBtn.className = "btn-edit";
+        editBtn.style.padding = "8px 16px";
+        editBtn.disabled = true; // Disable button initially
+        editBtn.onclick = () => {
+          const canvas = canvasContainer.querySelector(".edit-canvas");
+          const markingData = canvas.toDataURL("image/png");
+          editImageWithMarking(
+            imageBase64,
+            editInput.value,
+            markingData,
+            editSection
+          );
+        };
+        editActions.appendChild(editBtn);
 
-  const cancelBtn = document.createElement('button');
-  cancelBtn.textContent = 'Cancel';
-  cancelBtn.className = 'btn-secondary';
-  cancelBtn.style.padding = '8px 16px';
-  cancelBtn.onclick = () => editSection.remove();
-  editActions.appendChild(cancelBtn);
+        const cancelBtn = document.createElement("button");
+        cancelBtn.textContent = "Cancel";
+        cancelBtn.className = "btn-secondary";
+        cancelBtn.style.padding = "8px 16px";
+        cancelBtn.onclick = () => editSection.remove();
+        editActions.appendChild(cancelBtn);
 
-  editSection.appendChild(editActions);
-  imageContainer.appendChild(editSection);
-  editInput.focus();
-}
+        editSection.appendChild(editActions);
+        imageContainer.appendChild(editSection);
+        editInput.focus();
+      }
 
-function createImageCanvas(originalImg, imageBase64) {
-  const container = document.createElement('div');
-  container.style.textAlign = 'center';
+      function createImageCanvas(originalImg, imageBase64) {
+        const container = document.createElement("div");
+        container.style.textAlign = "center";
 
-  // Canvas tools
-  const tools = document.createElement('div');
-  tools.className = 'canvas-tools';
-  
-  const colorGroup = document.createElement('div');
-  colorGroup.className = 'tool-group';
-  colorGroup.innerHTML = `
+        // Canvas tools
+        const tools = document.createElement("div");
+        tools.className = "canvas-tools";
+
+        const colorGroup = document.createElement("div");
+        colorGroup.className = "tool-group";
+        colorGroup.innerHTML = `
     <label>Color:</label>
     <input type="color" class="color-picker" value="#ff0000">
   `;
-  tools.appendChild(colorGroup);
+        tools.appendChild(colorGroup);
 
-  const sizeGroup = document.createElement('div');
-  sizeGroup.className = 'tool-group';
-  sizeGroup.innerHTML = `
+        const sizeGroup = document.createElement("div");
+        sizeGroup.className = "tool-group";
+        sizeGroup.innerHTML = `
     <label>Size:</label>
     <input type="range" class="brush-size" min="2" max="20" value="5">
     <span class="size-value">5px</span>
   `;
-  tools.appendChild(sizeGroup);
+        tools.appendChild(sizeGroup);
 
-  const clearBtn = document.createElement('button');
-  clearBtn.textContent = 'Clear Marks';
-  clearBtn.className = 'btn-tool btn-secondary';
-  clearBtn.onclick = () => {
-    const canvas = container.querySelector('.edit-canvas');
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  };
-  tools.appendChild(clearBtn);
+        const clearBtn = document.createElement("button");
+        clearBtn.textContent = "Clear Marks";
+        clearBtn.className = "btn-tool btn-secondary";
+        clearBtn.onclick = () => {
+          const canvas = container.querySelector(".edit-canvas");
+          const ctx = canvas.getContext("2d");
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        };
+        tools.appendChild(clearBtn);
 
-  container.appendChild(tools);
+        container.appendChild(tools);
 
-  // Canvas container with image and overlay
-  const canvasContainer = document.createElement('div');
-  canvasContainer.className = 'canvas-container';
+        // Canvas container with image and overlay
+        const canvasContainer = document.createElement("div");
+        canvasContainer.className = "canvas-container";
 
-  // Create a copy of the image for the canvas background
-  const img = document.createElement('img');
-  img.src = originalImg.src;
-  img.style.display = 'block';
-  img.style.maxWidth = '500px';
-  img.style.height = 'auto';
-  
-  // Create canvas overlay
-  const canvas = document.createElement('canvas');
-  canvas.className = 'edit-canvas';
-  
-  img.onload = () => {
-    const displayWidth = img.offsetWidth;
-    const displayHeight = img.offsetHeight;
-    
-    console.log('Canvas setup - Image dimensions:', displayWidth, 'x', displayHeight);
-    
-    canvas.width = displayWidth;
-    canvas.height = displayHeight;
-    canvas.style.width = displayWidth + 'px';
-    canvas.style.height = displayHeight + 'px';
-    
-    setupCanvasDrawing(canvas, container);
-  };
+        // Create a copy of the image for the canvas background
+        const img = document.createElement("img");
+        img.src = originalImg.src;
+        img.style.display = "block";
+        img.style.maxWidth = "500px";
+        img.style.height = "auto";
 
-  canvasContainer.appendChild(img);
-  canvasContainer.appendChild(canvas);
-  container.appendChild(canvasContainer);
+        // Create canvas overlay
+        const canvas = document.createElement("canvas");
+        canvas.className = "edit-canvas";
 
-  return container;
-}
+        // --- FIX: Add a loading state ---
+        const loadingIndicator = document.createElement("div");
+        loadingIndicator.textContent = "Initializing canvas...";
+        canvasContainer.appendChild(loadingIndicator);
 
-function setupCanvasDrawing(canvas, container) {
-  const ctx = canvas.getContext('2d');
-  let isDrawing = false;
-  let lastX = 0;
-  let lastY = 0;
+        img.onload = () => {
+          const displayWidth = img.offsetWidth;
+          const displayHeight = img.offsetHeight;
 
-  const colorPicker = container.querySelector('.color-picker');
-  const brushSize = container.querySelector('.brush-size');
-  const sizeValue = container.querySelector('.size-value');
+          console.log(
+            "Canvas setup - Image dimensions:",
+            displayWidth,
+            "x",
+            displayHeight
+          );
 
-  // Update size display
-  brushSize.addEventListener('input', () => {
-    sizeValue.textContent = brushSize.value + 'px';
-  });
+          canvas.width = displayWidth;
+          canvas.height = displayHeight;
+          canvas.style.width = displayWidth + "px";
+          canvas.style.height = displayHeight + "px";
 
-  function draw(e) {
-    if (!isDrawing) return;
+          setupCanvasDrawing(canvas, container);
 
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+          // --- FIX: Enable controls only after canvas is ready ---
+          loadingIndicator.remove(); // Remove loading text
+          const applyBtn = container.parentElement.querySelector(".btn-edit");
+          if (applyBtn) {
+            applyBtn.disabled = false;
+            applyBtn.textContent = "Apply Edit";
+          }
+        };
 
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.strokeStyle = colorPicker.value;
-    ctx.lineWidth = parseInt(brushSize.value);
+        canvasContainer.appendChild(img);
+        canvasContainer.appendChild(canvas);
+        container.appendChild(canvasContainer);
 
-    ctx.beginPath();
-    ctx.moveTo(lastX, lastY);
-    ctx.lineTo(x, y);
-    ctx.stroke();
-
-    lastX = x;
-    lastY = y;
-  }
-
-  canvas.addEventListener('mousedown', (e) => {
-    isDrawing = true;
-    const rect = canvas.getBoundingClientRect();
-    lastX = e.clientX - rect.left;
-    lastY = e.clientY - rect.top;
-  });
-
-  canvas.addEventListener('mousemove', draw);
-  canvas.addEventListener('mouseup', () => isDrawing = false);
-  canvas.addEventListener('mouseout', () => isDrawing = false);
-
-  // Touch events for mobile
-  canvas.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    const touch = e.touches[0];
-    const rect = canvas.getBoundingClientRect();
-    lastX = touch.clientX - rect.left;
-    lastY = touch.clientY - rect.top;
-    isDrawing = true;
-  });
-
-  canvas.addEventListener('touchmove', (e) => {
-    e.preventDefault();
-    if (!isDrawing) return;
-    const touch = e.touches[0];
-    const rect = canvas.getBoundingClientRect();
-    const x = touch.clientX - rect.left;
-    const y = touch.clientY - rect.top;
-
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.strokeStyle = colorPicker.value;
-    ctx.lineWidth = brushSize.value;
-
-    ctx.beginPath();
-    ctx.moveTo(lastX, lastY);
-    ctx.lineTo(x, y);
-    ctx.stroke();
-
-    lastX = x;
-    lastY = y;
-  });
-
-  canvas.addEventListener('touchend', () => isDrawing = false);
-}
-
-async function editImageWithMarking(originalImageBase64, editPrompt, markingData, editSection) {
-  if(!editPrompt?.trim()) {
-    alert('Please enter an edit instruction for the marked areas');
-    return;
-  }
-
-  console.log('Starting marked edit with prompt:', editPrompt);
-  console.log('Marking data size:', markingData.length);
-
-  const originalBtn = editSection.querySelector('.btn-edit');
-  originalBtn.disabled = true;
-  originalBtn.textContent = 'Editing...';
-
-  try {
-    // Extract just the base64 data from the marking canvas
-    const markingBase64 = markingData.split(',')[1];
-    console.log('Extracted marking base64 size:', markingBase64.length);
-    
-    const res = await fetch('http://localhost:8000/api/edit-image-with-mask', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        imageBase64: originalImageBase64, 
-        maskBase64: markingBase64,
-        editPrompt: editPrompt.trim() 
-      })
-    });
-
-    console.log('API response status:', res.status);
-    const data = await res.json();
-    console.log('API response data:', data);
-    
-    if(data.success && (data.imageBase64 || data.imageUri)) {
-      // Create new image container for the edited image
-      const resultEl = document.getElementById('result');
-      const newImageContainer = document.createElement('div');
-      newImageContainer.className = 'image-container';
-      newImageContainer.style.marginTop = '20px';
-
-      const editedImg = document.createElement('img');
-      editedImg.src = data.imageBase64 
-        ? `data:image/png;base64,${data.imageBase64}` 
-        : data.imageUri;
-      editedImg.alt = 'Edited image with markings';
-      newImageContainer.appendChild(editedImg);
-
-      const editLabel = document.createElement('div');
-      editLabel.textContent = `✏️ Marked Edit: "${editPrompt}"`;
-      editLabel.style.fontStyle = 'italic';
-      editLabel.style.color = '#666';
-      editLabel.style.marginTop = '5px';
-      newImageContainer.appendChild(editLabel);
-
-      const newActions = document.createElement('div');
-      newActions.className = 'image-actions';
-
-      const downloadLink = document.createElement('a');
-      downloadLink.href = editedImg.src;
-      downloadLink.download = 'marked-edited-image.png';
-      downloadLink.textContent = 'Download';
-      downloadLink.style.display = 'inline-block';
-      downloadLink.style.padding = '8px 12px';
-      downloadLink.style.background = '#4a90e2';
-      downloadLink.style.color = 'white';
-      downloadLink.style.textDecoration = 'none';
-      downloadLink.style.borderRadius = '4px';
-      downloadLink.style.fontSize = '14px';
-      newActions.appendChild(downloadLink);
-
-      if(data.imageBase64) {
-        const editBtn = document.createElement('button');
-        editBtn.textContent = 'Edit Again';
-        editBtn.className = 'btn-edit';
-        editBtn.style.padding = '8px 12px';
-        editBtn.style.fontSize = '14px';
-        editBtn.onclick = () => showEditInterface(data.imageBase64, newImageContainer);
-        newActions.appendChild(editBtn);
+        return container;
       }
 
-      newImageContainer.appendChild(newActions);
-      resultEl.appendChild(newImageContainer);
+      function setupCanvasDrawing(canvas, container) {
+        const ctx = canvas.getContext("2d");
+        let isDrawing = false;
+        let lastX = 0;
+        let lastY = 0;
 
-      // Remove the edit interface
-      editSection.remove();
-    } else {
-      alert('Failed to edit image: ' + (data.error || 'Unknown error'));
-    }
+        const colorPicker = container.querySelector(".color-picker");
+        const brushSize = container.querySelector(".brush-size");
+        const sizeValue = container.querySelector(".size-value");
 
-  } catch(err) {
-    console.error(err);
-    // Fallback to regular editing if mask-based editing fails
-    console.log('Mask-based editing failed, falling back to regular edit');
-    editImage(originalImageBase64, editPrompt, editSection);
-  } finally {
-    originalBtn.disabled = false;
-    originalBtn.textContent = 'Apply Edit';
-  }
-}
+        // Update size display
+        brushSize.addEventListener("input", () => {
+          sizeValue.textContent = brushSize.value + "px";
+        });
 
-async function editImage(originalImageBase64, editPrompt, editSection) {
-  if(!editPrompt?.trim()) {
-    alert('Please enter an edit instruction');
-    return;
-  }
+        function draw(e) {
+          if (!isDrawing) return;
 
-  const originalBtn = editSection.querySelector('.btn-edit');
-  originalBtn.disabled = true;
-  originalBtn.textContent = 'Editing...';
+          const rect = canvas.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const y = e.clientY - rect.top;
 
-  try {
-    const res = await fetch('http://localhost:8000/api/edit-image', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        imageBase64: originalImageBase64, 
-        editPrompt: editPrompt.trim() 
-      })
-    });
+          ctx.globalCompositeOperation = "source-over";
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          ctx.strokeStyle = colorPicker.value;
+          ctx.lineWidth = parseInt(brushSize.value);
 
-    const data = await res.json();
-    
-    if(data.success && (data.imageBase64 || data.imageUri)) {
-      // Create new image container for the edited image
-      const resultEl = document.getElementById('result');
-      const newImageContainer = document.createElement('div');
-      newImageContainer.className = 'image-container';
-      newImageContainer.style.marginTop = '20px';
+          ctx.beginPath();
+          ctx.moveTo(lastX, lastY);
+          ctx.lineTo(x, y);
+          ctx.stroke();
 
-      const editedImg = document.createElement('img');
-      editedImg.src = data.imageBase64 
-        ? `data:image/png;base64,${data.imageBase64}` 
-        : data.imageUri;
-      editedImg.alt = 'Edited image';
-      newImageContainer.appendChild(editedImg);
+          lastX = x;
+          lastY = y;
+        }
 
-      const editLabel = document.createElement('div');
-      editLabel.textContent = `Edited: "${editPrompt}"`;
-      editLabel.style.fontStyle = 'italic';
-      editLabel.style.color = '#666';
-      editLabel.style.marginTop = '5px';
-      newImageContainer.appendChild(editLabel);
+        canvas.addEventListener("mousedown", (e) => {
+          isDrawing = true;
+          const rect = canvas.getBoundingClientRect();
+          lastX = e.clientX - rect.left;
+          lastY = e.clientY - rect.top;
+        });
 
-      const newActions = document.createElement('div');
-      newActions.className = 'image-actions';
+        canvas.addEventListener("mousemove", draw);
+        canvas.addEventListener("mouseup", () => (isDrawing = false));
+        canvas.addEventListener("mouseout", () => (isDrawing = false));
 
-      const downloadLink = document.createElement('a');
-      downloadLink.href = editedImg.src;
-      downloadLink.download = 'edited-image.png';
-      downloadLink.textContent = 'Download';
-      downloadLink.style.display = 'inline-block';
-      downloadLink.style.padding = '8px 12px';
-      downloadLink.style.background = '#4a90e2';
-      downloadLink.style.color = 'white';
-      downloadLink.style.textDecoration = 'none';
-      downloadLink.style.borderRadius = '4px';
-      downloadLink.style.fontSize = '14px';
-      newActions.appendChild(downloadLink);
+        // Touch events for mobile
+        canvas.addEventListener("touchstart", (e) => {
+          e.preventDefault();
+          const touch = e.touches[0];
+          const rect = canvas.getBoundingClientRect();
+          lastX = touch.clientX - rect.left;
+          lastY = touch.clientY - rect.top;
+          isDrawing = true;
+        });
 
-      if(data.imageBase64) {
-        const editBtn = document.createElement('button');
-        editBtn.textContent = 'Edit Again';
-        editBtn.className = 'btn-edit';
-        editBtn.style.padding = '8px 12px';
-        editBtn.style.fontSize = '14px';
-        editBtn.onclick = () => showEditInterface(data.imageBase64, newImageContainer);
-        newActions.appendChild(editBtn);
+        canvas.addEventListener("touchmove", (e) => {
+          e.preventDefault();
+          if (!isDrawing) return;
+          const touch = e.touches[0];
+          const rect = canvas.getBoundingClientRect();
+          const x = touch.clientX - rect.left;
+          const y = touch.clientY - rect.top;
+
+          ctx.globalCompositeOperation = "source-over";
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          ctx.strokeStyle = colorPicker.value;
+          ctx.lineWidth = brushSize.value;
+
+          ctx.beginPath();
+          ctx.moveTo(lastX, lastY);
+          ctx.lineTo(x, y);
+          ctx.stroke();
+
+          lastX = x;
+          lastY = y;
+        });
+
+        canvas.addEventListener("touchend", () => (isDrawing = false));
       }
 
-      newImageContainer.appendChild(newActions);
-      resultEl.appendChild(newImageContainer);
+      async function editImageWithMarking(
+        originalImageBase64,
+        editPrompt,
+        markingData,
+        editSection
+      ) {
+        if (!editPrompt?.trim()) {
+          alert("Please enter an edit instruction for the marked areas");
+          return;
+        }
 
-      // Remove the edit interface
-      editSection.remove();
-    } else {
-      alert('Failed to edit image: ' + (data.error || 'Unknown error'));
-    }
+        console.log("Starting marked edit with prompt:", editPrompt);
+        console.log("Marking data size:", markingData.length);
 
-  } catch(err) {
-    console.error(err);
-    alert('Error editing image: ' + (err?.message || String(err)));
-  } finally {
-    originalBtn.disabled = false;
-    originalBtn.textContent = 'Apply Edit';
-  }
-}
-</script>
-</body>
+        const originalBtn = editSection.querySelector(".btn-edit");
+        originalBtn.disabled = true;
+        originalBtn.textContent = "Editing...";
+
+        try {
+          // Extract just the base64 data from the marking canvas
+          const markingBase64 = markingData.split(",")[1];
+          console.log("Extracted marking base64 size:", markingBase64.length);
+
+          const res = await fetch(
+            "http://localhost:8000/api/edit-image-with-mask",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                imageBase64: originalImageBase64,
+                maskBase64: markingBase64,
+                editPrompt: editPrompt.trim(),
+              }),
+            }
+          );
+
+          console.log("API response status:", res.status);
+          const data = await res.json();
+          console.log("API response data:", data);
+
+          if (data.success && (data.imageBase64 || data.imageUri)) {
+            // Create new image container for the edited image
+            const resultEl = document.getElementById("result");
+            const newImageContainer = document.createElement("div");
+            newImageContainer.className = "image-container";
+            newImageContainer.style.marginTop = "20px";
+
+            const editedImg = document.createElement("img");
+            editedImg.src = data.imageBase64
+              ? `data:image/png;base64,${data.imageBase64}`
+              : data.imageUri;
+            editedImg.alt = "Edited image with markings";
+            newImageContainer.appendChild(editedImg);
+
+            const editLabel = document.createElement("div");
+            editLabel.textContent = `✏️ Marked Edit: "${editPrompt}"`;
+            editLabel.style.fontStyle = "italic";
+            editLabel.style.color = "#666";
+            editLabel.style.marginTop = "5px";
+            newImageContainer.appendChild(editLabel);
+
+            const newActions = document.createElement("div");
+            newActions.className = "image-actions";
+
+            const downloadLink = document.createElement("a");
+            downloadLink.href = editedImg.src;
+            downloadLink.download = "marked-edited-image.png";
+            downloadLink.textContent = "Download";
+            downloadLink.style.display = "inline-block";
+            downloadLink.style.padding = "8px 12px";
+            downloadLink.style.background = "#4a90e2";
+            downloadLink.style.color = "white";
+            downloadLink.style.textDecoration = "none";
+            downloadLink.style.borderRadius = "4px";
+            downloadLink.style.fontSize = "14px";
+            newActions.appendChild(downloadLink);
+
+            if (data.imageBase64) {
+              const editBtn = document.createElement("button");
+              editBtn.textContent = "Edit Again";
+              editBtn.className = "btn-edit";
+              editBtn.style.padding = "8px 12px";
+              editBtn.style.fontSize = "14px";
+              editBtn.onclick = () =>
+                showEditInterface(data.imageBase64, newImageContainer);
+              newActions.appendChild(editBtn);
+            }
+
+            newImageContainer.appendChild(newActions);
+            resultEl.appendChild(newImageContainer);
+
+            // Remove the edit interface
+            editSection.remove();
+          } else {
+            alert("Failed to edit image: " + (data.error || "Unknown error"));
+          }
+        } catch (err) {
+          console.error(err);
+          // Fallback to regular editing if mask-based editing fails
+          console.log(
+            "Mask-based editing failed, falling back to regular edit"
+          );
+          editImage(originalImageBase64, editPrompt, editSection);
+        } finally {
+          originalBtn.disabled = false;
+          originalBtn.textContent = "Apply Edit";
+        }
+      }
+
+      async function editImage(originalImageBase64, editPrompt, editSection) {
+        if (!editPrompt?.trim()) {
+          alert("Please enter an edit instruction");
+          return;
+        }
+
+        const originalBtn = editSection.querySelector(".btn-edit");
+        originalBtn.disabled = true;
+        originalBtn.textContent = "Editing...";
+
+        try {
+          const res = await fetch("http://localhost:8000/api/edit-image", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              imageBase64: originalImageBase64,
+              editPrompt: editPrompt.trim(),
+            }),
+          });
+
+          const data = await res.json();
+
+          if (data.success && (data.imageBase64 || data.imageUri)) {
+            // Create new image container for the edited image
+            const resultEl = document.getElementById("result");
+            const newImageContainer = document.createElement("div");
+            newImageContainer.className = "image-container";
+            newImageContainer.style.marginTop = "20px";
+
+            const editedImg = document.createElement("img");
+            editedImg.src = data.imageBase64
+              ? `data:image/png;base64,${data.imageBase64}`
+              : data.imageUri;
+            editedImg.alt = "Edited image";
+            newImageContainer.appendChild(editedImg);
+
+            const editLabel = document.createElement("div");
+            editLabel.textContent = `Edited: "${editPrompt}"`;
+            editLabel.style.fontStyle = "italic";
+            editLabel.style.color = "#666";
+            editLabel.style.marginTop = "5px";
+            newImageContainer.appendChild(editLabel);
+
+            const newActions = document.createElement("div");
+            newActions.className = "image-actions";
+
+            const downloadLink = document.createElement("a");
+            downloadLink.href = editedImg.src;
+            downloadLink.download = "edited-image.png";
+            downloadLink.textContent = "Download";
+            downloadLink.style.display = "inline-block";
+            downloadLink.style.padding = "8px 12px";
+            downloadLink.style.background = "#4a90e2";
+            downloadLink.style.color = "white";
+            downloadLink.style.textDecoration = "none";
+            downloadLink.style.borderRadius = "4px";
+            downloadLink.style.fontSize = "14px";
+            newActions.appendChild(downloadLink);
+
+            if (data.imageBase64) {
+              const editBtn = document.createElement("button");
+              editBtn.textContent = "Edit Again";
+              editBtn.className = "btn-edit";
+              editBtn.style.padding = "8px 12px";
+              editBtn.style.fontSize = "14px";
+              editBtn.onclick = () =>
+                showEditInterface(data.imageBase64, newImageContainer);
+              newActions.appendChild(editBtn);
+            }
+
+            newImageContainer.appendChild(newActions);
+            resultEl.appendChild(newImageContainer);
+
+            // Remove the edit interface
+            editSection.remove();
+          } else {
+            alert("Failed to edit image: " + (data.error || "Unknown error"));
+          }
+        } catch (err) {
+          console.error(err);
+          alert("Error editing image: " + (err?.message || String(err)));
+        } finally {
+          originalBtn.disabled = false;
+          originalBtn.textContent = "Apply Edit";
+        }
+      }
+    </script>
+  </body>
 </html>
