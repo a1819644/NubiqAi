@@ -1,0 +1,24 @@
+// ADD THIS CODE AT LINE 817 (right after: console.log(`📋 Using base structured response prompt`);)
+
+    // 📚 Add document context if documentId is provided
+    if (documentId) {
+      const searchResult = searchChunks(documentId, prompt);
+      if (searchResult) {
+        const documentContextSection = `
+${"=".repeat(60)}
+📄 DOCUMENT CONTEXT
+${"=".repeat(60)}
+
+Summary: ${searchResult.summary}
+
+Relevant Sections:
+${searchResult.relevantChunks.join("\n\n")}
+
+${"=".repeat(60)}
+`;
+        enhancedPrompt = documentContextSection + "\n\n" + enhancedPrompt;
+        console.log(`📚 Added document context to prompt. Chunks: ${searchResult.relevantChunks.length}`);
+      } else {
+        console.warn(`⚠️ Document ID "${documentId}" provided but not found in cache.`);
+      }
+    }

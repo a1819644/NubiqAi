@@ -16,6 +16,7 @@
     "@google-cloud/vertexai": "^1.10.0",
     "@google/genai": "^1.21.0",
     "@pinecone-database/pinecone": "^6.1.2",
+    "@types/multer": "^2.0.0",
     "ai-dashboard-portal-mockup": "file:..",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
@@ -23,6 +24,7 @@
     "express": "^5.1.0",
     "firebase-admin": "^13.5.0",
     "mammoth": "^1.7.0",
+    "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
     "pdf-parse": "^1.1.1"
   },

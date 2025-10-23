@@ -3,8 +3,10 @@ require("dotenv").config();
 import express from "express";
 import cors from "cors";
 import type { CorsOptions } from "cors";
+import multer from "multer";
 import { VertexAI } from "@google-cloud/vertexai";
 import { GoogleGenAI } from "@google/genai";
+import { buildRollingSummary } from "./services/contextManager";
 import {
   getEmbeddingService,
   MemoryItem,
@@ -14,7 +16,11 @@ import { getHybridMemoryService } from "./services/hybridMemoryService";
 import { extractDocumentTopics } from "./services/conversationService";
 import * as userProfileService from "./services/userProfileService";
 import { firebaseStorageService } from "./services/firebaseStorageService";
-import { extractTextFromDocument } from "./services/documentExtractionService";
+import { localImageCacheService } from "./services/localImageCacheService";
+import {
+  extractTextFromDocument,
+} from "./services/documentExtractionService";
+import { storeDocument, searchChunks } from "./services/documentCacheService";
 import {
   rateLimitMiddleware,
   validateUserIdMiddleware,
@@ -140,8 +146,84 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.json({ limit: "100mb" }));
-app.use(express.urlencoded({ limit: "100mb", extended: true }));
+
+// Serve local cached images quickly from disk when enabled
+try {
+  if (localImageCacheService.isEnabled()) {
+    const dir = localImageCacheService.getBaseDir();
+    console.log(`🗂️ Serving local images from: ${dir}`);
+    app.use(
+      "/local-images",
+      express.static(dir, {
+        maxAge: 5 * 60 * 1000, // 5 minutes
+        etag: true,
+        setHeaders: (res) => {
+          res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=60");
+          res.setHeader("Timing-Allow-Origin", "*");
+        },
+      })
+    );
+  }
+} catch (e) {
+  console.warn("⚠️ Failed to mount local image static route:", e);
+}
+
+// Early request logger BEFORE any body parsing to diagnose content-type issues
+app.use((req, _res, next) => {
+  const ct = req.headers['content-type'] || 'none';
+  console.log(`[REQ] ${req.method} ${req.url} | Content-Type: ${ct}`);
+  next();
+});
+
+// Conditionally parse body - skip JSON parsing for multipart/form-data
+app.use((req, res, next) => {
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  
+  // Skip body parsing for multipart/form-data (let multer handle it)
+  if (contentType.startsWith('multipart/form-data') || contentType.includes('multipart/form-data')) {
+    console.log('⏭️ Skipping body parser for multipart request');
+    return next();
+  }
+  
+  // Parse JSON for other requests
+  express.json({ limit: "100mb" })(req, res, next);
+});
+
+app.use((req, res, next) => {
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  
+  // Skip for multipart/form-data
+  if (contentType.startsWith('multipart/form-data') || contentType.includes('multipart/form-data')) {
+    return next();
+  }
+  
+  express.urlencoded({ limit: "100mb", extended: true })(req, res, next);
+});
+
+// Configure multer for multipart/form-data (image uploads)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
+
+// Serve local image cache statically for instant client loads
+try {
+  if (localImageCacheService.isEnabled()) {
+    const dir = (localImageCacheService as any).getBaseDir?.() || require('path').resolve(__dirname, 'local-images');
+    app.use('/local-images', express.static(dir, {
+      setHeaders: (res) => {
+        res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+      }
+    }));
+    console.log(`🖼️ Local image cache enabled. Serving ${dir} at /local-images`);
+  } else {
+    console.log('🖼️ Local image cache disabled');
+  }
+} catch (e) {
+  console.warn('⚠️ Failed to mount local image cache static route:', e);
+}
 
 // 🔒 Security middleware
 app.use(securityHeadersMiddleware);
@@ -264,27 +346,64 @@ process.on("unhandledRejection", (reason, promise) => {
 /**
  * POST /api/ask-ai
  * body: { prompt: string, type?: 'text' | 'image', model?: string, useMemory?: boolean, userId?: string }
+ * OR multipart/form-data: { prompt, image (file), type, userId, ... }
  * 🔒 SECURITY: Rate limited, input validated
  */
-app.post("/api/ask-ai", rateLimitMiddleware("general"), async (req, res) => {
+app.post("/api/ask-ai", upload.single('image'), rateLimitMiddleware("general"), async (req, res) => {
   if (!vertex && !ai)
     return res.status(500).json({ error: "AI client not initialized" });
 
   try {
     console.log("📥 Request received at /api/ask-ai");
-    const {
-      prompt,
-      type = "text",
-      model,
-      useMemory = true,
-      userId,
-      chatId,
-      messageCount,
-      userName,
-      conversationHistory,
-      conversationSummary,
-    } = req.body;
-    console.log("📦 Request body parsed successfully");
+    
+    // Handle both multipart (with image file) and JSON requests
+    let prompt, chatId, userId, model, temperature, max_tokens, memory, documentId, conversationHistory, conversationSummary, messageCount, userName, type, imageBase64;
+    
+    if (req.file) {
+      // Multipart request with image file
+      console.log("🖼️ Multipart request with image file");
+      imageBase64 = req.file.buffer.toString('base64');
+      prompt = req.body.prompt;
+      chatId = req.body.chatId;
+      userId = req.body.userId;
+      model = req.body.model;
+      temperature = req.body.temperature;
+      max_tokens = req.body.max_tokens;
+      memory = req.body.memory;
+      documentId = req.body.documentId;
+      messageCount = req.body.messageCount;
+      userName = req.body.userName;
+      // Default to text/vision analysis when an image file is uploaded
+      // (image generation is only triggered explicitly or when no image is uploaded)
+      type = req.body.type || 'text';
+      // Note: conversationHistory and conversationSummary are typically not sent with images
+    } else {
+      // JSON request
+      ({
+        prompt,
+        chatId,
+        userId,
+        model,
+        temperature,
+        max_tokens,
+        memory,
+        documentId,
+        conversationHistory,
+        conversationSummary,
+        messageCount,
+        userName,
+        type,
+      } = req.body);
+    }
+
+  const useMemory = memory !== false; // Default to true if not specified
+
+  // Normalize type to handle typos like "iamge", synonyms like "img", etc.
+  const normalizedType = normalizeRequestType(type);
+
+    if (!prompt) {
+      return res.status(400).json({ error: "Prompt is required" });
+    }
 
     // � Concurrency guard per user/chat
     const keyUser = userId || "anonymous";
@@ -445,7 +564,7 @@ app.post("/api/ask-ai", rateLimitMiddleware("general"), async (req, res) => {
     };
 
     // Use memory system based on search strategy
-    if (useMemory && type === "text") {
+  if (useMemory && normalizedType === "text") {
       // ⚡ OPTIMIZATION: Use smart strategy determination
       const memoryStrategy = determineMemoryStrategy(
         prompt,
@@ -597,6 +716,18 @@ ${prompt}
             memoryResult.combinedContext !==
               "No relevant conversation history found."
           ) {
+            // 🔎 NEW: Build a compact rolling summary to lead the context
+            let rollingSummarySection = '';
+            try {
+              const roll = await buildRollingSummary(effectiveUserId, effectiveChatId);
+              if (roll) {
+                const facts = roll.keyFacts.map((f) => `• ${f}`).join("\n");
+                rollingSummarySection = `${"=".repeat(60)}\n🧾 ROLLING SUMMARY\n${"=".repeat(60)}\n\n${roll.summary}\n\nKEY FACTS:\n${facts}\n`;
+              }
+            } catch (e) {
+              console.warn('⚠️ Rolling summary generation failed (non-fatal):', e);
+            }
+
             enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent, helpful assistant with persistent memory and excellent communication skills.
 
 ⚠️ CRITICAL FORMATTING RULES - READ CAREFULLY:
@@ -721,7 +852,7 @@ Which tip will you try first? 🚀"
 
 ${"=".repeat(60)}
 🧠 CONVERSATION HISTORY & USER PROFILE:
-${memoryResult.combinedContext}
+${rollingSummarySection}${memoryResult.combinedContext}
 ${"=".repeat(60)}
 
 💬 CURRENT USER QUESTION:
@@ -804,11 +935,448 @@ ${prompt}
 � Respond using ONLY emojis and natural language. NO # or * symbols!`;
       console.log(`📋 Using base structured response prompt`);
     }
+// ADD THIS CODE AT LINE 817 (right after: console.log(`📋 Using base structured response prompt`);)
 
-    const textModel = model ?? "gemini-2.5-flash";
-    const imageModel = model ?? "gemini-2.5-flash-image"; // 🎯 UPDATED: Using the latest multimodal flash model for both text and images.
+    // 📚 Add document context if documentId is provided
+    if (documentId) {
+      const searchResult = searchChunks(documentId, prompt);
+      if (searchResult) {
+        const documentContextSection = `
+${"=".repeat(60)}
+📄 DOCUMENT CONTEXT
+${"=".repeat(60)}
 
-    if (type === "image") {
+Summary: ${searchResult.summary}
+
+Relevant Sections:
+${searchResult.relevantChunks.join("\n\n")}
+
+${"=".repeat(60)}
+`;
+        enhancedPrompt = documentContextSection + "\n\n" + enhancedPrompt;
+        console.log(`📚 Added document context to prompt. Chunks: ${searchResult.relevantChunks.length}`);
+      } else {
+        console.warn(`⚠️ Document ID "${documentId}" provided but not found in cache.`);
+      }
+    }
+
+    // 🖼️ Add image context if imageId is provided OR if image was uploaded via multipart
+    const { imageId } = req.body;
+    let imageContextData: { description: string, imageBase64: string } | null = null;
+    
+    // Priority: Use uploaded image file first, then imageId from cache
+    if (imageBase64) {
+      // Image uploaded via multipart/form-data
+      console.log(`🖼️ Using uploaded image file for vision analysis (${imageBase64.length} chars base64)`);
+      imageContextData = {
+        description: "User uploaded image",
+        imageBase64: imageBase64
+      };
+      
+      const imageContextSection = `
+${"=".repeat(60)}
+🖼️ IMAGE CONTEXT
+${"=".repeat(60)}
+
+Image: Uploaded by user
+Type: Vision analysis with uploaded image
+
+${"=".repeat(60)}
+`;
+      enhancedPrompt = imageContextSection + "\n\n" + enhancedPrompt;
+    } else if (imageId) {
+      // Image from cache (imageId reference)
+      const { getImage } = require("./services/imageCacheService");
+      const imageData = getImage(imageId);
+      
+      if (imageData) {
+        imageContextData = {
+          description: imageData.description,
+          imageBase64: imageData.imageBase64
+        };
+        
+        const imageContextSection = `
+${"=".repeat(60)}
+🖼️ IMAGE CONTEXT
+${"=".repeat(60)}
+
+Image: ${imageData.fileName}
+Description: ${imageData.description}
+
+${"=".repeat(60)}
+`;
+        enhancedPrompt = imageContextSection + "\n\n" + enhancedPrompt;
+        console.log(`🖼️ Added image context to prompt. Image: ${imageData.fileName}`);
+      } else {
+        console.warn(`⚠️ Image ID "${imageId}" provided but not found in cache.`);
+      }
+    }
+
+  // Prefer explicit request model, then env overrides, then safe defaults
+  const textModel = (model as string | undefined) || process.env.TEXT_MODEL || "gemini-2.5-pro"; // 🎯 GA model for text/chat
+  const imageModel = (model as string | undefined) || process.env.IMAGE_MODEL || "gemini-2.5-flash-image"; // 🎯 GA model for image generation
+  // Use a fast, lightweight model for classification by default
+  const intentModel = process.env.INTENT_MODEL || "gemini-1.5-flash-001"; // Default to v1 model id to avoid 404s
+
+    // 🔍 Intent helpers: fuzzy matching + optional model-based classification
+    function levenshtein(a: string, b: string): number {
+      const m = a.length, n = b.length;
+      if (m === 0) return n;
+      if (n === 0) return m;
+      const dp = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+      for (let i = 0; i <= m; i++) dp[i][0] = i;
+      for (let j = 0; j <= n; j++) dp[0][j] = j;
+      for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          dp[i][j] = Math.min(
+            dp[i - 1][j] + 1,
+            dp[i][j - 1] + 1,
+            dp[i - 1][j - 1] + cost
+          );
+        }
+      }
+      return dp[m][n];
+    }
+
+    function fuzzyIncludes(haystack: string, needles: string[], maxDistance = 1): { matched: string | null } {
+      const s = haystack.toLowerCase();
+      for (const needle of needles) {
+        const n = needle.toLowerCase();
+        if (s.includes(n)) return { matched: needle };
+        // Sliding window fuzzy search
+        const w = n.length;
+        for (let i = 0; i <= s.length - w; i++) {
+          const seg = s.slice(i, i + w);
+          if (levenshtein(seg, n) <= maxDistance) return { matched: needle };
+        }
+      }
+      return { matched: null };
+    }
+
+    function normalizeRequestType(t?: string): 'text' | 'image' {
+      if (!t) return 'text';
+      const s = String(t).toLowerCase().trim();
+      const imageSynonyms = ['image', 'img', 'picture', 'pic', 'generate', 'gen', 'art', 'logo'];
+      if (imageSynonyms.some((syn) => s === syn)) return 'image';
+      // Fuzzy for common typos: iamge, imgae
+      if (levenshtein(s, 'image') <= 2) return 'image';
+      return 'text';
+    }
+
+    function detectImageEditIntentHeuristic(p: string): { likely: boolean; confidence: number; signal?: string } {
+      if (!p) return { likely: false, confidence: 0 };
+      const verbs = [
+        'add','insert','place','put','overlay','draw','paint','write','stamp','apply',
+        'remove','erase','delete','clean','clear','hide','cut',
+        'replace','swap','change','modify','edit','adjust','tweak','fix','update',
+        'blur','sharpen','denoise','enhance','brighten','darken','exposure','contrast','saturation','vibrance','hue',
+        'crop','resize','rotate','flip','scale','border','frame',
+        'background','bg','mask','cutout','transparent',
+        'text','caption','label','watermark'
+      ];
+      const { matched } = fuzzyIncludes(p, verbs, 1);
+      if (matched) {
+        // Boost confidence for strong edit nouns
+        const strongNouns = ['background','mask','border','frame','watermark'];
+        const boost = strongNouns.some(n => p.toLowerCase().includes(n)) ? 0.2 : 0;
+        return { likely: true, confidence: Math.min(0.9, 0.6 + boost), signal: matched };
+      }
+      return { likely: false, confidence: 0.2 };
+    }
+
+    async function classifyIntentWithModel(p: string, hasImage: boolean): Promise<{ intent: 'imageEdit'|'visionQA'|'imageGenerate'|'text'; confidence: number } | null> {
+      try {
+        let classificationPrompt: string;
+        if (hasImage) {
+          // Binary classification when an image is present: edit vs vision Q&A
+          classificationPrompt = `Task: Classify the user's intent when an image is provided.
+Return a JSON object with fields intent and confidence (0-1).
+Valid intents: "imageEdit" or "visionQA" only.
+If the user is asking to modify the image (add/remove/replace/crop/background/change colors/etc), choose imageEdit.
+If the user is asking questions about the image (what is this, count, describe, compare), choose visionQA.
+
+INPUT PROMPT:
+${p}`;
+        } else {
+          // Full classification for text-only prompts
+          const instruction = `You are an intent classifier. Decide the user's intent given a prompt.
+Return ONLY a compact JSON object with fields intent and confidence (0-1).
+Valid intents: "imageEdit", "visionQA", "imageGenerate", "text".`;
+          classificationPrompt = `${instruction}\nPROMPT:\n${p}`;
+        }
+        const resp = await generateContent({ model: intentModel, contents: [classificationPrompt] });
+        const parts: any[] = (resp as any)?.parts ?? [];
+        const txt = parts.map((q: any) => q.text ?? '').join('').trim();
+        // Try JSON first
+        const jsonText = txt.match(/\{[\s\S]*\}/)?.[0] || txt;
+        let parsed: any = null;
+        try { parsed = JSON.parse(jsonText); } catch {}
+
+        // Fallback: accept simple outputs like "edit", "ask", "vision"
+        if (!parsed) {
+          const t = txt.toLowerCase();
+          if (/\b(edit|image\s*edit)\b/.test(t)) parsed = { intent: 'imageEdit', confidence: 0.55 };
+          else if (/\b(ask|vision|q&a|qa|analy[sz]e)\b/.test(t)) parsed = { intent: 'visionQA', confidence: 0.55 };
+          else if (/\b(generate|gen(erate)?\s*image|image\s*gen)\b/.test(t)) parsed = { intent: 'imageGenerate', confidence: 0.55 };
+          else parsed = { intent: 'text', confidence: 0.5 };
+        }
+
+        const intent = parsed.intent as any;
+        const confidence = Number(parsed.confidence ?? 0.5);
+        if (['imageEdit','visionQA','imageGenerate','text'].includes(intent)) {
+          return { intent, confidence: Math.max(0, Math.min(1, confidence)) };
+        }
+      } catch (e) {
+        console.warn('⚠️ Intent classifier failed, using heuristic:', e);
+      }
+      return null;
+    }
+
+    // 🔎 Extract a usable image URL when model returns markdown/link instead of inline image
+    function extractImageUrlFromText(text: string): string | null {
+      if (!text) return null;
+      const t = text.trim();
+      // Markdown image ![alt](url)
+      const md = t.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i);
+      if (md && md[1]) return md[1];
+      // Plain URL ending with common image extensions
+      const plain = t.match(/(https?:\/\/[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|svg))(?!\S)/i);
+      if (plain && plain[1]) return plain[1];
+      // Hosted attachments or storage paths that are likely images
+      const hosted = t.match(/(https?:\/\/[\w.-]+\/(?:assistants|storage|firebasestorage|googleusercontent)[^\s)]+)/i);
+      if (hosted && hosted[1]) return hosted[1];
+      return null;
+    }
+
+    // 🧼 Remove markdown image links and raw URLs from text so UI doesn't show links instead of images
+    function sanitizeImageText(text?: string): string | undefined {
+      if (!text) return text;
+      let out = text;
+      // Remove markdown image syntax
+      out = out.replace(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi, '').trim();
+      // Remove standalone URLs likely pointing to images/attachments
+      out = out.replace(/https?:\/\/[^\s)]+/gi, '').trim();
+      // Collapse multiple spaces/newlines
+      out = out.replace(/\n{3,}/g, '\n\n').replace(/\s{2,}/g, ' ');
+      return out || undefined;
+    }
+
+    async function detectFinalImageIntent(p: string): Promise<'edit'|'vision'> {
+      const heuristic = detectImageEditIntentHeuristic(p);
+      if (heuristic.likely && heuristic.confidence >= 0.6) {
+        console.log(`🧭 Heuristic intent: edit (signal: ${heuristic.signal}, conf: ${heuristic.confidence})`);
+        return 'edit';
+      }
+  const mode = (process.env.INTENT_CLASSIFIER || 'always').toLowerCase(); // 'off' | 'fallback' | 'always'
+      if (mode === 'off') {
+        console.log('🧭 Intent classifier OFF → default to vision Q&A');
+        return 'vision';
+      }
+      if (mode === 'always' || (mode === 'fallback' && (!heuristic.likely || heuristic.confidence < 0.6))) {
+        const cls = await classifyIntentWithModel(p, true);
+        if (cls) {
+          console.log(`🧭 Model intent: ${cls.intent} (conf: ${cls.confidence})`);
+          if (cls.intent === 'imageEdit' && cls.confidence >= 0.5) return 'edit';
+          return 'vision';
+        }
+      }
+      return 'vision';
+    }
+
+    // 🔍 New: Image GENERATION intent detection for text-only prompts
+    function detectImageGenerateIntentHeuristic(p: string): { likely: boolean; confidence: number; signal?: string } {
+      if (!p) return { likely: false, confidence: 0 };
+      const terms = [
+        'generate', 'create', 'make', 'draw', 'illustrate', 'visualize', 'render', 'produce', 'design',
+        'image of', 'picture of', 'photo of', 'art of', 'logo', 'icon', 'avatar', '/imagine',
+        'wallpaper', 'poster', 'banner', 'thumbnail'
+      ];
+      const cont = ['another', 'more', 'again', 'one more'];
+      const lower = p.toLowerCase();
+      const { matched } = fuzzyIncludes(lower, terms, 1);
+      const continuation = cont.some(w => new RegExp(`\\b${w}\\b`, 'i').test(lower));
+      if (matched || continuation) {
+        // If phrase has descriptors like "of a", assume specific generation intent
+        const specific = lower.includes(' of a ') || lower.includes(' with a ') || lower.includes(' that has ');
+        let conf = 0.6 + (specific ? 0.2 : 0);
+        if (continuation && p.length < 60) conf = Math.max(conf, 0.7);
+        return { likely: true, confidence: Math.min(0.95, conf), signal: matched || 'continuation' };
+      }
+      return { likely: false, confidence: 0.2 };
+    }
+
+    async function shouldGenerateImage(promptText: string, normalizedType: 'text'|'image'): Promise<boolean> {
+      // If client explicitly requested image, honor it
+      if (normalizedType === 'image') return true;
+
+      const mode = (process.env.AUTO_GENERATE_INTENT || 'fallback').toLowerCase(); // 'off' | 'fallback' | 'always'
+      if (mode === 'off') return false;
+
+      const h = detectImageGenerateIntentHeuristic(promptText);
+      if (mode === 'always') {
+        // Always run classifier for stronger signal when no explicit type
+        const cls = await classifyIntentWithModel(promptText, false);
+        if (cls?.intent === 'imageGenerate' && cls.confidence >= 0.55) return true;
+        // Fall back to heuristic if classifier uncertain
+        return h.likely && h.confidence >= 0.7;
+      }
+
+      // Fallback mode: Use heuristic first, then model if weak
+      if (h.likely && h.confidence >= 0.7) return true;
+      const cls = await classifyIntentWithModel(promptText, false);
+      return !!(cls && cls.intent === 'imageGenerate' && cls.confidence >= 0.6);
+    }
+
+    if (imageContextData && (await detectFinalImageIntent(prompt)) === 'edit') {
+      console.log("✏️ Edit intent detected with uploaded image - performing image editing");
+
+      const editInstruction = `Edit this image as follows: ${prompt}\n\nRules:\n- Make only the requested modifications\n- Preserve all other parts of the image\n- Return a single edited image output`;
+
+      let response;
+      try {
+        response = await generateContent({
+          model: imageModel,
+          contents: [
+            {
+              parts: [
+                { inlineData: { data: imageContextData.imageBase64, mimeType: "image/png" } },
+                { text: editInstruction },
+              ],
+            },
+          ],
+        });
+
+        const parts: any[] = (response as any)?.parts ?? [];
+  let editedBase64: string | null = null;
+  let editedUri: string | null = null;
+  let imageLocalUri: string | null = null;
+        let altText: string | null = null;
+
+        for (const part of parts) {
+          if ((part as any).inlineData) {
+            editedBase64 = (part as any).inlineData.data;
+          }
+          if ((part as any).fileData) {
+            editedUri = (part as any).fileData.fileUri;
+          }
+          if ((part as any).text) {
+            altText = (part as any).text ?? altText;
+          }
+        }
+
+        // Fallback: extract URL from text when no inline/fileData
+        if (!editedBase64 && !editedUri && altText) {
+          const extracted = extractImageUrlFromText(altText);
+          if (extracted) {
+            editedUri = extracted;
+            console.log(`🔗 [edit] Extracted image URL from text: ${editedUri}`);
+            try {
+              const resp = await fetch(extracted);
+              if (resp.ok) {
+                const arrayBuf = await resp.arrayBuffer();
+                const buffer = Buffer.from(arrayBuf);
+                editedBase64 = buffer.toString('base64');
+                console.log(`✅ [edit] Converted extracted URL image to base64 (${editedBase64.length} chars)`);
+              } else {
+                console.warn(`⚠️ [edit] Failed to fetch extracted image URL (status ${resp.status})`);
+              }
+            } catch (e) {
+              console.warn(`⚠️ [edit] Could not download extracted image URL:`, e);
+            }
+          }
+        }
+
+        // Save locally for instant load (if enabled)
+        try {
+          if (localImageCacheService.isEnabled()) {
+            if (editedBase64) {
+              const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", editedBase64, "png");
+              imageLocalUri = saved.localUri;
+            } else if (editedUri) {
+              const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", editedUri, "png");
+              imageLocalUri = saved.localUri;
+            }
+          }
+        } catch (e) {
+          console.warn("⚠️ Failed to save edited image locally:", e);
+        }
+
+        // Background upload to Firebase Storage if enabled
+        if (useMemory && effectiveUserId && (editedBase64 || editedUri)) {
+          setImmediate(async () => {
+            try {
+              const hybridMemoryService = getHybridMemoryService();
+              let firebaseImageUrl: string;
+
+              if (editedBase64) {
+                firebaseImageUrl = await firebaseStorageService.uploadImage(
+                  effectiveUserId,
+                  effectiveChatId || "default",
+                  editedBase64,
+                  prompt
+                );
+              } else if (editedUri) {
+                try {
+                  const resp = await fetch(editedUri);
+                  if (resp.ok) {
+                    const arrayBuf = await resp.arrayBuffer();
+                    const buffer = Buffer.from(arrayBuf);
+                    const b64 = buffer.toString('base64');
+                    firebaseImageUrl = await firebaseStorageService.uploadImage(
+                      effectiveUserId,
+                      effectiveChatId || "default",
+                      b64,
+                      prompt
+                    );
+                  } else {
+                    firebaseImageUrl = editedUri;
+                  }
+                } catch (err) {
+                  firebaseImageUrl = editedUri!;
+                }
+              } else {
+                return;
+              }
+
+              const conversationTurn = hybridMemoryService.storeConversationTurn(
+                effectiveUserId,
+                prompt,
+                altText || "Image edited",
+                effectiveChatId,
+                { url: firebaseImageUrl, prompt }
+              );
+              await firestoreChatService.saveTurn(conversationTurn);
+              console.log(`🖼️ [BACKGROUND] Stored edited image URL in conversation history`);
+            } catch (e) {
+              console.warn("[BACKGROUND] Failed to upload/store edited image:", e);
+            }
+          });
+        }
+
+        return res.json({
+          success: true,
+          isImageGeneration: true,
+          text: sanitizeImageText(altText || undefined) || "Edited image",
+          imageBase64: editedBase64,
+          imageUri: editedUri,
+          imageLocalUri,
+          raw: response,
+          metadata: {
+            tokens: (response as any)?.usage?.totalTokenCount || 0,
+            candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+            promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
+          },
+        });
+      } catch (e) {
+        console.error("❌ Image editing failed, falling back to vision Q&A:", e);
+        // Fall through to normal vision Q&A below
+      }
+    }
+
+  // Only run image generation when explicitly requested AND there is no uploaded/cached image context
+  const wantsGeneration = await shouldGenerateImage(prompt, normalizedType);
+  if (wantsGeneration && !imageContextData) {
       // 🔒 Apply image-specific rate limiting
       const { rateLimiter } = require("./services/securityMiddleware");
       if (!rateLimiter.checkRateLimit(effectiveUserId, "image")) {
@@ -845,6 +1413,9 @@ ${prompt}
         "more image",
         "one more",
         "again",
+        "image of",
+        "image",
+        "logo"
       ];
       const promptLower = prompt.toLowerCase().trim();
 
@@ -879,10 +1450,10 @@ ${prompt}
           } = require("./services/conversationService");
           const conversationService = getConversationService();
 
-          // Get last 5 conversation turns for context
+          // Get last 2 conversation turns for context (tighter context for images)
           const recentTurns = conversationService.getRecentConversations(
             effectiveUserId,
-            5
+            2
           );
 
           if (recentTurns.length > 0) {
@@ -914,7 +1485,7 @@ Create a detailed, visually compelling image that captures the essence and conte
               `💬 Using ${conversationHistory.length} messages from current chat session`
             );
             const contextSummary = conversationHistory
-              .slice(-5) // Last 5 messages
+              .slice(-2) // Last 2 messages
               .map(
                 (msg: any) =>
                   `${msg.role === "user" ? "User" : "AI"}: ${msg.content}`
@@ -1007,6 +1578,7 @@ Create a detailed, visually compelling image that captures the essence and conte
   const parts: any[] = (response as any)?.parts ?? [];
   let imageBase64: string | null = null;
   let imageUri: string | null = null;
+      let imageLocalUri: string | null = null;
       let altText: string | null = null;
 
       console.log(`📦 Received ${parts.length} parts from Gemini`);
@@ -1037,27 +1609,64 @@ Create a detailed, visually compelling image that captures the essence and conte
         );
       } else if (imageUri) {
         console.log(`✅ Image generated successfully - URI: ${imageUri}`);
-        // Attempt to download the URI to base64 immediately so the client can render it
-        try {
-          console.log("📥 Downloading image from URI to base64 for immediate display...");
-          const resp = await fetch(imageUri);
-          if (resp.ok) {
-            const arrayBuf = await resp.arrayBuffer();
-            const buffer = Buffer.from(arrayBuf);
-            imageBase64 = buffer.toString('base64');
-            console.log(`✅ Converted URI image to base64 (${imageBase64.length} chars)`);
-          } else {
-            console.warn(`⚠️ Failed to fetch image URI (status ${resp.status}) - will return URI only`);
+        // ⚡ Speed optimization: return URI immediately; optional inline base64 behind flag
+        if (process.env.INLINE_IMAGE_BASE64 === 'true') {
+          try {
+            console.log("📥 Downloading image from URI to base64 for immediate display (opt-in)...");
+            const resp = await fetch(imageUri);
+            if (resp.ok) {
+              const arrayBuf = await resp.arrayBuffer();
+              const buffer = Buffer.from(arrayBuf);
+              imageBase64 = buffer.toString('base64');
+              console.log(`✅ Converted URI image to base64 (${imageBase64.length} chars)`);
+            } else {
+              console.warn(`⚠️ Failed to fetch image URI (status ${resp.status}) - will return URI only`);
+            }
+          } catch (e) {
+            console.warn("⚠️ Could not convert image URI to base64 (opt-in)", e);
           }
-        } catch (e) {
-          console.warn("⚠️ Could not convert image URI to base64:", e);
         }
       } else {
-        console.error(`❌ No image data found in response!`);
+        console.error(`❌ No image data found in response! Attempting to extract from text...`);
+        const combinedText = parts.map((p: any) => p.text ?? '').join(' ');
+        const extractedUrl = extractImageUrlFromText(combinedText);
+        if (extractedUrl) {
+          imageUri = extractedUrl;
+          console.log(`🔗 Extracted image URL from text: ${imageUri}`);
+          // Try to convert to base64 for immediate display
+          try {
+            const resp = await fetch(extractedUrl);
+            if (resp.ok) {
+              const arrayBuf = await resp.arrayBuffer();
+              const buffer = Buffer.from(arrayBuf);
+              imageBase64 = buffer.toString('base64');
+              console.log(`✅ Converted extracted URL image to base64 (${imageBase64.length} chars)`);
+            } else {
+              console.warn(`⚠️ Failed to fetch extracted image URL (status ${resp.status}) - will return URL only`);
+            }
+          } catch (e) {
+            console.warn(`⚠️ Could not download extracted image URL:`, e);
+          }
+        }
+      }
+
+      // Save locally for instant load (if enabled)
+      try {
+        if (localImageCacheService.isEnabled()) {
+          if (imageBase64) {
+            const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", imageBase64, "png");
+            imageLocalUri = saved.localUri;
+          } else if (imageUri) {
+            const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", imageUri, "png");
+            imageLocalUri = saved.localUri;
+          }
+        }
+      } catch (e) {
+        console.warn("⚠️ Failed to save generated image locally:", e);
       }
 
       // Upload image to Firebase Storage and store URL
-      if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
+  if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
         setImmediate(async () => {
           try {
             const hybridMemoryService = getHybridMemoryService();
@@ -1127,8 +1736,11 @@ Create a detailed, visually compelling image that captures the essence and conte
 
       return res.json({
         success: true,
+        isImageGeneration: true,
+        text: sanitizeImageText(altText || undefined) || "Image generated",
         imageBase64,
         imageUri,
+        imageLocalUri,
         altText,
         raw: response,
         metadata: {
@@ -1145,7 +1757,27 @@ Create a detailed, visually compelling image that captures the essence and conte
 
     // Normal text response
     const startTime = Date.now();
-    const response = await generateContent({ model: textModel, contents: [enhancedPrompt] });
+    let response;
+    
+    // If we have image context, include the actual image in the request for visual analysis
+    if (imageContextData) {
+      console.log("🖼️ Including image data in vision model request for visual Q&A");
+      response = await generateContent({ 
+        model: textModel, 
+        contents: [
+          {
+            parts: [
+              { inlineData: { data: imageContextData.imageBase64, mimeType: "image/png" } },
+              { text: enhancedPrompt }
+            ]
+          }
+        ]
+      });
+    } else {
+      // Text-only request
+      response = await generateContent({ model: textModel, contents: [enhancedPrompt] });
+    }
+    
     const duration = (Date.now() - startTime) / 1000; // Convert to seconds
     const parts = (response as any)?.parts ?? [];
     const text = parts.map((p: any) => p.text ?? "").join("");
@@ -1408,11 +2040,15 @@ app.post(
         }
       }
 
-      // AI-based extraction step removed for scale; use local extractors for PDFs
+      // Try local extraction first for PDFs
       if (!extractedText && mimeType === "application/pdf") {
         try {
           const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          if (!cleanedBase64) {
+            throw new Error("Base64 data is empty after cleaning.");
+          }
           const buffer = Buffer.from(cleanedBase64, "base64");
+          console.log(`Attempting local PDF extraction, buffer size: ${buffer.length} bytes`);
           const local = await extractTextFromDocument(buffer, mimeType);
           if (local.text && local.text.trim()) {
             extractedText = local.text;
@@ -1423,58 +2059,84 @@ app.post(
         }
       }
 
-      // 🛟 Fallback: local extraction if AI result is empty
+      // 🛟 Fallback: AI-based extraction for PDFs when local fails
       if (!extractedText || !extractedText.trim()) {
         try {
           const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
-          const buffer = Buffer.from(cleanedBase64, "base64");
-          const local = await extractTextFromDocument(buffer, mimeType);
-          if (local.text && local.text.trim()) {
-            extractedText = local.text;
-            console.log(`✅ Fallback local extraction succeeded via ${local.method}`);
+          if (!cleanedBase64) {
+            return res.status(400).json({
+              error: "The provided document appears to be empty or invalid.",
+              code: "INVALID_DOCUMENT",
+            });
           }
-        } catch (fallbackErr) {
-          console.warn("Local extraction fallback failed:", fallbackErr);
+          console.log("Attempting AI-based extraction with Vertex/Gemini...");
+          
+          const result = await generateContent({
+            model: "gemini-2.5-flash", // GA model for document processing
+            contents: [
+              {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType,
+                      data: cleanedBase64,
+                    },
+                  },
+                  { text: prompt || "Extract all text from this document." }
+                ]
+              }
+            ]
+          });
+
+          const aiText = result.parts?.[0]?.text || "";
+          if (aiText && aiText.trim()) {
+            extractedText = aiText;
+            console.log(`✅ AI extraction succeeded, length: ${extractedText.length}`);
+          } else {
+             // If AI also returns nothing, the document is likely unreadable
+             console.warn("AI extraction returned no text. The document may be unreadable.");
+          }
+        } catch (aiErr) {
+          console.warn("AI extraction failed:", aiErr);
+          // Check for the specific "no pages" error
+          const errorMessage = (aiErr as Error).message || "";
+          if (errorMessage.includes("document has no pages") || errorMessage.includes("INVALID_ARGUMENT")) {
+            return res.status(400).json({
+              error: "The PDF document is invalid or has no pages.",
+              code: "INVALID_PDF",
+            });
+          }
         }
       }
 
       // Optionally store the processed document in memory
-      const { storeInMemory = false } = req.body;
+      const { storeInMemory = false, fileName = "Uploaded Document" } = req.body;
       if (storeInMemory && extractedText && userId) {
         try {
-          // Extract topics from document content using AI
-          const documentTopics = await extractDocumentTopics(extractedText);
-          console.log(
-            `📊 Extracted document topics: ${documentTopics.join(", ")}`
-          );
+          // Store the document and get its ID and summary
+          const { docId, summary } = storeDocument({
+            fullText: extractedText,
+            fileName,
+          });
 
-          const embeddingService = getEmbeddingService();
-          const documentMemory: MemoryItem = {
-            id: `document_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-            content: extractedText,
-            metadata: {
-              timestamp: Date.now(),
-              type: "document",
-              source: filePath || "uploaded-file",
-              userId,
-              tags: ["processed-document", mimeType, ...documentTopics],
-            },
-          };
+          // Return the document ID, summary, AND extracted text for backward compatibility
+          return res.json({
+            success: true,
+            message: "Document processed successfully.",
+            documentId: docId,
+            summary: summary,
+            extractedText: extractedText, // Frontend needs this
+            isDocument: true,
+          });
 
-          // Store asynchronously without blocking the response
-          embeddingService
-            .storeMemory(documentMemory)
-            .catch((err) =>
-              console.error("Failed to store document memory:", err)
-            );
-
-          console.log("Document content stored in memory for future reference");
-        } catch (memoryError) {
-          console.warn("Failed to store document in memory:", memoryError);
+        } catch (storageErr) {
+          console.error("Failed to store document:", storageErr);
+          return res.status(500).json({ error: "Failed to process and store document." });
         }
       }
 
-  return res.json({ success: true, extractedText });
+      // If not storing, just return the extracted text as before
+      return res.json({ success: true, extractedText });
     } catch (err: any) {
       console.error("process-document error:", err);
 
@@ -1506,15 +2168,169 @@ app.post(
 );
 
 /**
- * POST /api/edit-image
- * body: { imageBase64: string, editPrompt: string, model?: string, userId?: string }
+ * POST /api/process-image
+ * body: { imageBase64: string, fileName?: string, storeInMemory?: boolean, userId?: string, prompt?: string }
+ * OR multipart/form-data with 'image' field
+ * Process and analyze an uploaded image, optionally storing it for future Q&A
  */
-app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
+app.post(
+  "/api/process-image",
+  upload.single('image'), // Handle multipart/form-data
+  rateLimitMiddleware("general"),
+  async (req, res) => {
+    if (!vertex && !ai)
+      return res.status(500).json({ error: "AI client not initialized" });
+
+    try {
+      let imageBase64: string;
+      let fileName: string;
+      let storeInMemory: boolean;
+      let userId: string | undefined;
+      let prompt: string | undefined;
+
+      // Check if request is multipart/form-data (has file) or JSON
+      if (req.file) {
+        // Multipart/form-data upload
+        imageBase64 = req.file.buffer.toString('base64');
+        fileName = req.body.fileName || req.file.originalname || "Uploaded Image";
+        storeInMemory = req.body.storeInMemory === 'true' || req.body.storeInMemory === true;
+        userId = req.body.userId;
+        prompt = req.body.prompt;
+        console.log(`🖼️ Received multipart/form-data image upload: ${fileName} (${req.file.size} bytes)`);
+      } else {
+        // JSON request
+        ({ imageBase64, fileName, storeInMemory, userId, prompt } = req.body);
+        fileName = fileName || "Uploaded Image";
+        console.log(`🖼️ Received JSON image data`);
+      }
+
+      // 🔒 Validate inputs
+      if (!imageBase64 || typeof imageBase64 !== "string") {
+        return res.status(400).json({ error: "imageBase64 is required" });
+      }
+
+      const base64Validation = SecurityValidator.validateBase64Image(imageBase64);
+      if (!base64Validation.valid) {
+        logSecurityEvent("Image validation failed in process-image", { userId, error: base64Validation.error });
+        return res.status(400).json({ error: base64Validation.error || "Invalid image data (max 10MB)" });
+      }
+
+      if (userId) {
+        const userIdValidation = SecurityValidator.validateUserId(userId);
+        if (!userIdValidation.valid) {
+          logSecurityEvent("Invalid userId in process-image", { userId, error: userIdValidation.error });
+          return res.status(400).json({ error: userIdValidation.error });
+        }
+      }
+
+      if (prompt) {
+        const promptValidation = SecurityValidator.validatePrompt(prompt);
+        if (!promptValidation.valid) {
+          logSecurityEvent("Invalid prompt in process-image", { userId, error: promptValidation.error });
+          return res.status(400).json({ error: promptValidation.error });
+        }
+      }
+
+      console.log(`🖼️ Processing image: ${fileName || "Unnamed"}`);
+
+      // Use vision model to analyze the image
+      const visionModel = "gemini-2.5-flash";
+      const analysisPrompt = prompt || `Analyze this image in detail. Describe:
+1. What you see (objects, people, scenes, text)
+2. The style and composition
+3. Colors and visual elements
+4. Any notable details or context
+5. What this image might be used for
+
+Provide a comprehensive description that will help answer questions about this image later.`;
+
+      const response = await generateContent({
+        model: visionModel,
+        contents: [
+          {
+            parts: [
+              { inlineData: { data: imageBase64, mimeType: "image/png" } },
+              { text: analysisPrompt }
+            ]
+          }
+        ]
+      });
+
+      const parts: any[] = response?.parts ?? [];
+      const description = parts.map((p: any) => p.text ?? "").join("") || "Image processed";
+
+      console.log(`✅ Image analyzed - description length: ${description.length} chars`);
+
+      // Store in cache if requested
+      if (storeInMemory && userId) {
+        try {
+          const { storeImage } = require("./services/imageCacheService");
+          const { imageId } = storeImage({
+            fileName: fileName || "Uploaded Image",
+            imageBase64,
+            description,
+            mimeType: "image/png"
+          });
+
+          return res.json({
+            success: true,
+            message: "Image processed and stored successfully.",
+            imageId,
+            description,
+            isImage: true,
+          });
+        } catch (storageErr) {
+          console.error("Failed to store image:", storageErr);
+          return res.status(500).json({ error: "Failed to process and store image." });
+        }
+      }
+
+      // If not storing, just return the description
+      return res.json({ success: true, description });
+    } catch (err: any) {
+      console.error("process-image error:", err);
+      return res.status(500).json({ 
+        success: false, 
+        error: err?.message ?? String(err) 
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/edit-image
+ * body: { imageBase64?: string, imageId?: string, editPrompt: string, model?: string, userId?: string }
+ * OR multipart/form-data with 'image' field and editPrompt
+ * Edit an image using AI - provide either imageBase64, imageId from cache, or upload file directly
+ */
+app.post("/api/edit-image", upload.single('image'), rateLimitMiddleware("image"), async (req, res) => {
   if (!vertex && !ai)
     return res.status(500).json({ error: "AI client not initialized" });
 
   try {
-    const { imageBase64, editPrompt, model, userId } = req.body;
+    let imageBase64: string | undefined;
+    let editPrompt: string;
+    let model: string | undefined;
+    let userId: string | undefined;
+    let imageId: string | undefined;
+
+    // Check if request is multipart/form-data (has file) or JSON
+    if (req.file) {
+      // Multipart/form-data upload - image file provided directly
+      imageBase64 = req.file.buffer.toString('base64');
+      editPrompt = req.body.editPrompt;
+      model = req.body.model;
+      userId = req.body.userId;
+      console.log(`🎨 Received multipart image for editing: ${req.file.originalname} (${req.file.size} bytes)`);
+    } else {
+      // JSON request
+      const body = req.body;
+      imageBase64 = body.imageBase64;
+      imageId = body.imageId;
+      editPrompt = body.editPrompt;
+      model = body.model;
+      userId = body.userId;
+    }
 
     // 🔒 Validate inputs
     if (
@@ -1526,6 +2342,20 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
       return res.status(400).json({ error: "Invalid or missing editPrompt" });
     }
 
+    // Get image data - priority: uploaded file > imageBase64 > imageId from cache
+    if (!imageBase64 && imageId) {
+      // Retrieve from cache
+      const { getImage } = require("./services/imageCacheService");
+      const imageData = getImage(imageId);
+      
+      if (!imageData) {
+        return res.status(404).json({ error: `Image with ID "${imageId}" not found in cache` });
+      }
+      
+      imageBase64 = imageData.imageBase64;
+      console.log(`🖼️ Retrieved image from cache for editing: ${imageData.fileName}`);
+    }
+
     if (
       !imageBase64 ||
       typeof imageBase64 !== "string" ||
@@ -1534,13 +2364,15 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
       logSecurityEvent("Invalid image in edit-image", { userId });
       return res
         .status(400)
-        .json({ error: "Invalid or oversized imageBase64 (max 10MB)" });
+        .json({ error: "Invalid or oversized imageBase64 (max 10MB). Provide either imageBase64 or imageId." });
     }
 
     if (userId && !SecurityValidator.validateUserId(userId)) {
       logSecurityEvent("Invalid userId in edit-image", { userId });
       return res.status(400).json({ error: "Invalid user ID format" });
     }
+
+    console.log(`🎨 Editing image with prompt: "${editPrompt}"`);
 
     // NOTE: Gemini's image models (gemini-2.5-flash-image) only GENERATE new images, they don't edit existing ones
     // For "editing", we'll use the vision model to analyze the image and generate a new one based on the edit instruction
@@ -1550,9 +2382,13 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
     const descriptionResponse = await generateContent({
       model: visionModel,
       contents: [
-        "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.",
-        { inlineData: { data: imageBase64, mimeType: "image/png" } },
-      ],
+        {
+          parts: [
+            { inlineData: { data: imageBase64, mimeType: "image/png" } },
+            { text: "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood." }
+          ]
+        }
+      ]
     });
     const imageDescription = ((descriptionResponse as any)?.parts ?? [])
       .map((p: any) => p.text)
@@ -1581,10 +2417,27 @@ Generate a new image that matches the original description but with the requeste
       if ((part as any).text) altText = (part as any).text ?? altText;
     }
 
+    // Save locally for instant load
+    let imageLocalUri: string | null = null;
+    try {
+      if (localImageCacheService.isEnabled()) {
+        if (newImageBase64) {
+          const saved = await localImageCacheService.saveBase64(userId || 'anonymous', 'edit', newImageBase64, 'png');
+          imageLocalUri = saved.localUri;
+        } else if (imageUri) {
+          const saved = await localImageCacheService.saveFromUri(userId || 'anonymous', 'edit', imageUri, 'png');
+          imageLocalUri = saved.localUri;
+        }
+      }
+    } catch (e) {
+      console.warn('⚠️ Failed to save edited image locally:', e);
+    }
+
     return res.json({
       success: true,
       imageBase64: newImageBase64,
       imageUri,
+      imageLocalUri,
       altText,
       raw: response,
     });
@@ -1599,16 +2452,46 @@ Generate a new image that matches the original description but with the requeste
 /**
  * POST /api/edit-image-with-mask
  * body: { imageBase64: string, maskBase64: string, editPrompt: string, model?: string, userId?: string }
+ * OR multipart/form-data with 'image' and 'mask' fields
  */
 app.post(
   "/api/edit-image-with-mask",
+  upload.fields([{ name: 'image', maxCount: 1 }, { name: 'mask', maxCount: 1 }]),
   rateLimitMiddleware("image"),
   async (req, res) => {
     if (!vertex && !ai)
       return res.status(500).json({ error: "AI client not initialized" });
 
     try {
-      const { imageBase64, maskBase64, editPrompt, model, userId } = req.body;
+      let imageBase64: string;
+      let maskBase64: string;
+      let editPrompt: string;
+      let model: string | undefined;
+      let userId: string | undefined;
+
+      // Check if request is multipart/form-data (has files) or JSON
+      if (req.files && typeof req.files === 'object' && !Array.isArray(req.files)) {
+        const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+        
+        if (!files.image || !files.mask) {
+          return res.status(400).json({ error: "Both 'image' and 'mask' files are required" });
+        }
+        
+        imageBase64 = files.image[0].buffer.toString('base64');
+        maskBase64 = files.mask[0].buffer.toString('base64');
+        editPrompt = req.body.editPrompt;
+        model = req.body.model;
+        userId = req.body.userId;
+        console.log(`🎨 Received multipart image+mask for editing`);
+      } else {
+        // JSON request
+        const body = req.body;
+        imageBase64 = body.imageBase64;
+        maskBase64 = body.maskBase64;
+        editPrompt = body.editPrompt;
+        model = body.model;
+        userId = body.userId;
+      }
 
       // 🔒 Validate inputs
       if (
@@ -1701,10 +2584,27 @@ Generate a new version of the image with the edit applied ONLY to the masked are
         if ((part as any).text) altText = (part as any).text ?? altText;
       }
 
+      // Save locally for instant load
+      let imageLocalUri2: string | null = null;
+      try {
+        if (localImageCacheService.isEnabled()) {
+          if (newImageBase64) {
+            const saved = await localImageCacheService.saveBase64(userId || 'anonymous', 'edit-mask', newImageBase64, 'png');
+            imageLocalUri2 = saved.localUri;
+          } else if (imageUri) {
+            const saved = await localImageCacheService.saveFromUri(userId || 'anonymous', 'edit-mask', imageUri, 'png');
+            imageLocalUri2 = saved.localUri;
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ Failed to save edited(mask) image locally:', e);
+      }
+
       return res.json({
         success: true,
         imageBase64: newImageBase64,
         imageUri,
+        imageLocalUri: imageLocalUri2,
         altText,
         raw: response,
       });

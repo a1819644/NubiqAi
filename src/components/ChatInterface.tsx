@@ -15,6 +15,7 @@ import {
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
 import { imageStorageService } from "../services/imageStorageService";
+import { ImageWithFallback } from "./figma/ImageWithFallback";
 
 // Using a placeholder for image icon
 const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTIgMkgxNFYxNEgyVjJaIiBzdHJva2U9IiM2NjY2NjYiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIvPgo8cGF0aCBkPSJNMiAxMkw2IDhMOCAxMEwxMiA2TDE0IDhWMTJIMloiIGZpbGw9IiM2NjY2NjYiLz4KPC9zdmc+';
@@ -103,7 +104,9 @@ const analyzeImageIntent = (raw: string) => {
   const isImagineCommand = lower.startsWith('/imagine');
   const hasImageWord = /(image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)/.test(lower);
   const hasVerb = /(generate|create|draw|make|produce|design|render|show|give|send|need|want|would like)/.test(lower);
-  const wantsImage = isImagineCommand || (hasImageWord && hasVerb);
+  // NEW: Support noun-first prompts like "image of X", "picture of Y"
+  const nounFirstPattern = /^\s*(image|picture|photo|drawing|illustration|art|artwork|sketch|logo|icon)\s+of\b/.test(lower);
+  const wantsImage = isImagineCommand || nounFirstPattern || (hasImageWord && hasVerb);
 
   if (!wantsImage) {
     return { wantsImage: false, needsDetails: false, isImagineCommand };
@@ -114,7 +117,7 @@ const analyzeImageIntent = (raw: string) => {
   const tokens = lower.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
   const descriptiveTokens = tokens.filter((token) => !IMAGE_STOP_WORDS.has(token));
   const hasSubject = descriptiveTokens.length > 0;
-  const needsDetails = !isImagineCommand && (isGeneric || !hasSubject);
+  const needsDetails = !isImagineCommand && !nounFirstPattern && (isGeneric || !hasSubject);
 
   return { wantsImage: true, needsDetails, isImagineCommand };
 };
@@ -502,7 +505,7 @@ export function ChatInterface({
 
         if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
           // Store image in IndexedDB for persistence
-          const imageUrl = imgResp.imageUri || (imgResp.imageBase64 ? `data:image/png;base64,${imgResp.imageBase64}` : '');
+          const imageUrl = imgResp.imageLocalUri || imgResp.imageUri || (imgResp.imageBase64 ? `data:image/png;base64,${imgResp.imageBase64}` : '');
           // Use the SAME message ID for cache and chat message so preload can map them
           const messageId = `img-${Date.now()}`;
 
@@ -614,9 +617,11 @@ export function ChatInterface({
         });
 
         if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
-          const imageUrl = imgResp.imageBase64
-            ? `data:image/png;base64,${imgResp.imageBase64}`
-            : imgResp.imageUri!;
+          const imageUrl = imgResp.imageLocalUri
+            ? imgResp.imageLocalUri
+            : (imgResp.imageBase64
+              ? `data:image/png;base64,${imgResp.imageBase64}`
+              : imgResp.imageUri!);
 
           console.log('🖼️ Creating image URL:', imageUrl.substring(0, 100) + '...');
 
@@ -748,6 +753,8 @@ ${procResp.extractedText}`,
                 documentType: file.type,
                 documentSize: file.size,
                 isDocumentContext: true,
+                // documentId is optional; present only when backend returns it
+                ...(procResp && (procResp as any).documentId ? { documentId: (procResp as any).documentId } : {}),
               } as any,
             };
 
@@ -818,6 +825,18 @@ ${procResp.extractedText}`,
         console.log(`💡 Optimized context: Sending ${conversationHistory.length} recent messages + summary of ${olderMessages.length} older messages`);
       }
       
+      // Extract documentId from the most recent document in the conversation
+      const documentMessages = targetChatSnapshot.messages.filter(msg => 
+        msg.metadata?.isDocumentContext && (msg.metadata as any)?.documentId
+      );
+      const latestDocumentId = documentMessages.length > 0 
+        ? (documentMessages[documentMessages.length - 1].metadata as any)?.documentId 
+        : undefined;
+      
+      if (latestDocumentId) {
+        console.log(`📚 Including document context from documentId: ${latestDocumentId}`);
+      }
+      
       // Call the backend API with chat-scoped memory
       const response = await apiService.askAI({
         message: text,
@@ -828,7 +847,8 @@ ${procResp.extractedText}`,
         conversationSummary,                           // 🎯 Summary of older messages (if any)
         userId: user?.id,                              // 🎯 NEW! Pass actual user ID from auth
         userName: user?.name,                          // 🎯 NEW! Pass user name for auto-profile creation
-        useMemory: true
+        useMemory: true,
+        documentId: latestDocumentId                   // 🎯 NEW! For RAG document retrieval
       });
 
       // 🧠 MEMORY SYSTEM LOGGING
@@ -850,9 +870,11 @@ ${procResp.extractedText}`,
           console.log('🖼️ AI response includes generated image!');
           
           // Create image URL
-          const imageUrl = (response as any).imageBase64
-            ? `data:image/png;base64,${(response as any).imageBase64}`
-            : (response as any).imageUri!;
+          const imageUrl = (response as any).imageLocalUri
+            ? (response as any).imageLocalUri
+            : ((response as any).imageBase64
+              ? `data:image/png;base64,${(response as any).imageBase64}`
+              : (response as any).imageUri!);
           
           const messageId = (Date.now() + 1).toString();
           
@@ -1484,7 +1506,7 @@ ${procResp.extractedText}`,
                                     <div className="w-64 h-40 bg-gray-100 rounded-md animate-pulse flex items-center justify-center">
                                       <div className="text-sm text-muted-foreground">Generating image...</div>
                                     </div>
-                                  ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.includes('.firebasestorage.app')) ? (
+                                  ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.includes('.firebasestorage.app') || file.includes('/local-images/')) ? (
                                     <div className="flex flex-col gap-2">
                                       {status === 'error' ? (
                                         <div className="w-64 h-40 bg-gray-100 border border-dashed border-border rounded-md flex flex-col items-center justify-center gap-2 text-center p-4">
@@ -1494,7 +1516,7 @@ ${procResp.extractedText}`,
                                           </Button>
                                         </div>
                                       ) : (
-                                        <img
+                                        <ImageWithFallback
                                           src={buildImageSrc(file, attachmentId)}
                                           alt={`generated-${idx}`}
                                           className="max-w-xs rounded-md cursor-pointer hover:opacity-90 transition-opacity"

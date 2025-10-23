@@ -78,10 +78,11 @@ class FirebaseStorageService {
       // Create file reference
       const file = this.bucket.file(filePath);
 
-      // Upload with metadata
-      await file.save(imageBuffer, {
+      // Upload with metadata (force simple upload to avoid resumable ECONNRESET)
+      const saveOnce = async () => file.save(imageBuffer, {
         metadata: {
           contentType: 'image/png',
+          cacheControl: 'public, max-age=31536000, immutable',
           metadata: {
             userId: userId,
             chatId: chatId,
@@ -90,9 +91,29 @@ class FirebaseStorageService {
             uploadedAt: new Date().toISOString()
           }
         },
-        public: false, // Images are private by default
-        validation: 'md5' // Ensure data integrity
+        resumable: false,  // 🔧 Avoid resumable upload instability for small images
+        public: false,
+        validation: 'md5'
       });
+
+      // Minimal retry on transient network errors
+      let attempts = 0;
+      const maxAttempts = 3;
+      while (true) {
+        try {
+          attempts++;
+          await saveOnce();
+          break;
+        } catch (err: any) {
+          const msg = String(err?.message || err);
+          const code = (err?.code || '').toString();
+          const retriable = msg.includes('ECONNRESET') || msg.includes('Retry limit exceeded') || code === 'ECONNRESET';
+          if (!retriable || attempts >= maxAttempts) throw err;
+          const backoff = 300 * attempts; // 300ms, 600ms
+          console.warn(`⚠️ Upload transient error (${attempts}/${maxAttempts - 1}). Retrying in ${backoff}ms...`, msg);
+          await new Promise(r => setTimeout(r, backoff));
+        }
+      }
 
       // Make the file publicly accessible (signed URL with long expiration)
       // Alternative: Use signed URLs for private access
@@ -145,9 +166,11 @@ class FirebaseStorageService {
       const filePath = `users/${userId}/chats/${chatId}/images/${imageId}.png`;
       const file = this.bucket.file(filePath);
 
+      // Use simple upload here as well
       await file.save(imageBuffer, {
         metadata: {
           contentType: 'image/png',
+          cacheControl: 'public, max-age=31536000, immutable',
           metadata: {
             userId: userId,
             chatId: chatId,
@@ -156,6 +179,7 @@ class FirebaseStorageService {
             uploadedAt: new Date().toISOString()
           }
         },
+        resumable: false,
         public: false
       });
 
