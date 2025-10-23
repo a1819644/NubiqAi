@@ -1,9 +1,9 @@
-import * as admin from 'firebase-admin';
-import { ConversationTurn } from './conversationService';
+import * as admin from "firebase-admin";
+import { ConversationTurn } from "./conversationService";
 
 interface FirestoreChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: "user" | "assistant";
   content: string;
   timestamp: number;
   attachments?: string[];
@@ -34,31 +34,34 @@ class FirestoreChatService {
   constructor() {
     try {
       if (!admin.apps.length) {
-        const serviceAccount = require('../serviceAccountKey.json');
+        const serviceAccount = require("../serviceAccountKey.json");
         admin.initializeApp({
           credential: admin.credential.cert(serviceAccount),
           storageBucket: `${serviceAccount.project_id}.firebasestorage.app`,
         });
-        console.log('🔥 Firebase Admin initialized (FireStore Chat Service)');
+        console.log("🔥 Firebase Admin initialized (FireStore Chat Service)");
       }
       this.firestore = admin.firestore();
     } catch (error) {
-      console.error('❌ Failed to initialize Firestore:', error);
+      console.error("❌ Failed to initialize Firestore:", error);
       this.firestore = null;
     }
   }
 
   private getChatCollection(userId: string) {
     if (!this.firestore) {
-      throw new Error('Firestore is not initialized');
+      throw new Error("Firestore is not initialized");
     }
-    return this.firestore.collection('users').doc(userId).collection('activeChats');
+    return this.firestore
+      .collection("users")
+      .doc(userId)
+      .collection("activeChats");
   }
 
   async saveTurn(turn: ConversationTurn): Promise<void> {
     if (!turn.chatId) {
       // Some legacy flows might not send chatId; skip to avoid polluting Firestore.
-      console.warn('⚠️ FirestoreChatService.saveTurn skipped – missing chatId');
+      console.warn("⚠️ FirestoreChatService.saveTurn skipped – missing chatId");
       return;
     }
 
@@ -66,19 +69,21 @@ class FirestoreChatService {
       const chatRef = this.getChatCollection(turn.userId).doc(turn.chatId);
       await this.firestore!.runTransaction(async (tx) => {
         const snapshot = await tx.get(chatRef);
-        const existing = snapshot.exists ? (snapshot.data() as FirestoreChatDocument) : undefined;
+        const existing = snapshot.exists
+          ? (snapshot.data() as FirestoreChatDocument)
+          : undefined;
 
         const timestamp = turn.timestamp ?? Date.now();
         const userMessage: FirestoreChatMessage = {
           id: `${turn.id}-user`,
-          role: 'user',
+          role: "user",
           content: turn.userPrompt,
           timestamp,
         };
 
         const assistantMessage: FirestoreChatMessage = {
           id: `${turn.id}-assistant`,
-          role: 'assistant',
+          role: "assistant",
           content: turn.aiResponse,
           timestamp,
         };
@@ -98,8 +103,8 @@ class FirestoreChatService {
 
         const titleSource = existing?.title || turn.userPrompt;
         const title = titleSource
-          ? titleSource.substring(0, 80) + (titleSource.length > 80 ? '…' : '')
-          : 'New Chat';
+          ? titleSource.substring(0, 80) + (titleSource.length > 80 ? "…" : "")
+          : "New Chat";
 
         const doc: Partial<FirestoreChatDocument> = {
           chatId: turn.chatId,
@@ -118,14 +123,14 @@ class FirestoreChatService {
         tx.set(chatRef, doc, { merge: true });
       });
     } catch (error) {
-      console.error('❌ FirestoreChatService.saveTurn failed:', error);
+      console.error("❌ FirestoreChatService.saveTurn failed:", error);
     }
   }
 
   async listActiveChats(userId: string): Promise<any[]> {
     try {
       const snapshot = await this.getChatCollection(userId)
-        .orderBy('updatedAt', 'desc')
+        .orderBy("updatedAt", "desc")
         .limit(50)
         .get();
 
@@ -142,11 +147,11 @@ class FirestoreChatService {
 
         return {
           id: data.chatId || doc.id,
-          title: data.title || 'New Chat',
+          title: data.title || "New Chat",
           timestamp: new Date(data.updatedAt || Date.now()).toISOString(),
           userId,
           messages,
-          source: 'firestore',
+          source: "firestore",
           metadata: {
             pendingPersistence: data.pendingPersistence ?? false,
             messageCount: data.messageCount ?? messages.length,
@@ -155,7 +160,7 @@ class FirestoreChatService {
         };
       });
     } catch (error) {
-      console.error('❌ FirestoreChatService.listActiveChats failed:', error);
+      console.error("❌ FirestoreChatService.listActiveChats failed:", error);
       return [];
     }
   }
@@ -171,11 +176,15 @@ class FirestoreChatService {
         { merge: true }
       );
     } catch (error) {
-      console.error('❌ FirestoreChatService.markChatPersisted failed:', error);
+      console.error("❌ FirestoreChatService.markChatPersisted failed:", error);
     }
   }
 
-  async archiveChat(userId: string, chatId: string, archived: boolean): Promise<void> {
+  async archiveChat(
+    userId: string,
+    chatId: string,
+    archived: boolean
+  ): Promise<void> {
     try {
       const chatRef = this.getChatCollection(userId).doc(chatId);
       await chatRef.set(
@@ -185,7 +194,7 @@ class FirestoreChatService {
         { merge: true }
       );
     } catch (error) {
-      console.error('❌ FirestoreChatService.archiveChat failed:', error);
+      console.error("❌ FirestoreChatService.archiveChat failed:", error);
     }
   }
 
@@ -193,7 +202,7 @@ class FirestoreChatService {
     try {
       await this.getChatCollection(userId).doc(chatId).delete();
     } catch (error) {
-      console.error('❌ FirestoreChatService.deleteChat failed:', error);
+      console.error("❌ FirestoreChatService.deleteChat failed:", error);
     }
   }
 }

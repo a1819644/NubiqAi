@@ -79,17 +79,18 @@ function isAllowedOrigin(origin: string): boolean {
   try {
     const url = new URL(origin);
     const hostname = url.hostname;
-    
+
     // Allow localhost and 127.0.0.1
-    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+    if (hostname === "localhost" || hostname === "127.0.0.1") {
       return true;
     }
-    
+
     // Allow private IP ranges: 10.x.x.x, 192.168.x.x, 172.16-31.x.x
     if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
     if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
-    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
-    
+    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname))
+      return true;
+
     return false;
   } catch {
     return false;
@@ -197,7 +198,10 @@ try {
 
 // Unified generation helper using Vertex first, then Google as fallback
 type GenResult = { parts: any[]; raw: any; usage?: any };
-async function generateContent(args: { model: string; contents: any[] }): Promise<GenResult> {
+async function generateContent(args: {
+  model: string;
+  contents: any[];
+}): Promise<GenResult> {
   const { model, contents } = args;
   // Try Vertex first
   if (vertex) {
@@ -212,7 +216,11 @@ async function generateContent(args: { model: string; contents: any[] }): Promis
             parts: contents.map((t) => ({ text: String(t) })),
           },
         ];
-      } else if (contents[0] && typeof contents[0] === "object" && "parts" in contents[0]) {
+      } else if (
+        contents[0] &&
+        typeof contents[0] === "object" &&
+        "parts" in contents[0]
+      ) {
         vContents = [
           {
             role: "user",
@@ -223,17 +231,24 @@ async function generateContent(args: { model: string; contents: any[] }): Promis
         vContents = contents as any[];
       }
       const resp: any = await gm.generateContent({ contents: vContents });
-      const parts: any[] = resp?.response?.candidates?.[0]?.content?.parts ?? [];
+      const parts: any[] =
+        resp?.response?.candidates?.[0]?.content?.parts ?? [];
       const usage = resp?.response?.usageMetadata;
       return { parts, raw: resp, usage };
     } catch (err) {
-      console.warn("Vertex generateContent failed, will try Google fallback:", err);
+      console.warn(
+        "Vertex generateContent failed, will try Google fallback:",
+        err
+      );
     }
   }
 
   // Fallback: Google AI Studio client
   if (ai) {
-    const resp: any = await (ai as any).models.generateContent({ model, contents });
+    const resp: any = await (ai as any).models.generateContent({
+      model,
+      contents,
+    });
     const parts: any[] = resp?.candidates?.[0]?.content?.parts ?? [];
     const usage = resp?.usageMetadata;
     return { parts, raw: resp, usage };
@@ -293,14 +308,18 @@ app.post("/api/ask-ai", rateLimitMiddleware("general"), async (req, res) => {
     if (inFlightChatRequests.has(inFlightKey)) {
       return res.status(409).json({
         success: false,
-        error: "Another request is already processing for this chat. Please wait for it to finish.",
+        error:
+          "Another request is already processing for this chat. Please wait for it to finish.",
       });
     }
     // Set a TTL to avoid stale locks (e.g., 2 minutes)
-    const ttl = setTimeout(() => {
-      inFlightChatRequests.delete(inFlightKey);
-      console.warn(`⏱️ Cleared stale lock for ${inFlightKey}`);
-    }, 2 * 60 * 1000);
+    const ttl = setTimeout(
+      () => {
+        inFlightChatRequests.delete(inFlightKey);
+        console.warn(`⏱️ Cleared stale lock for ${inFlightKey}`);
+      },
+      2 * 60 * 1000
+    );
     inFlightChatRequests.set(inFlightKey, ttl);
 
     // �🔒 Validate prompt
@@ -753,9 +772,9 @@ ${prompt}
         .join("\n\n");
 
       // Add summary of older messages if provided
-      const summarySection = conversationSummary 
+      const summarySection = conversationSummary
         ? `\n\n📚 OLDER MESSAGES CONTEXT:\n${conversationSummary}\n${"=".repeat(60)}\n\n`
-        : '';
+        : "";
 
       enhancedPrompt = `${summarySection}RECENT CONVERSATION (LAST ${conversationHistory.length} MESSAGES):
 ${"=".repeat(60)}
@@ -764,10 +783,10 @@ ${"=".repeat(60)}
 
 ${enhancedPrompt}
 
-Remember: The conversation above is from the CURRENT chat session. ${conversationSummary ? 'Earlier messages are summarized above for context. ' : ''}Use it to maintain context and continuity in your responses.`;
+Remember: The conversation above is from the CURRENT chat session. ${conversationSummary ? "Earlier messages are summarized above for context. " : ""}Use it to maintain context and continuity in your responses.`;
 
       console.log(
-        `💬 Added ${conversationHistory.length} recent messages${conversationSummary ? ' + older message summary' : ''} from current conversation for context`
+        `💬 Added ${conversationHistory.length} recent messages${conversationSummary ? " + older message summary" : ""} from current conversation for context`
       );
     } else if (!enhancedPrompt.includes("SYSTEM:")) {
       // If no memory context and no conversation history, add base structured prompt
@@ -858,14 +877,33 @@ ${prompt}
         promptLower.includes(kw)
       );
       const hasSpecificDescriptor =
-        promptLower.includes(" of a ") ||
-        promptLower.includes(" with a ") ||
-        promptLower.includes(" that has ");
+        /\b(of|with|that has|showing|featuring|depicting)\b/i.test(promptLower);
+
+      // New logic: Check for descriptive nouns/adjectives beyond the keywords
+      const descriptiveWords = promptLower
+        .split(/\s+/)
+        .filter((word: string) => {
+          // Simple check: is it a common image keyword or a stop word?
+          const isKeyword = genericImageKeywords.some((kw) =>
+            kw.includes(word)
+          );
+          const isStopWord = [
+            "a",
+            "an",
+            "the",
+            "me",
+            "for",
+            "and",
+            "in",
+          ].includes(word);
+          return !isKeyword && !isStopWord;
+        });
 
       const isGenericRequest =
         (hasGenericKeyword || hasContinuationWord) &&
         prompt.length < 50 &&
-        !hasSpecificDescriptor;
+        !hasSpecificDescriptor &&
+        descriptiveWords.length < 2; // If there are 2 or more descriptive words, it's likely specific
 
       // If generic request and we have chat history, add conversation context
       if (isGenericRequest && effectiveUserId) {
@@ -1004,9 +1042,9 @@ Create a detailed, visually compelling image that captures the essence and conte
         }
       }
 
-  const parts: any[] = (response as any)?.parts ?? [];
-  let imageBase64: string | null = null;
-  let imageUri: string | null = null;
+      const parts: any[] = (response as any)?.parts ?? [];
+      let imageBase64: string | null = null;
+      let imageUri: string | null = null;
       let altText: string | null = null;
 
       console.log(`📦 Received ${parts.length} parts from Gemini`);
@@ -1039,15 +1077,21 @@ Create a detailed, visually compelling image that captures the essence and conte
         console.log(`✅ Image generated successfully - URI: ${imageUri}`);
         // Attempt to download the URI to base64 immediately so the client can render it
         try {
-          console.log("📥 Downloading image from URI to base64 for immediate display...");
+          console.log(
+            "📥 Downloading image from URI to base64 for immediate display..."
+          );
           const resp = await fetch(imageUri);
           if (resp.ok) {
             const arrayBuf = await resp.arrayBuffer();
             const buffer = Buffer.from(arrayBuf);
-            imageBase64 = buffer.toString('base64');
-            console.log(`✅ Converted URI image to base64 (${imageBase64.length} chars)`);
+            imageBase64 = buffer.toString("base64");
+            console.log(
+              `✅ Converted URI image to base64 (${imageBase64.length} chars)`
+            );
           } else {
-            console.warn(`⚠️ Failed to fetch image URI (status ${resp.status}) - will return URI only`);
+            console.warn(
+              `⚠️ Failed to fetch image URI (status ${resp.status}) - will return URI only`
+            );
           }
         } catch (e) {
           console.warn("⚠️ Could not convert image URI to base64:", e);
@@ -1074,13 +1118,15 @@ Create a detailed, visually compelling image that captures the essence and conte
               );
             } else if (imageUri) {
               // Fallback: try downloading the URI and uploading it
-              console.log("📤 Attempting to download URI and upload to Firebase Storage...");
+              console.log(
+                "📤 Attempting to download URI and upload to Firebase Storage..."
+              );
               try {
                 const resp = await fetch(imageUri);
                 if (resp.ok) {
                   const arrayBuf = await resp.arrayBuffer();
                   const buffer = Buffer.from(arrayBuf);
-                  const b64 = buffer.toString('base64');
+                  const b64 = buffer.toString("base64");
                   firebaseImageUrl = await firebaseStorageService.uploadImage(
                     effectiveUserId,
                     effectiveChatId || "default",
@@ -1088,11 +1134,16 @@ Create a detailed, visually compelling image that captures the essence and conte
                     prompt
                   );
                 } else {
-                  console.warn(`⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`);
+                  console.warn(
+                    `⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`
+                  );
                   firebaseImageUrl = imageUri;
                 }
               } catch (err) {
-                console.warn("⚠️ Error downloading URI for upload, storing URI as-is:", err);
+                console.warn(
+                  "⚠️ Error downloading URI for upload, storing URI as-is:",
+                  err
+                );
                 firebaseImageUrl = imageUri;
               }
             } else {
@@ -1133,7 +1184,8 @@ Create a detailed, visually compelling image that captures the essence and conte
         raw: response,
         metadata: {
           tokens: (response as any)?.usage?.totalTokenCount || 0,
-          candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+          candidatesTokenCount:
+            (response as any)?.usage?.candidatesTokenCount || 0,
           promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
         },
       });
@@ -1145,7 +1197,10 @@ Create a detailed, visually compelling image that captures the essence and conte
 
     // Normal text response
     const startTime = Date.now();
-    const response = await generateContent({ model: textModel, contents: [enhancedPrompt] });
+    const response = await generateContent({
+      model: textModel,
+      contents: [enhancedPrompt],
+    });
     const duration = (Date.now() - startTime) / 1000; // Convert to seconds
     const parts = (response as any)?.parts ?? [];
     const text = parts.map((p: any) => p.text ?? "").join("");
@@ -1157,13 +1212,14 @@ Create a detailed, visually compelling image that captures the essence and conte
     // ═══════════════════════════════════════════════════════════════════════
     // 🚀 CRITICAL: Send response to user FIRST (don't make them wait!)
     // ═══════════════════════════════════════════════════════════════════════
-    const jsonResponse = { 
-      success: true, 
-      text, 
+    const jsonResponse = {
+      success: true,
+      text,
       raw: response,
       metadata: {
         tokens: (response as any)?.usage?.totalTokenCount || 0,
-        candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+        candidatesTokenCount:
+          (response as any)?.usage?.candidatesTokenCount || 0,
         promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
         duration: parseFloat(duration.toFixed(2)),
       },
@@ -1249,9 +1305,7 @@ app.post(
   rateLimitMiddleware("general"),
   async (req, res) => {
     if (!vertex && !ai)
-      return res
-        .status(500)
-        .json({ error: "AI client not initialized" });
+      return res.status(500).json({ error: "AI client not initialized" });
 
     try {
       const {
@@ -1266,25 +1320,41 @@ app.post(
       if (prompt) {
         const promptValidation = SecurityValidator.validatePrompt(prompt);
         if (!promptValidation.valid) {
-          logSecurityEvent("Invalid document processing prompt", { userId, error: promptValidation.error });
-          return res.status(400).json({ error: promptValidation.error || "Invalid prompt format" });
+          logSecurityEvent("Invalid document processing prompt", {
+            userId,
+            error: promptValidation.error,
+          });
+          return res
+            .status(400)
+            .json({ error: promptValidation.error || "Invalid prompt format" });
         }
       }
 
       if (userId) {
         const userIdValidation = SecurityValidator.validateUserId(userId);
         if (!userIdValidation.valid) {
-          logSecurityEvent("Invalid userId in document processing", { userId, error: userIdValidation.error });
-          return res.status(400).json({ error: userIdValidation.error || "Invalid user ID format" });
+          logSecurityEvent("Invalid userId in document processing", {
+            userId,
+            error: userIdValidation.error,
+          });
+          return res.status(400).json({
+            error: userIdValidation.error || "Invalid user ID format",
+          });
         }
       }
 
       // Validate base64 document size if provided (10MB limit)
       if (fileBase64) {
-        const base64Validation = SecurityValidator.validateBase64Image(fileBase64);
+        const base64Validation =
+          SecurityValidator.validateBase64Image(fileBase64);
         if (!base64Validation.valid) {
-          logSecurityEvent("Document base64 validation failed", { userId, error: base64Validation.error });
-          return res.status(400).json({ error: base64Validation.error || "Document size exceeds 10MB limit" });
+          logSecurityEvent("Document base64 validation failed", {
+            userId,
+            error: base64Validation.error,
+          });
+          return res.status(400).json({
+            error: base64Validation.error || "Document size exceeds 10MB limit",
+          });
         }
       }
 
@@ -1320,9 +1390,11 @@ app.post(
         ".txt": "text/plain",
         ".md": "text/markdown",
         ".pdf": "application/pdf",
-        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".docx":
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".doc": "application/msword",
-        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsx":
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".csv": "text/csv",
         ".json": "application/json",
       };
@@ -1334,7 +1406,9 @@ app.post(
         const buffer = fs.readFileSync(filePath);
         base64Data = buffer.toString("base64");
         if (!clientMime) {
-          const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+          const ext = filePath
+            .substring(filePath.lastIndexOf("."))
+            .toLowerCase();
           mimeType = SUPPORTED_EXTENSIONS[ext] || "application/pdf";
         }
       } else {
@@ -1345,15 +1419,16 @@ app.post(
 
       // Check if file type is supported
       if (!SUPPORTED_MIME_TYPES.includes(mimeType)) {
-        const fileExtension = Object.keys(SUPPORTED_EXTENSIONS).find(
-          ext => SUPPORTED_EXTENSIONS[ext] === mimeType
-        ) || "this file type";
-        
+        const fileExtension =
+          Object.keys(SUPPORTED_EXTENSIONS).find(
+            (ext) => SUPPORTED_EXTENSIONS[ext] === mimeType
+          ) || "this file type";
+
         console.warn(`Unsupported file type attempted: ${mimeType}`);
-        return res.status(400).json({ 
-          success: false, 
+        return res.status(400).json({
+          success: false,
           error: `We don't have the capability to process ${fileExtension} files yet. Supported formats: PDF, DOCX, DOC, TXT, MD, CSV, JSON, XLSX`,
-          unsupportedType: mimeType
+          unsupportedType: mimeType,
         });
       }
 
@@ -1368,7 +1443,7 @@ app.post(
       }
 
       // Use Gemini for document processing
-  const DOC_MODEL = "gemini-2.5-flash";
+      const DOC_MODEL = "gemini-2.5-flash";
       const defaultPrompt =
         "Extract all text content from this document. Provide a clean, well-formatted extraction of the text.";
       const userPrompt =
@@ -1379,39 +1454,54 @@ app.post(
       let extractedText = "";
 
       // Fast-path 1: Plain text files can be returned directly
-      if (mimeType === "text/plain" || mimeType === "text/markdown" || mimeType === "application/json" || mimeType === "text/csv") {
+      if (
+        mimeType === "text/plain" ||
+        mimeType === "text/markdown" ||
+        mimeType === "application/json" ||
+        mimeType === "text/csv"
+      ) {
         try {
           // Clean base64 data - remove any whitespace/newlines that might cause decoding issues
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           const textContent = Buffer.from(cleanedBase64, "base64").toString(
             "utf8"
           );
           extractedText = textContent;
-          console.log(`✅ Direct text extraction successful (${mimeType}), length: ${extractedText.length}`);
+          console.log(
+            `✅ Direct text extraction successful (${mimeType}), length: ${extractedText.length}`
+          );
         } catch (decodeErr) {
-          console.warn("Failed to decode text base64, falling back to local extraction", decodeErr);
+          console.warn(
+            "Failed to decode text base64, falling back to local extraction",
+            decodeErr
+          );
         }
       }
 
       // Fast-path 2: Use local extraction for DOCX, DOC, XLSX (Gemini doesn't support these)
       if (!extractedText && LOCAL_EXTRACTION_TYPES.includes(mimeType)) {
         try {
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           const buffer = Buffer.from(cleanedBase64, "base64");
           const local = await extractTextFromDocument(buffer, mimeType);
           if (local.text && local.text.trim()) {
             extractedText = local.text;
-            console.log(`✅ Local extraction succeeded via ${local.method} for ${mimeType}`);
+            console.log(
+              `✅ Local extraction succeeded via ${local.method} for ${mimeType}`
+            );
           }
         } catch (localErr) {
-          console.warn(`Local extraction failed for ${mimeType}, will try Gemini:`, localErr);
+          console.warn(
+            `Local extraction failed for ${mimeType}, will try Gemini:`,
+            localErr
+          );
         }
       }
 
       // AI-based extraction step removed for scale; use local extractors for PDFs
       if (!extractedText && mimeType === "application/pdf") {
         try {
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           const buffer = Buffer.from(cleanedBase64, "base64");
           const local = await extractTextFromDocument(buffer, mimeType);
           if (local.text && local.text.trim()) {
@@ -1426,12 +1516,14 @@ app.post(
       // 🛟 Fallback: local extraction if AI result is empty
       if (!extractedText || !extractedText.trim()) {
         try {
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           const buffer = Buffer.from(cleanedBase64, "base64");
           const local = await extractTextFromDocument(buffer, mimeType);
           if (local.text && local.text.trim()) {
             extractedText = local.text;
-            console.log(`✅ Fallback local extraction succeeded via ${local.method}`);
+            console.log(
+              `✅ Fallback local extraction succeeded via ${local.method}`
+            );
           }
         } catch (fallbackErr) {
           console.warn("Local extraction fallback failed:", fallbackErr);
@@ -1474,7 +1566,7 @@ app.post(
         }
       }
 
-  return res.json({ success: true, extractedText });
+      return res.json({ success: true, extractedText });
     } catch (err: any) {
       console.error("process-document error:", err);
 
@@ -1554,10 +1646,11 @@ app.post("/api/edit-image", rateLimitMiddleware("image"), async (req, res) => {
         { inlineData: { data: imageBase64, mimeType: "image/png" } },
       ],
     });
-    const imageDescription = ((descriptionResponse as any)?.parts ?? [])
-      .map((p: any) => p.text)
-      .filter(Boolean)
-      .join(" ") || "an image";
+    const imageDescription =
+      ((descriptionResponse as any)?.parts ?? [])
+        .map((p: any) => p.text)
+        .filter(Boolean)
+        .join(" ") || "an image";
 
     // Step 2: Generate a new image based on the description + edit instruction
     const imageModel = model ?? "gemini-2.5-flash-image"; // image generation model
@@ -1567,7 +1660,10 @@ Apply this edit: ${editPrompt}
 
 Generate a new image that matches the original description but with the requested edits applied.`;
 
-    const response = await generateContent({ model: imageModel, contents: [combinedPrompt] });
+    const response = await generateContent({
+      model: imageModel,
+      contents: [combinedPrompt],
+    });
     const parts: any[] = (response as any)?.parts ?? [];
     let newImageBase64: string | null = null;
     let imageUri: string | null = null;
@@ -1659,10 +1755,11 @@ app.post(
           { inlineData: { data: imageBase64, mimeType: "image/png" } },
         ],
       });
-      const imageDescription = ((descriptionResponse as any)?.parts ?? [])
-        .map((p: any) => p.text)
-        .filter(Boolean)
-        .join(" ") || "an image";
+      const imageDescription =
+        ((descriptionResponse as any)?.parts ?? [])
+          .map((p: any) => p.text)
+          .filter(Boolean)
+          .join(" ") || "an image";
 
       // Step 2: Analyze the mask to understand what areas to edit
       const maskResponse = await generateContent({
@@ -1672,13 +1769,14 @@ app.post(
           { inlineData: { data: maskBase64, mimeType: "image/png" } },
         ],
       });
-      const maskDescription = ((maskResponse as any)?.parts ?? [])
-        .map((p: any) => p.text)
-        .filter(Boolean)
-        .join(" ") || "marked areas";
+      const maskDescription =
+        ((maskResponse as any)?.parts ?? [])
+          .map((p: any) => p.text)
+          .filter(Boolean)
+          .join(" ") || "marked areas";
 
       // Step 3: Generate new image with edits applied to masked areas
-    const imageModel = model ?? "gemini-2.5-flash-image";
+      const imageModel = model ?? "gemini-2.5-flash-image";
       const combinedPrompt = `Original image: ${imageDescription}
 
 Masked areas to edit: ${maskDescription}
@@ -1687,8 +1785,11 @@ Edit instruction for the masked areas ONLY: ${editPrompt}
 
 Generate a new version of the image with the edit applied ONLY to the masked areas. Keep everything else the same as the original.`;
 
-  const response = await generateContent({ model: imageModel, contents: [combinedPrompt] });
-  const parts: any[] = (response as any)?.parts ?? [];
+      const response = await generateContent({
+        model: imageModel,
+        contents: [combinedPrompt],
+      });
+      const parts: any[] = (response as any)?.parts ?? [];
       let newImageBase64: string | null = null;
       let imageUri: string | null = null;
       let altText: string | null = null;
@@ -2175,31 +2276,25 @@ app.post(
 
       // Validate text fields length
       if (name && (typeof name !== "string" || name.length > 200)) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "Name must be a string (max 200 chars)",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "Name must be a string (max 200 chars)",
+        });
       }
       if (role && (typeof role !== "string" || role.length > 200)) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "Role must be a string (max 200 chars)",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "Role must be a string (max 200 chars)",
+        });
       }
       if (
         background &&
         (typeof background !== "string" || background.length > 5000)
       ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "Background must be a string (max 5000 chars)",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "Background must be a string (max 5000 chars)",
+        });
       }
 
       const profileData: any = {};
@@ -2342,7 +2437,7 @@ app.post("/api/end-chat", rateLimitMiddleware("general"), async (req, res) => {
 
     // Enqueue background persistence job with retry/backoff
     const queue = getJobQueue();
-    queue.enqueue('persist-chat', { userId, chatId, force: !!force });
+    queue.enqueue("persist-chat", { userId, chatId, force: !!force });
 
     // Respond immediately (don't make user wait for Pinecone upload)
     return res.json({
@@ -2402,12 +2497,10 @@ app.post(
             userId,
             chatId,
           });
-          return res
-            .status(400)
-            .json({
-              success: false,
-              error: `Invalid chatId format: ${chatId}`,
-            });
+          return res.status(400).json({
+            success: false,
+            error: `Invalid chatId format: ${chatId}`,
+          });
         }
       }
 
@@ -2420,7 +2513,7 @@ app.post(
       let enqueued = 0;
       for (const chatId of chatIds) {
         try {
-          queue.enqueue('persist-chat', { userId, chatId, force: true });
+          queue.enqueue("persist-chat", { userId, chatId, force: true });
           enqueued += 1;
         } catch (error) {
           console.error(`❌ Failed to enqueue save for chat ${chatId}:`, error);
@@ -2497,19 +2590,19 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
         const storedChats = await pineconeStorage.getUserChats(userId, 200);
 
         // Convert to API response format
-          const pineconeChats = storedChats.map((chat: any) => ({
+        const pineconeChats = storedChats.map((chat: any) => ({
           id: chat.chatId,
           title: chat.title,
           timestamp: new Date(chat.createdAt).toISOString(),
           userId: userId,
           messages: chat.messages.map((msg: any) => ({
-              id: msg.id,
+            id: msg.id,
             role: msg.role,
             content: msg.content,
-              timestamp: new Date(msg.timestamp).toISOString(),
-              attachments:
-                msg.hasImage && msg.imageUrl ? [msg.imageUrl] : undefined,
-              imagePrompt: msg.imagePrompt,
+            timestamp: new Date(msg.timestamp).toISOString(),
+            attachments:
+              msg.hasImage && msg.imageUrl ? [msg.imageUrl] : undefined,
+            imagePrompt: msg.imagePrompt,
           })),
           source: "pinecone", // Mark source
         }));
@@ -2560,40 +2653,63 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
 // Register job handlers (once at module load time)
 (() => {
   const queue = getJobQueue();
-  queue.register('persist-chat', async ({ userId, chatId, force }: { userId: string; chatId: string; force: boolean }) => {
-    console.log(`💾 [QUEUE] Persisting chat ${chatId} (force=${force})...`);
-    const hybridMemoryService = getHybridMemoryService();
-    if (force) {
-      await hybridMemoryService.forceUpload(userId, chatId);
-    } else {
-      await hybridMemoryService.persistChatSession(userId, chatId);
+  queue.register(
+    "persist-chat",
+    async ({
+      userId,
+      chatId,
+      force,
+    }: {
+      userId: string;
+      chatId: string;
+      force: boolean;
+    }) => {
+      console.log(`💾 [QUEUE] Persisting chat ${chatId} (force=${force})...`);
+      const hybridMemoryService = getHybridMemoryService();
+      if (force) {
+        await hybridMemoryService.forceUpload(userId, chatId);
+      } else {
+        await hybridMemoryService.persistChatSession(userId, chatId);
+      }
+      await firestoreChatService.markChatPersisted(userId, chatId);
+      console.log(`✅ [QUEUE] Chat ${chatId} persisted`);
     }
-    await firestoreChatService.markChatPersisted(userId, chatId);
-    console.log(`✅ [QUEUE] Chat ${chatId} persisted`);
-  });
+  );
 })();
 
 // Queue stats endpoint for debugging
-app.get('/api/queue-stats', rateLimitMiddleware('general'), (req, res) => {
+app.get("/api/queue-stats", rateLimitMiddleware("general"), (req, res) => {
   try {
     const stats = getJobQueue().getStats();
     return res.json({ success: true, stats });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || String(err) });
   }
 });
 
 // Dead-letter inspection endpoint (debug only)
-app.get('/api/queue-dead-letter', rateLimitMiddleware('general'), (req, res) => {
-  try {
-    const limitParam = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : undefined;
-    const limit = Number.isFinite(limitParam) && limitParam! > 0 ? limitParam! : 20;
-    const dead = getJobQueue().getDeadLetter(limit);
-    return res.json({ success: true, dead });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || String(err) });
+app.get(
+  "/api/queue-dead-letter",
+  rateLimitMiddleware("general"),
+  (req, res) => {
+    try {
+      const limitParam =
+        typeof req.query.limit === "string"
+          ? parseInt(req.query.limit, 10)
+          : undefined;
+      const limit =
+        Number.isFinite(limitParam) && limitParam! > 0 ? limitParam! : 20;
+      const dead = getJobQueue().getDeadLetter(limit);
+      return res.json({ success: true, dead });
+    } catch (err: any) {
+      return res
+        .status(500)
+        .json({ success: false, error: err?.message || String(err) });
+    }
   }
-});
+);
 
 app.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);

@@ -74,7 +74,12 @@ export function useAuth() {
       // Store in localStorage
       localStorage.setItem('auth_user', JSON.stringify(user));
       
-      return user;
+      // Return the full result so App.tsx can check for isNewUser
+      return {
+        user: user,
+        isNewUser: result.additionalUserInfo?.isNewUser ?? false,
+        _firebaseResult: result, // For debugging if needed
+      };
     } catch (error: any) {
       console.error('Google sign-in error:', error);
       const errorMessage = error.code === 'auth/popup-closed-by-user' 

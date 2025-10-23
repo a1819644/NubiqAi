@@ -11,6 +11,8 @@ import {
   DialogTitle,
   DialogDescription,
   DialogClose,
+  DialogHeader,
+  DialogFooter,
 } from "./ui/dialog";
 import { copyToClipboard, isClipboardAvailable } from "../utils/clipboard";
 import { ConfirmationDialog } from "./ConfirmationDialog";
@@ -519,6 +521,11 @@ export function ChatInterface({
         });
 
         if (imgResp.success && (imgResp.imageBase64 || imgResp.imageUri)) {
+          // 🖼️ Create a displayable URL (prefer base64 for instant view)
+          const displayUrl = imgResp.imageBase64
+            ? `data:image/png;base64,${imgResp.imageBase64}`
+            : imgResp.imageUri!;
+
           // Store image in IndexedDB for persistence
           const imageUrl = imgResp.imageUri || (imgResp.imageBase64 ? `data:image/png;base64,${imgResp.imageBase64}` : '');
           // Use the SAME message ID for cache and chat message so preload can map them
@@ -544,7 +551,9 @@ export function ChatInterface({
             content: imgResp.altText || text,
             role: 'assistant',
             timestamp: new Date(),
-            attachments: [imageUrl],
+            // ✅ CRITICAL FIX: Store BOTH the display URL and the permanent Firebase URL.
+            // The base64 (displayUrl) will be stripped on save, but the Firebase URL will remain.
+            attachments: [displayUrl, imgResp.imageUri].filter(Boolean) as string[],
             metadata: imgResp.metadata ? {
               tokens: imgResp.metadata.tokens,
               duration: imgResp.metadata.duration,
@@ -638,13 +647,12 @@ export function ChatInterface({
           const imageUrl = imgResp.imageBase64
             ? `data:image/png;base64,${imgResp.imageBase64}`
             : imgResp.imageUri!;
-
-          console.log('🖼️ Creating image URL:', imageUrl.substring(0, 100) + '...');
-
+          
           // 💾 Store image in IndexedDB for instant loading on page reload
           const messageId = (Date.now() + 2).toString();
           try {
             if (user?.id && imageUrl) {
+              // 💾 Store in IndexedDB with both display URL (base64) and permanent Firebase URL
               await imageStorageService.storeImage(
                 messageId,
                 user.id,
@@ -664,7 +672,9 @@ export function ChatInterface({
             content: imgResp.altText || `Image generated for: ${prompt}`,
             role: 'assistant',
             timestamp: new Date(),
-            attachments: [imageUrl],
+            // ✅ CRITICAL FIX: Store BOTH the display URL and the permanent Firebase URL.
+            // The base64 (imageUrl) will be stripped on save, but the Firebase URL will remain.
+            attachments: [imageUrl, imgResp.imageUri].filter(Boolean) as string[],
             metadata: imgResp.metadata ? {
               tokens: imgResp.metadata.tokens,
               duration: imgResp.metadata.duration,
@@ -996,6 +1006,8 @@ ${procResp.extractedText}`,
   const [brushSize, setBrushSize] = useState(24);
   const [maskDirty, setMaskDirty] = useState(false);
   const [showMaskPreview, setShowMaskPreview] = useState(true);
+  const maskFadeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [lastPoint, setLastPoint] = useState<{ x: number; y: number } | null>(null);
 
   const openImageViewer = (src: string, alt?: string) => {
     setViewerSrc(src);
@@ -1008,25 +1020,35 @@ ${procResp.extractedText}`,
     if (!viewerSrc || !maskCanvasRef.current) return;
     const img = new Image();
     img.onload = () => {
-      const canvas = maskCanvasRef.current!;
-      // use intrinsic image pixels for canvas internal resolution
-      const naturalW = img.naturalWidth || img.width || 1;
-      const naturalH = img.naturalHeight || img.height || 1;
-      canvas.width = naturalW;
-      canvas.height = naturalH;
+      const canvas = maskCanvasRef.current;
+      const imgEl = maskImgRef.current;
+      if (!canvas || !imgEl) return;
 
-      // ensure the canvas CSS size matches the displayed image size so overlay aligns
-      const displayedW = maskImgRef.current?.clientWidth ?? naturalW;
-      const displayedH = maskImgRef.current?.clientHeight ?? naturalH;
-      canvas.style.width = `${displayedW}px`;
-      canvas.style.height = `${displayedH}px`;
+      // --- PIXEL-PERFECT ALIGNMENT LOGIC ---
+      const dpr = window.devicePixelRatio || 1;
+      const rect = imgEl.getBoundingClientRect();
 
-      const ctx = canvas.getContext('2d')!;
+      // Set canvas internal resolution to match the image's natural size, scaled by DPR for sharpness
+      canvas.width = img.naturalWidth * dpr;
+      canvas.height = img.naturalHeight * dpr;
+
+      // Set canvas display size to match the image's rendered size on screen
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      // Scale the drawing context to match the DPR
+      ctx.scale(dpr, dpr);
+
+      // Clear and initialize
       ctx.clearRect(0,0,canvas.width, canvas.height);
       // initialize transparent background
       ctx.fillStyle = 'rgba(0,0,0,0)';
       ctx.fillRect(0,0,canvas.width, canvas.height);
       setMaskDirty(false);
+      if (maskFadeTimeoutRef.current) clearTimeout(maskFadeTimeoutRef.current);
     };
     img.src = viewerSrc;
   }, [viewerSrc]);
@@ -1036,11 +1058,20 @@ ${procResp.extractedText}`,
     const sync = () => {
       const canvas = maskCanvasRef.current;
       const img = maskImgRef.current;
-      if (!canvas || !img) return;
-      const w = img.clientWidth || canvas.width;
-      const h = img.clientHeight || canvas.height;
-      canvas.style.width = `${w}px`;
-      canvas.style.height = `${h}px`;
+      if (!canvas || !img || !img.complete || img.naturalWidth === 0) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      const rect = img.getBoundingClientRect();
+
+      // Update internal resolution
+      canvas.width = img.naturalWidth * dpr;
+      canvas.height = img.naturalHeight * dpr;
+
+      // Update display size
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+
+      canvas.getContext('2d')?.scale(dpr, dpr);
     };
 
     // initial sync
@@ -1189,7 +1220,7 @@ ${procResp.extractedText}`,
     const placeholderId = `edit-${Date.now()}`;
     const placeholderMsg: Message = {
       id: placeholderId,
-      content: `Editing image... ${editPrompt}`,
+      content: editPrompt, // Store only the prompt, not the status text
       role: 'assistant',
       timestamp: new Date(),
       attachments: ['__editing_image__']
@@ -1225,12 +1256,13 @@ ${procResp.extractedText}`,
 
           const filtered = activeChat.messages.filter(m => !(m.attachments && m.attachments.includes('__editing_image__')));
           const newMsg: Message = {
-            id: (Date.now() + 1).toString(),
-            content: editResp.altText || `Edited image: ${editPrompt}`,
-            role: 'assistant',
-            timestamp: new Date(),
-            attachments: [newUrl]
-          };
+                  id: (Date.now() + 1).toString(),
+                  content: editPrompt, // SELALU gunakan prompt asli pengguna
+                  role: 'assistant',
+                  timestamp: new Date(),
+                  attachments: [newUrl],
+                  metadata: { altText: editResp.altText } 
+                };
           onUpdateChat({ ...activeChat, messages: [...filtered, newMsg] });
         }
 
@@ -1428,21 +1460,21 @@ ${procResp.extractedText}`,
                   to begin your AI-powered journey.
                 </p>
               </div>
-              <div className="space-y-2">
+              <div data-tour-id="welcome-quick-actions" className="space-y-2 rounded-lg">
                 <div className="flex gap-2">
-                  <button className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
+                  <button data-tour-id="welcome-chat-with-ai" className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
                     💬 Chat with AI
                   </button>
-                  <button onClick={() => fileInputRef.current?.click()} className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
+                  <button data-tour-id="welcome-upload-files" onClick={() => fileInputRef.current?.click()} className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
                     📁 Upload Files
                   </button>
                 </div>
                 <div className="flex gap-2">
-                  <button onClick={startRecording} className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
+                  <button data-tour-id="welcome-voice-recording" onClick={startRecording} className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
                     🎤 Voice Recording
                   </button>
-                  <button className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
-                    📝 Add Notes
+                  <button data-tour-id="welcome-create-image" onClick={handleImageClick} className="flex-1 h-10 px-3 bg-muted hover:bg-accent border border-border rounded-md flex items-center justify-center gap-2 text-xs font-medium text-muted-foreground transition-colors">
+                    🎨 Create Image
                   </button>
                 </div>
               </div>
@@ -1452,7 +1484,9 @@ ${procResp.extractedText}`,
           <div className="p-6 space-y-6 max-w-4xl mx-auto">
             {chat.messages
               .filter(message => message.role !== 'system') // Hide system messages (document context)
-              .map((message, messageIndex) => (
+              .map((message, messageIndex) => {
+                const attachmentId = getAttachmentId(message.id, message.timestamp, messageIndex);
+                return (
               <div 
                 key={message.id ?? `${message.timestamp.getTime()}-${message.role}-${messageIndex}`}
                 className={`group flex ${
@@ -1505,25 +1539,42 @@ ${procResp.extractedText}`,
                           }`}
                         >
                           {/* Attachment handling */}
-                          {/* For image messages, the prompt is inside the card, so we don't show it here */}
-                          {!(message.attachments && message.attachments.some(f => typeof f === 'string' && f.startsWith('data:image'))) && (
-                              <p className="whitespace-pre-wrap text-sm">
-                                {message.content}
-                              </p>
+                          {!(message.attachments && message.attachments.some(f => {
+                            if (typeof f !== 'string') return false;
+                            
+                            // JANGAN render konten di sini jika itu adalah placeholder edit (yang merender kontennya sendiri)
+                            if (f === '__editing_image__') return true; 
+                            
+                            // JANGAN render konten di sini jika itu adalah kartu gambar final (yang merender kontennya sendiri)
+                            return (
+                              f.startsWith('data:image') || 
+                              f.startsWith('https://firebasestorage.googleapis.com') || 
+                              f.startsWith('https://storage.googleapis.com') || 
+                              f.includes('.firebasestorage.app') || 
+                              f.includes('/o/')
+                            );
+                          })) && (
+                            <p className="whitespace-pre-wrap text-sm">
+                              {message.content}
+                            </p>
                           )}
                           {message.attachments && message.attachments.length > 0 && editingMessageId !== message.id && (
                             <div className="mt-2 space-y-1">
-                              {message.attachments.map((file, idx) => {
-                                const attachmentId = getAttachmentId(message.id, message.timestamp, idx);
-                                const status = imageStatus[attachmentId] ?? 'loading';
-                                return (
-                                  <React.Fragment key={`${message.id}:${idx}:${typeof file === 'string' ? file.slice(0, 24) : 'file'}`}>
-                                  {typeof file === 'string' && (file === '__generating_image__' || file === '__editing_image__') ? (
-                                    <div className="w-64 h-40 bg-gray-100 rounded-md animate-pulse flex items-center justify-center">
-                                      <div className="text-sm text-muted-foreground">
-                                        {file === '__editing_image__' 
-                                          ? 'Editing image...' 
-                                          : 'Generating image...'}
+                              {message.attachments.map((file, idx) => (
+                                <React.Fragment key={idx}>
+                                  {typeof file === 'string' && (file === '__generating_image__') ? (
+                                    <div className="w-64 h-40 bg-muted rounded-lg animate-pulse flex items-center justify-center">
+                                      <p className="text-sm text-muted-foreground">Generating image...</p>
+                                    </div>
+                                  ) : typeof file === 'string' && file === '__editing_image__' ? (
+                                    <div className="bg-muted/50 rounded-xl border border-border/20 shadow-sm overflow-hidden w-full max-w-md">
+                                      <div className="bg-muted p-2">
+                                        <div className="w-full aspect-video bg-muted-foreground/10 rounded-lg animate-pulse flex items-center justify-center">
+                                          <p className="text-sm text-muted-foreground">Editing image...</p>
+                                        </div>
+                                      </div>
+                                      <div className="p-4 pt-2">
+                                        <p className="text-sm text-muted-foreground line-clamp-2">{message.content}</p>
                                       </div>
                                     </div>
                                   ) : typeof file === 'string' && (file.startsWith('data:image') || file.startsWith('https://firebasestorage.googleapis.com') || file.startsWith('https://storage.googleapis.com') || file.includes('.firebasestorage.app') || file.includes('/o/')) ? (
@@ -1550,6 +1601,9 @@ ${procResp.extractedText}`,
                                           <Button size="sm" variant="outline" className="h-8" onClick={() => openImageViewer(file, message.content)}>
                                             <Eye className="mr-1.5 h-4 w-4" /> Open
                                           </Button>
+                                          <Button size="sm" variant="outline" className="h-8" onClick={() => openImageViewer(file, message.content)}>
+                                            <Pencil className="mr-1.5 h-4 w-4" /> Edit
+                                          </Button>
                                           <Button size="sm" variant="outline" className="h-8" onClick={() => downloadImage(file)}>
                                             <Download className="mr-1.5 h-4 w-4" /> Download
                                           </Button>
@@ -1560,8 +1614,7 @@ ${procResp.extractedText}`,
                                     <div className="text-xs opacity-80">📎 {file}</div>
                                   )}
                                 </React.Fragment>
-                                );
-                              })}
+                              ))}
                             </div>
                           )}
                           {/* Document content preview */}
@@ -1600,7 +1653,7 @@ ${procResp.extractedText}`,
                           )}
                           {/* Action Buttons */}
                           {(message.content && message.content.trim()) && (
-                            <div>
+                            <div className="flex items-center">
                               <Button
                                 size="icon"
                                 variant="ghost"
@@ -1613,8 +1666,8 @@ ${procResp.extractedText}`,
                                 ) : (
                                   <Copy className="h-4 w-4" />
                                 )}
-                              </Button>
-                            </div>
+                              </Button></div>
+                            
                           )}
                           {/* Edit Button for user messages */}
                           {message.role === 'user' && !editingMessageId && (
@@ -1629,12 +1682,12 @@ ${procResp.extractedText}`,
                                 <Pencil className="h-4 w-4" />
                               </Button>
                             </div>
-                          )}
-                      </div>
+                          )}                      </div>
                     </div>
                 )}
               </div>
-            ))}
+                );
+            })}
             {isLoading && (
               <div className="flex justify-start">
                 <div className="flex flex-col">
@@ -1678,7 +1731,7 @@ ${procResp.extractedText}`,
           }}
           className="flex gap-3 max-w-4xl mx-auto"
         >
-          <div className="flex-1 relative">
+          <div data-tour-id="prompt-input-area" className="flex-1 relative">
             <Textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -1699,6 +1752,7 @@ ${procResp.extractedText}`,
                 size="sm"
                 variant="ghost"
                 className="h-8 w-8 p-0 text-muted-foreground hover:bg-accent"
+                data-tour-id="attach-file-button"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isLoading}
               >
@@ -1711,6 +1765,7 @@ ${procResp.extractedText}`,
                 className={`h-8 w-8 p-0 hover:bg-gray-100 flex-shrink-0 ${ 
                   isImageModeActive ? 'bg-blue-100 hover:bg-blue-200' : ''
                 }`}
+                data-tour-id="image-icon-button"
                 onClick={handleImageClick}
                 disabled={isLoading}
                 title="Toggle Image Generation Mode"
@@ -1743,6 +1798,7 @@ ${procResp.extractedText}`,
           </div>
           {isLoading ? (
             <Button
+              data-tour-id="stop-button"
               type="button"
               onClick={handleStopGeneration}
               className="h-11 w-11 p-0 bg-destructive hover:bg-destructive/90 rounded-lg"
@@ -1751,7 +1807,7 @@ ${procResp.extractedText}`,
               <Square className="h-4 w-4 text-white" />
             </Button>
           ) : (
-            <Button type="submit" disabled={isLoading || (!input.trim() && attachedFiles.length === 0)} className="h-11 w-11 p-0 bg-black hover:bg-gray-800 rounded-lg">
+            <Button data-tour-id="send-button" type="submit" disabled={isLoading || (!input.trim() && attachedFiles.length === 0)} className="h-11 w-11 p-0 bg-black hover:bg-gray-800 rounded-lg">
               <Send className="h-4 w-4 text-white" />
             </Button>
           )}
@@ -1768,100 +1824,147 @@ ${procResp.extractedText}`,
       </div>
       {/* Image viewer modal */}
       <Dialog open={viewerOpen} onOpenChange={(open) => setViewerOpen(open)}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogTitle>Image Preview</DialogTitle>
-          <DialogDescription>{viewerAlt}</DialogDescription>
-          <div className="mt-4">
+        <DialogContent className="sm:max-w-2xl max-h-[95vh] flex flex-col p-0">
+          <DialogHeader>
+            <DialogTitle className="text-lg font-medium p-6 pb-2">Image Preview</DialogTitle>
+            <DialogDescription className="px-6 text-sm text-muted-foreground/80">{viewerAlt}</DialogDescription>
+          </DialogHeader>
+          <div className="flex-1 overflow-y-auto px-6 grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
             {viewerSrc ? (
-              <div className="relative">
-                <img ref={maskImgRef} src={viewerSrc} alt={viewerAlt || 'preview'} className="w-full h-auto rounded-md block" />
+              <div 
+                className="relative bg-muted/50 rounded-lg flex justify-center items-center overflow-hidden border shadow-inner touch-none"
+                style={{ cursor: 'crosshair' }}
+                onPointerDown={(e) => {
+                  const canvas = maskCanvasRef.current;
+                  if (!canvas || !e.isPrimary) return;
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); // Tetap gunakan currentTarget
+                  
+                  const rect = canvas.getBoundingClientRect();
+                  const scaleX = canvas.width / rect.width;
+                  const scaleY = canvas.height / rect.height;
+                  const x = (e.clientX - rect.left) * scaleX;
+                  const y = (e.clientY - rect.top) * scaleY;
+                  const dpr = window.devicePixelRatio || 1;
+                  const naturalBrushSize = brushSize * (scaleX / dpr); // Ukuran kuas dalam piksel natural
+
+                  const ctx = canvas.getContext('2d')!;
+                  ctx.globalCompositeOperation = 'source-over';
+                  ctx.strokeStyle = 'rgba(255,0,0,0.5)';
+                  ctx.fillStyle = 'rgba(255,0,0,0.5)'; // Juga atur fillStyle untuk titik awal
+                  ctx.lineWidth = naturalBrushSize; // Atur ketebalan garis
+                  ctx.lineCap = 'round'; // Ujung garis bulat
+                  ctx.lineJoin = 'round'; // Sambungan garis bulat
+
+                  const currentX = x / dpr;
+                  const currentY = y / dpr;
+
+                  // Mulai path baru dan gambar titik awal
+                  ctx.beginPath();
+                  ctx.arc(currentX, currentY, naturalBrushSize / 2, 0, Math.PI * 2);
+                  ctx.fill(); // Isi lingkaran titik awal
+
+                  // Mulai path garis (meskipun belum ada garis)
+                  ctx.beginPath();
+                  ctx.moveTo(currentX, currentY); // Pindahkan "pena" ke posisi saat ini
+
+                  setLastPoint({ x: currentX, y: currentY }); // Simpan titik saat ini
+                  setMaskDirty(true);
+                  if (maskFadeTimeoutRef.current) clearTimeout(maskFadeTimeoutRef.current);
+                  canvas.style.opacity = '0.9';
+                  setIsDrawingMask(true);
+                }}
+                onPointerMove={(e) => {
+                  if (!isDrawingMask || !e.isPrimary || !lastPoint) return; // Hanya jika sedang menggambar & ada titik terakhir
+                  const canvas = maskCanvasRef.current;
+                  if (!canvas) return;
+                  e.preventDefault();
+
+                  const rect = canvas.getBoundingClientRect();
+                  const scaleX = canvas.width / rect.width;
+                  const scaleY = canvas.height / rect.height;
+                  const x = (e.clientX - rect.left) * scaleX;
+                  const y = (e.clientY - rect.top) * scaleY;
+                  const dpr = window.devicePixelRatio || 1;
+
+                  const currentX = x / dpr;
+                  const currentY = y / dpr;
+
+                  const ctx = canvas.getContext('2d')!;
+                  // Tidak perlu set style lagi karena sudah di onPointerDown
+
+                  // Lanjutkan path dari titik terakhir
+                  ctx.lineTo(currentX, currentY); // Gambar garis ke posisi baru
+                  ctx.stroke(); // Terapkan goresan garis
+                  
+                  // Update titik terakhir untuk goresan berikutnya
+                  setLastPoint({ x: currentX, y: currentY });
+                }}
+                onPointerUp={(e) => {
+                  if (!e.isPrimary) return;
+                  setIsDrawingMask(false);
+                  setLastPoint(null); // <-- Reset titik terakhir
+                  (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); // Tetap gunakan currentTarget
+                  if (maskFadeTimeoutRef.current) clearTimeout(maskFadeTimeoutRef.current);
+                  maskFadeTimeoutRef.current = setTimeout(() => {
+                    if (maskCanvasRef.current) {
+                      maskCanvasRef.current.style.opacity = '0';
+                    }
+                  }, 1500);
+                }}
+              >
+                <img ref={maskImgRef} src={viewerSrc} alt={viewerAlt || 'preview'} className="max-w-full h-auto w-full object-contain rounded-md" />
                 <canvas
                   ref={(el) => (maskCanvasRef.current = el)}
-                  className="absolute top-0 left-0 rounded-md pointer-events-auto"
-                  style={{ top: 0, left: 0, zIndex: 20, cursor: 'crosshair' as any, opacity: showMaskPreview ? 0.9 : 0 }}
-                  onPointerDown={(e) => {
-                    const canvas = maskCanvasRef.current;
-                    const imgEl = maskImgRef.current;
-                    if (!canvas || !imgEl) return;
-                    const rect = imgEl.getBoundingClientRect();
-                    const ctx = canvas.getContext('2d')!;
-                    const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-                    const y = (e.clientY - rect.top) * (canvas.height / rect.height);
-                    ctx.globalCompositeOperation = 'source-over';
-                    // draw visible semi-transparent red for user feedback
-                    ctx.fillStyle = 'rgba(255,0,0,0.5)';
-                    ctx.beginPath();
-                    ctx.arc(x, y, brushSize/2, 0, Math.PI * 2);
-                    ctx.fill();
-                    setMaskDirty(true);
-                    // ensure pointer capture on the canvas element
-                    try { canvas.setPointerCapture(e.pointerId); } catch {}
-                    setIsDrawingMask(true);
-                  }}
-                  onPointerMove={(e) => {
-                    const canvas = maskCanvasRef.current;
-                    const imgEl = maskImgRef.current;
-                    if (!canvas || !imgEl || !isDrawingMask) return;
-                    const rect = imgEl.getBoundingClientRect();
-                    const ctx = canvas.getContext('2d')!;
-                    const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-                    const y = (e.clientY - rect.top) * (canvas.height / rect.height);
-                    ctx.beginPath();
-                    ctx.arc(x, y, brushSize/2, 0, Math.PI * 2);
-                    ctx.fill();
-                  }}
-                  onPointerUp={(e) => {
-                    setIsDrawingMask(false);
-                    try { maskCanvasRef.current?.releasePointerCapture?.(e.pointerId); } catch {}
-                  }}
+                  className="absolute top-0 left-0 rounded-md pointer-events-none transition-opacity duration-300"
+                  style={{ top: 0, left: 0, zIndex: 20, opacity: showMaskPreview ? 0.9 : 0 }}
                 />
               </div>
             ) : (
               <div>No image</div>
             )}
-          </div>
-          <div className="mt-2 flex items-center gap-2">
-            <label className="text-sm">Brush</label>
-            <input type="range" min={4} max={64} value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} />
-            <Button size="sm" variant="outline" onClick={() => {
-              if (maskCanvasRef.current) {
-                const ctx = maskCanvasRef.current.getContext('2d')!;
-                ctx.clearRect(0,0,maskCanvasRef.current.width, maskCanvasRef.current.height);
-                setMaskDirty(false);
-              }
-            }}>Clear Mask</Button>
-            <Button size="sm" variant="ghost" onClick={() => setShowMaskPreview(s => !s)}>{showMaskPreview ? 'Hide' : 'Show'} Mask</Button>
-          </div>
-          <div className="mt-4">
-            <div className="mb-2">
-              <label className="text-sm font-medium">Edit prompt</label>
-              <input
-                value={editPrompt}
-                onChange={(e) => setEditPrompt(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && editPrompt && !isEditing) {
-                    e.preventDefault();
-                    performImageEdit(true);
+            {/* Controls Column */}
+            <div className="space-y-8 pt-2">
+              <div className="space-y-3">
+                <label className="text-sm font-medium">Edit Prompt</label>
+                <Textarea
+                  value={editPrompt}
+                  onChange={(e) => setEditPrompt(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey && editPrompt && !isEditing) {
+                      e.preventDefault();
+                      performImageEdit(true);
+                    }
+                  }}
+                  placeholder="e.g., 'make the background a sunset'"
+                  className="w-full min-h-[80px] text-sm placeholder:text-muted-foreground/60"
+                  rows={3}
+                />
+              </div>
+              <div className="space-y-3">
+                <label className="text-sm font-medium">Brush Size</label>
+                <div className="flex items-center gap-4">
+                  <input type="range" min={4} max={64} value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} className="flex-1" />
+                  <span className="text-sm font-mono w-8 text-center">{brushSize}px</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button size="sm" variant="outline" onClick={() => {
+                  if (maskCanvasRef.current) {
+                    const ctx = maskCanvasRef.current.getContext('2d')!;
+                    ctx.clearRect(0,0,maskCanvasRef.current.width, maskCanvasRef.current.height);
+                    setMaskDirty(false);
                   }
-                }}
-                placeholder="Describe the edit (e.g. change background to sunset)"
-                className="w-full mt-1 p-2 border rounded-md"
-              />
-            </div>
-            <div className="mb-2">
-              <label className="text-sm font-medium">Optional mask (PNG)</label>
-              <input type="file" accept="image/png" onChange={(e) => handleMaskSelect(e.target.files?.[0] ?? null)} className="mt-1" />
-            </div>
-            <div className="mt-4 flex justify-end gap-2">
-              <Button onClick={() => performImageEdit(true)} disabled={!editPrompt || isEditing}>
-                {isEditing ? 'Editing...' : 'Edit'}
-              </Button>
-              <Button onClick={() => downloadImage(viewerSrc)}>Download</Button>
-              <DialogClose asChild>
-                <Button variant="ghost">Close</Button>
-              </DialogClose>
+                }}>Clear Mask</Button>
+                <Button size="sm" variant="ghost" onClick={() => setShowMaskPreview(s => !s)}>{showMaskPreview ? 'Hide' : 'Show'} Mask</Button>
+              </div>
             </div>
           </div>
+          <DialogFooter className="p-6 mt-6 bg-muted/50 border-t flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2">
+            <Button onClick={() => performImageEdit(true)} disabled={!editPrompt || isEditing}>
+              {isEditing ? 'Editing...' : 'Edit'}
+            </Button>
+            <Button onClick={() => downloadImage(viewerSrc)}>Download</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

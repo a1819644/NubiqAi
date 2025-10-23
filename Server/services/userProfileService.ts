@@ -1,16 +1,16 @@
 /**
  * User Profile Service
- * 
+ *
  * This service manages persistent user profiles that exist across all chat sessions.
  * It extracts and stores user information like name, role, interests, preferences, etc.
- * 
+ *
  * Two-Tier Memory Strategy:
  * - Tier 1: User Profile (cross-chat, permanent) ← THIS SERVICE
  * - Tier 2: Chat Context (chat-specific, temporary) ← hybridMemoryService
  */
 
-import { GoogleGenAI } from '@google/genai';
-import dotenv from 'dotenv';
+import { GoogleGenAI } from "@google/genai";
+import dotenv from "dotenv";
 
 dotenv.config();
 
@@ -65,12 +65,17 @@ async function extractProfileFromConversation(
 ): Promise<ProfileExtractionResult> {
   try {
     if (!genAI) {
-      console.log('[USER PROFILE] Gemini API not configured, skipping profile extraction');
-      return { extracted: false, error: 'Gemini API not configured' };
+      console.log(
+        "[USER PROFILE] Gemini API not configured, skipping profile extraction"
+      );
+      return { extracted: false, error: "Gemini API not configured" };
     }
 
     console.log(`[USER PROFILE] Extracting profile info for user: ${userId}`);
-    console.log(`[USER PROFILE] Conversation text (${conversationText.length} chars):`, conversationText.substring(0, 200) + '...');
+    console.log(
+      `[USER PROFILE] Conversation text (${conversationText.length} chars):`,
+      conversationText.substring(0, 200) + "..."
+    );
 
     const prompt = `
 You are a profile extraction assistant. Analyze the conversation below and extract ANY personal information about the USER.
@@ -104,23 +109,27 @@ IMPORTANT: Return ONLY the JSON object, no markdown, no explanations.
 `;
 
     const response = await genAI.models.generateContent({
-      model: 'gemini-2.5-pro',  // Use better model for more accurate extraction
-      contents: [prompt]
+      model: "gemini-2.5-pro", // Use better model for more accurate extraction
+      contents: [prompt],
     });
 
-    const resultText = response?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-    
+    const resultText =
+      response?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
     if (!resultText) {
-      console.log('[USER PROFILE] No response from AI');
+      console.log("[USER PROFILE] No response from AI");
       return { extracted: false };
     }
-    
-    console.log(`[USER PROFILE] AI extraction response:`, resultText.substring(0, 200));
-`   `
+
+    console.log(
+      `[USER PROFILE] AI extraction response:`,
+      resultText.substring(0, 200)
+    );
+    `   `;
     // Parse the JSON response
     const cleanedResponse = resultText
-      .replace(/```json/g, '')
-      .replace(/```/g, '')
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
       .trim();
 
     const extracted = JSON.parse(cleanedResponse);
@@ -129,10 +138,13 @@ IMPORTANT: Return ONLY the JSON object, no markdown, no explanations.
     const profile: Partial<UserProfile> = {};
     if (extracted.name) profile.name = extracted.name;
     if (extracted.role) profile.role = extracted.role;
-    if (extracted.interests && extracted.interests.length > 0) profile.interests = extracted.interests;
-    if (extracted.preferences && extracted.preferences.length > 0) profile.preferences = extracted.preferences;
+    if (extracted.interests && extracted.interests.length > 0)
+      profile.interests = extracted.interests;
+    if (extracted.preferences && extracted.preferences.length > 0)
+      profile.preferences = extracted.preferences;
     if (extracted.background) profile.background = extracted.background;
-    if (extracted.conversationStyle) profile.conversationStyle = extracted.conversationStyle;
+    if (extracted.conversationStyle)
+      profile.conversationStyle = extracted.conversationStyle;
 
     const hasAnyInfo = Object.keys(profile).length > 0;
 
@@ -144,14 +156,13 @@ IMPORTANT: Return ONLY the JSON object, no markdown, no explanations.
 
     return {
       extracted: hasAnyInfo,
-      profile: hasAnyInfo ? profile : undefined
+      profile: hasAnyInfo ? profile : undefined,
     };
-
   } catch (error) {
-    console.error('[USER PROFILE] Error extracting profile:', error);
+    console.error("[USER PROFILE] Error extracting profile:", error);
     return {
       extracted: false,
-      error: error instanceof Error ? error.message : 'Unknown error'
+      error: error instanceof Error ? error.message : "Unknown error",
     };
   }
 }
@@ -170,7 +181,10 @@ export function getUserProfile(userId: string): UserProfile | null {
 /**
  * Create or update user profile
  */
-export function upsertUserProfile(userId: string, profileData: Partial<UserProfile>): UserProfile {
+export function upsertUserProfile(
+  userId: string,
+  profileData: Partial<UserProfile>
+): UserProfile {
   const existing = userProfiles.get(userId);
 
   if (existing) {
@@ -180,13 +194,25 @@ export function upsertUserProfile(userId: string, profileData: Partial<UserProfi
       ...profileData,
       lastUpdated: new Date(),
       conversationCount: existing.conversationCount + 1,
-      // Merge arrays instead of replacing
-      interests: profileData.interests 
-        ? [...new Set([...(existing.interests || []), ...profileData.interests])]
-        : existing.interests,
-      preferences: profileData.preferences
-        ? [...new Set([...(existing.preferences || []), ...profileData.preferences])]
-        : existing.preferences,
+      // Merge arrays safely, handling null/undefined from profileData
+      interests:
+        profileData.interests && Array.isArray(profileData.interests)
+          ? [
+              ...new Set([
+                ...(existing.interests || []),
+                ...profileData.interests,
+              ]),
+            ]
+          : existing.interests || [],
+      preferences:
+        profileData.preferences && Array.isArray(profileData.preferences)
+          ? [
+              ...new Set([
+                ...(existing.preferences || []),
+                ...profileData.preferences,
+              ]),
+            ]
+          : existing.preferences || [],
     };
 
     userProfiles.set(userId, updated);
@@ -199,11 +225,14 @@ export function upsertUserProfile(userId: string, profileData: Partial<UserProfi
       extractedAt: new Date(),
       lastUpdated: new Date(),
       conversationCount: 1,
-      ...profileData
+      ...profileData,
     };
 
     userProfiles.set(userId, newProfile);
-    console.log(`[USER PROFILE] ✓ Created new profile for ${userId}:`, newProfile);
+    console.log(
+      `[USER PROFILE] ✓ Created new profile for ${userId}:`,
+      newProfile
+    );
     return newProfile;
   }
 }
@@ -241,18 +270,24 @@ export async function updateProfileFromConversation(
   try {
     // Convert messages to text
     const conversationText = conversationMessages
-      .map(msg => `${msg.role.toUpperCase()}: ${msg.content}`)
-      .join('\n\n');
+      .map((msg) => `${msg.role.toUpperCase()}: ${msg.content}`)
+      .join("\n\n");
 
     // Extract profile info
-    const result = await extractProfileFromConversation(userId, conversationText);
+    const result = await extractProfileFromConversation(
+      userId,
+      conversationText
+    );
 
     if (result.extracted && result.profile) {
       // Update the profile
       upsertUserProfile(userId, result.profile);
     }
   } catch (error) {
-    console.error('[USER PROFILE] Error updating profile from conversation:', error);
+    console.error(
+      "[USER PROFILE] Error updating profile from conversation:",
+      error
+    );
   }
 }
 
@@ -267,7 +302,7 @@ export function generateProfileContext(userId: string): string {
   const profile = getUserProfile(userId);
 
   if (!profile) {
-    return '';
+    return "";
   }
 
   const parts: string[] = [];
@@ -281,11 +316,11 @@ export function generateProfileContext(userId: string): string {
   }
 
   if (profile.interests && profile.interests.length > 0) {
-    parts.push(`Their interests include: ${profile.interests.join(', ')}.`);
+    parts.push(`Their interests include: ${profile.interests.join(", ")}.`);
   }
 
   if (profile.preferences && profile.preferences.length > 0) {
-    parts.push(`Preferences: ${profile.preferences.join(', ')}.`);
+    parts.push(`Preferences: ${profile.preferences.join(", ")}.`);
   }
 
   if (profile.background) {
@@ -297,10 +332,10 @@ export function generateProfileContext(userId: string): string {
   }
 
   if (parts.length === 0) {
-    return '';
+    return "";
   }
 
-  return `\n--- USER PROFILE ---\n${parts.join(' ')}\n--- END PROFILE ---\n`;
+  return `\n--- USER PROFILE ---\n${parts.join(" ")}\n--- END PROFILE ---\n`;
 }
 
 // ============================================================================

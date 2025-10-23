@@ -6,6 +6,7 @@ import { History } from "./components/History";
 import { ChatInterface } from "./components/ChatInterface";
 import { apiService } from "./services/api";
 import { imageStorageService } from "./services/imageStorageService";
+import { OnboardingTutorial } from "./components/OnboardingTutorial";
 import { imageRehydrationService } from "./services/imageRehydrationService";
 // import { History } from "./components/History";
 // import { Workspace } from "./components/Workspace";
@@ -20,6 +21,7 @@ export default function App() {
   const { isDarkMode, toggleDarkMode } = useDarkMode();
   const { user, signInWithGoogle, signOut, isLoading } = useAuth();
   const [isAuthDialogOpen, setAuthDialogOpen] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
 
   const [activeSection, setActiveSection] = useState<NavigationSection>("home");
 
@@ -93,12 +95,17 @@ export default function App() {
           messages: chat.messages.map(msg => ({
             ...msg,
             attachments: msg.attachments?.map(att => {
+              // If attachment is an object with a URL, keep it
+              if (typeof att === 'object' && att !== null && (att as any).url) {
+                return att;
+              }
               // Keep Firebase URLs for rehydration
               if (typeof att === 'string' && (att.startsWith('https://firebasestorage.googleapis.com/') || att.includes('.firebasestorage.app'))) {
                 return att; // Keep Firebase URLs
               }
               // Remove base64 images to save space (will be loaded from IndexedDB)
               if (typeof att === 'string' && att.startsWith('data:image')) {
+                // IMPORTANT: This is where base64 is stripped. The rehydration logic must handle this.
                 return undefined; // Remove base64, will be rehydrated from IndexedDB
               }
               return att;
@@ -172,21 +179,31 @@ export default function App() {
               });
             }
             // 🖼️ Rehydrate images from Firebase URLs + IndexedDB cache
-            const rehydratedChats = await imageRehydrationService.rehydrateChats(restoredChats, user.id);
+            const rehydratedChats =
+              await imageRehydrationService.rehydrateChats(
+                restoredChats,
+                user.id
+              );
             setChats(rehydratedChats);
-            console.log(`✅ PHASE 1: Loaded ${rehydratedChats.length} chat(s) from localStorage with image rehydration (sorted newest first)`);
+            console.log(
+              `✅ PHASE 1: Loaded ${rehydratedChats.length} chat(s) from localStorage with image rehydration (sorted newest first)`
+            );
           }
         } catch (error) {
-          console.error('Failed to parse saved chats:', error);
+          console.error("Failed to parse saved chats:", error);
         }
       }
       
       // 🔥 PHASE 2: Load from server's local memory (fast - no DB delay)
       try {
-        console.log('⚡ PHASE 2: Loading from server memory (instant)...');
-        const response = await apiService.getChats(user.id, 'local');
+        console.log("⚡ PHASE 2: Loading from server memory (instant)...");
+        const response = await apiService.getChats(user.id, "local");
         
-        if (response?.data && Array.isArray(response.data) && response.data.length > 0) {
+        if (
+          response?.data &&
+          Array.isArray(response.data) &&
+          response.data.length > 0
+        ) {
           // Convert dates from server response
           const serverChats = response.data.map((chat: any) => ({
             ...chat,
@@ -196,8 +213,9 @@ export default function App() {
               .map((msg: any) => ({
                 ...msg,
                 timestamp: new Date(msg.timestamp)
-              }))
-              .sort((a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime()) // Sort messages chronologically (oldest first)
+              })).sort(
+                (a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime()
+              ), // Sort messages chronologically (oldest first)
           }));
           
           // Ensure every message has a stable unique id
@@ -211,11 +229,16 @@ export default function App() {
             });
           }
           // 🖼️ Rehydrate images from Firebase URLs back into IndexedDB
-          const rehydratedChats = await imageRehydrationService.rehydrateChats(serverChats, user.id);
+          const rehydratedChats =
+            await imageRehydrationService.rehydrateChats(serverChats, user.id);
           // Sort newest first
-          rehydratedChats.sort((a: any, b: any) => b.createdAt.getTime() - a.createdAt.getTime());
+          rehydratedChats.sort(
+            (a: any, b: any) => b.createdAt.getTime() - a.createdAt.getTime()
+          );
           setChats(rehydratedChats);
-          console.log(`✅ PHASE 2: Loaded ${rehydratedChats.length} chat(s) from server memory with image rehydration (sorted newest first)`);
+          console.log(
+            `✅ PHASE 2: Loaded ${rehydratedChats.length} chat(s) from server memory with image rehydration (sorted newest first)`
+          );
           
           // Update localStorage with server data
           try {
@@ -223,26 +246,40 @@ export default function App() {
               ...chat,
               messages: chat.messages.map((msg: any) => ({
                 ...msg,
-                attachments: msg.attachments?.map((att: any) => {
-                  // Keep Firebase URLs for rehydration
-                  if (typeof att === 'string' && (att.startsWith('https://firebasestorage.googleapis.com/') || att.includes('.firebasestorage.app'))) {
+                attachments: msg.attachments
+                  ?.map((att: any) => {
+                    // Keep Firebase URLs for rehydration
+                    if (
+                      typeof att === "string" &&
+                      (att.startsWith(
+                        "https://firebasestorage.googleapis.com/"
+                      ) ||
+                        att.includes(".firebasestorage.app"))
+                    ) {
+                      return att;
+                    }
+                    // Remove base64 images to save space
+                    if (
+                      typeof att === "string" &&
+                      att.startsWith("data:image")
+                    ) {
+                      return undefined;
+                    }
                     return att;
-                  }
-                  // Remove base64 images to save space
-                  if (typeof att === 'string' && att.startsWith('data:image')) {
-                    return undefined;
-                  }
-                  return att;
-                }).filter((att: any) => att !== undefined)
-              }))
+                  })
+                  .filter((att: any) => att !== undefined),
+              })),
             }));
-            localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
+            localStorage.setItem(
+              localStorageKey,
+              JSON.stringify(chatsForStorage)
+            );
           } catch (e) {
-            console.warn('⚠️ Could not save to localStorage, continuing anyway...');
+            console.warn("⚠️ Could not save to localStorage, continuing anyway...");
           }
         }
       } catch (error) {
-        console.warn('Phase 2 failed (non-critical):', error);
+        console.warn("Phase 2 failed (non-critical):", error);
       }
       
       // 🌐 PHASE 3: Load from Pinecone in background (slower - full history)
@@ -250,10 +287,14 @@ export default function App() {
       if (chats.length < 5) {
         setTimeout(async () => {
           try {
-            console.log('🔍 PHASE 3: Checking Pinecone for older history...');
-            const pineconeResponse = await apiService.getChats(user.id, 'pinecone');
+            console.log("🔍 PHASE 3: Checking Pinecone for older history...");
+            const pineconeResponse = await apiService.getChats(
+              user.id,
+              "pinecone"
+            );
             
-            if (pineconeResponse?.data && Array.isArray(pineconeResponse.data) && pineconeResponse.data.length > 0) {
+            if (pineconeResponse?.data && Array.isArray(pineconeResponse.data) && pineconeResponse.data.length > 0)
+             {
               const olderChats = pineconeResponse.data.map((chat: any) => ({
                 ...chat,
                 createdAt: new Date(chat.timestamp),
@@ -262,8 +303,9 @@ export default function App() {
                   .map((msg: any) => ({
                     ...msg,
                     timestamp: new Date(msg.timestamp)
-                  }))
-                  .sort((a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime()) // Sort messages chronologically (oldest first)
+                  })).sort(
+                    (a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime()
+                  ), // Sort messages chronologically (oldest first)
               }));
               
               // 🖼️ Rehydrate images from Firebase URLs
@@ -277,7 +319,11 @@ export default function App() {
                   };
                 });
               }
-              const rehydratedOlderChats = await imageRehydrationService.rehydrateChats(olderChats, user.id);
+              const rehydratedOlderChats =
+                await imageRehydrationService.rehydrateChats(
+                  olderChats,
+                  user.id
+                );
               
               // Merge with existing chats (avoid duplicates)
               setChats(prevChats => {
@@ -285,17 +331,19 @@ export default function App() {
                 const newChats = rehydratedOlderChats.filter(c => !existingIds.has(c.id));
                 
                 if (newChats.length > 0) {
-                  console.log(`✅ PHASE 3: Added ${newChats.length} older chat(s) from Pinecone with image rehydration`);
+                  console.log(
+                    `✅ PHASE 3: Added ${newChats.length} older chat(s) from Pinecone with image rehydration`
+                  );
                   // Sort by timestamp (descending - newest first)
-                  return [...prevChats, ...newChats].sort((a, b) => 
-                    b.createdAt.getTime() - a.createdAt.getTime()
+                  return [...prevChats, ...newChats].sort(
+                    (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
                   );
                 }
                 return prevChats;
               });
             }
           } catch (error) {
-            console.warn('Phase 3 failed (non-critical):', error);
+            console.warn("Phase 3 failed (non-critical):", error);
           }
         }, 1000); // Delay 1 second to not block initial load
       }
@@ -306,9 +354,28 @@ export default function App() {
 
   const handleSignIn = async () => {
     try {
-      await signInWithGoogle();
+      const signInResult = await signInWithGoogle();
       setAuthDialogOpen(false);
       toast.success("Signed in successfully!");
+
+      // --- ROBUST ONBOARDING LOGIC ---
+      // We will no longer rely on Firebase's `isNewUser` flag as it can be unreliable.
+      // Instead, we check if the user has ever completed the onboarding on THIS browser.
+      const signedInUser = signInResult?.user;
+      if (!signedInUser?.id) return; // Safety check
+
+      const onboardingKey = `onboarding_complete_${signedInUser.id}`;
+      const hasCompletedOnboarding = localStorage.getItem(onboardingKey);
+
+      console.log(`Onboarding check for user ${signedInUser?.id}:`, {
+        hasCompletedOnboarding,
+      });
+
+      if (!hasCompletedOnboarding) {
+        console.log("✨ New user detected! Starting onboarding tutorial.");
+        localStorage.setItem(onboardingKey, "true");
+        setTimeout(() => setShowOnboarding(true), 500);
+      }
       // Chat history will be loaded by the useEffect hook
     } catch (error: any) {
       toast.error(error.message || "Failed to sign in with Google");
@@ -382,13 +449,13 @@ export default function App() {
       // The welcome screen has a "Sign In to Get Started" button
       toast.success("Signed out successfully");
     } catch (error) {
-      console.error('Sign out error:', error);
-      toast.error('Failed to sign out');
+      console.error("Sign out error:", error);
+      toast.error("Failed to sign out");
     }
   };
 
   const handleNewChat = () => {
-    console.log('🆕 Creating new chat...');
+    console.log("🆕 Creating new chat...");
     
     // 🎯 Persist previous chat before creating new one
     if (activeChat && activeChat.messages.length > 0 && user) {
@@ -396,13 +463,16 @@ export default function App() {
       const userId = user.id;
       
       // Call endChat API in background (don't block UI)
-      apiService.endChat({ userId, chatId: previousChatId })
+      apiService
+        .endChat({ userId, chatId: previousChatId })
         .then(() => {
-          console.log(`✅ Previous chat ${previousChatId} will be persisted to Pinecone`);
+          console.log(
+            `✅ Previous chat ${previousChatId} will be persisted to Pinecone`
+          );
         })
-        .catch((error) => {
-          console.warn('⚠️ Failed to persist previous chat:', error);
-        });
+        .catch((error) =>
+          console.warn("⚠️ Failed to persist previous chat:", error)
+        );
     }
     
     const newChat: ChatHistory = {
@@ -425,7 +495,7 @@ export default function App() {
     }
     setActiveChat(newChat);
     setActiveSection("home");
-    console.log('✅ New chat created:', newChat.id, '| Active section:', 'home');
+    console.log("✅ New chat created:", newChat.id, "| Active section:", "home");
     toast.success("New chat created");
   };
 
@@ -446,13 +516,16 @@ export default function App() {
       const userId = user.id;
       
       // Call endChat API in background (don't block UI)
-      apiService.endChat({ userId, chatId: previousChatId })
+      apiService
+        .endChat({ userId, chatId: previousChatId })
         .then(() => {
-          console.log(`✅ Previous chat ${previousChatId} will be persisted to Pinecone`);
+          console.log(
+            `✅ Previous chat ${previousChatId} will be persisted to Pinecone`
+          );
         })
-        .catch((error) => {
-          console.warn('⚠️ Failed to persist previous chat:', error);
-        });
+        .catch((error) =>
+          console.warn("⚠️ Failed to persist previous chat:", error)
+        );
     }
     
     setActiveChat(chat);
@@ -494,7 +567,10 @@ export default function App() {
   };
 
   const renderMainContent = () => {
-    console.log(`📄 Rendering main content | Section: ${activeSection} | Active chat:`, activeChat?.id);
+    console.log(
+      `📄 Rendering main content | Section: ${activeSection} | Active chat:`,
+      activeChat?.id
+    );
     switch (activeSection) {
       case "home":
         return (
@@ -683,7 +759,10 @@ export default function App() {
         onOpenChange={setAuthDialogOpen}
         onSignIn={handleSignIn}
       />
+      <OnboardingTutorial
+        open={showOnboarding}
+        onOpenChange={setShowOnboarding}
+      />
     </div>
   );
 }
-

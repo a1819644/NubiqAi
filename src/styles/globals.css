@@ -89,6 +89,21 @@
   --sidebar-ring: 217.2 10.6% 64.9%;
 }
 
+@layer utilities {
+  @keyframes pulse-glow {
+    0%, 100% {
+      box-shadow: 0 0 6px 2px rgba(255, 255, 255, 0.15), 0 0 0 9999px rgba(20, 20, 22, 0.4);
+    }
+    50% {
+      box-shadow: 0 0 16px 4px rgba(255, 255, 255, 0.3), 0 0 0 9999px rgba(20, 20, 22, 0.45);
+    }
+  }
+
+  .animate-pulse-glow {
+    animation: pulse-glow 2.5s infinite ease-in-out;
+  }
+}
+
 @layer base {
   * {
     @apply border-border;
