@@ -14,7 +14,8 @@ import { imageRehydrationService } from "./services/imageRehydrationService";
 import { Toaster } from "sonner";
 import { toast } from "sonner";
 import { useDarkMode } from "./hooks/useDarkMode";
-import { useAuth } from "./hooks/useAuth";
+import { useAuth, User } from "./hooks/useAuth";
+import { cn } from "./components/ui/utils";
 import { ChatHistory, NavigationSection } from "./types";
 
 export default function App() {
@@ -22,6 +23,9 @@ export default function App() {
   const { user, signInWithGoogle, signOut, isLoading } = useAuth();
   const [isAuthDialogOpen, setAuthDialogOpen] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  
+
 
   const [activeSection, setActiveSection] = useState<NavigationSection>("home");
 
@@ -725,6 +729,8 @@ export default function App() {
     );
   }
 
+  
+
   // Main app interface for authenticated users
   return (
     <div className="h-screen flex flex-col bg-background text-foreground">
@@ -738,7 +744,7 @@ export default function App() {
         onLogoClick={handleLogoClick}
       />
       <div className="flex flex-1 overflow-hidden">
-        <div className="w-64 bg-sidebar transition-colors">
+        <div className={cn("bg-sidebar transition-all duration-300 ease-in-out", isSidebarCollapsed ? "w-20" : "w-64")}>
           <Sidebar
             activeSection={activeSection}
             onSectionChange={setActiveSection}
@@ -749,6 +755,8 @@ export default function App() {
             }
             onSelectChat={handleSelectChat}
             activeChatId={activeChat?.id || null}
+            isCollapsed={isSidebarCollapsed}
+            onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
           />
         </div>
         <main className="flex-1 overflow-hidden">{renderMainContent()}</main>
@@ -765,4 +773,5 @@ export default function App() {
       />
     </div>
   );
+  
 }

@@ -8,6 +8,8 @@ import {
   Settings,
   ChevronRight,
   Bot,
+  PanelLeftClose,
+  PanelLeftOpen,
   FileText,
   Home,
   CreditCard,
@@ -31,6 +33,8 @@ interface SidebarProps {
   recentChats: ChatHistory[];
   onSelectChat: (chat: ChatHistory) => void;
   activeChatId: string | null;
+  isCollapsed: boolean;
+  onToggleCollapse: () => void;
 }
 
 // Assuming ActiveSection is NavigationSection from types
@@ -39,8 +43,8 @@ type ActiveSection = NavigationSection;
 // Create a reusable NavItem component for consistent styling
 const NavItem = React.forwardRef<
   HTMLButtonElement,
-  React.ComponentProps<typeof Button> & { isActive?: boolean }
->(({ className, isActive, ...props }, ref) => {
+  React.ComponentProps<typeof Button> & { isActive?: boolean; isCollapsed?: boolean }
+>(({ className, isActive, isCollapsed, children, ...props }, ref) => {
   return (
     <Button
       ref={ref}
@@ -53,7 +57,9 @@ const NavItem = React.forwardRef<
         className
       )}
       {...props}
-    />
+    >
+      {children}
+    </Button>
   );
 });
 NavItem.displayName = "NavItem";
@@ -65,8 +71,10 @@ export function Sidebar({
   recentChats,
   onSelectChat,
   activeChatId,
+  isCollapsed,
+  onToggleCollapse,
 }: SidebarProps) {
-  const isWorkspaceExpanded = activeSection.startsWith("workspace");
+  const isWorkspaceExpanded = !isCollapsed && activeSection.startsWith("workspace");
   const isSettingsExpanded = activeSection.startsWith("settings");
 
   const mainSidebarItems = [
@@ -156,7 +164,10 @@ export function Sidebar({
   };
 
   return (
-    <aside className="w-64 border-r bg-muted/20 dark:bg-zinc-900/50 flex flex-col h-full">
+    <aside className={cn(
+      "border-r bg-muted/20 dark:bg-zinc-900/50 flex flex-col h-full transition-all duration-300 ease-in-out",
+      isCollapsed ? "w-20" : "w-64"
+    )}>
       <div className="flex-1 overflow-y-auto">
         <div className="p-4">
           <nav className="space-y-1">
@@ -172,7 +183,7 @@ export function Sidebar({
                     className="font-semibold !text-primary dark:!text-primary hover:!bg-primary/10 dark:hover:!bg-primary/10"
                   >
                     <item.icon className="w-4 h-4 mr-3" />
-                    {item.label}
+                    {!isCollapsed && item.label}
                   </NavItem>
                 );
               }
@@ -185,7 +196,7 @@ export function Sidebar({
                     onClick={() => onSectionChange(item.section)}
                   >
                     <item.icon className="w-4 h-4 mr-3" />
-                    {item.label}
+                    {!isCollapsed && item.label}
                   </NavItem>
                 );
               }
@@ -208,14 +219,14 @@ export function Sidebar({
                       >
                         <div className="flex items-center">
                           <item.icon className="w-4 h-4 mr-3" />
-                          {item.label}
+                          {!isCollapsed && item.label}
                         </div>
-                        <ChevronRight
+                        {!isCollapsed && <ChevronRight
                           className={cn(
                             "w-4 h-4 transition-transform",
                             item.isExpanded && "rotate-90"
                           )}
-                        />
+                        />}
                       </NavItem>
                     </CollapsibleTrigger>
                     <CollapsibleContent className="pl-4">
@@ -227,7 +238,7 @@ export function Sidebar({
                             onClick={() => onSectionChange(subItem.section)}
                           >
                             <subItem.icon className="w-4 h-4 mr-3" />
-                            {subItem.label}
+                            {!isCollapsed && subItem.label}
                           </NavItem>
                         ))}
                       </div>
@@ -241,7 +252,7 @@ export function Sidebar({
           </nav>
         </div>
         {/* Recent Chats Section */}
-        <div className="px-4 pt-3 mt-2 border-t border-white/5 dark:border-white/5">
+        {!isCollapsed && <div className="px-4 pt-3 mt-2 border-t border-white/5 dark:border-white/5">
           <h3 className="text-xs font-medium text-muted-foreground/80 tracking-wide mb-2 px-3 text-[#9CA3AF]">
             Recent
           </h3>
@@ -254,7 +265,7 @@ export function Sidebar({
                 onClick={() => onSelectChat(chat)}
                 title={chat.title}
               >
-                <span className="truncate">
+                <span className={cn("truncate", isCollapsed && "sr-only")}>
                   {chat.title}
                 </span>
               </NavItem>
@@ -269,10 +280,19 @@ export function Sidebar({
               </Button>
             )}
           </div>
-        </div>
+        </div>}
       </div>
       {/* Bottom fixed section */}
-      <div className="p-4 border-t border-white/5 dark:border-white/5">
+      <div className="p-4 border-t border-white/5 dark:border-white/5 space-y-2">
+        <NavItem onClick={onToggleCollapse} className="text-muted-foreground">
+          {isCollapsed ? (
+            <PanelLeftOpen className="w-4 h-4" />
+          ) : (
+            <PanelLeftClose className="w-4 h-4 mr-3" />
+          )}
+          {!isCollapsed && "Collapse"}
+        </NavItem>
+
         <Collapsible open={settingsItem.isExpanded}>
           <CollapsibleTrigger asChild>
             <NavItem
@@ -288,14 +308,14 @@ export function Sidebar({
             >
               <div className="flex items-center">
                 <settingsItem.icon className="w-4 h-4 mr-3" />
-                {settingsItem.label}
+                {!isCollapsed && settingsItem.label}
               </div>
-              <ChevronRight
+              {!isCollapsed && <ChevronRight
                 className={cn(
                   "w-4 h-4 transition-transform",
                   settingsItem.isExpanded && "rotate-90"
                 )}
-              />
+              />}
             </NavItem>
           </CollapsibleTrigger>
           <CollapsibleContent className="pl-4 mt-1">
@@ -307,7 +327,7 @@ export function Sidebar({
                   onClick={() => onSectionChange(subItem.section)}
                 >
                   <subItem.icon className="w-4 h-4 mr-3" />
-                  {subItem.label}
+                  {!isCollapsed && subItem.label}
                 </NavItem>
               ))}
             </div>
