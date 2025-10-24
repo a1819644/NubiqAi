@@ -22,6 +22,15 @@ import { cn } from "./ui/utils";
 import { imageStorageService } from "../services/imageStorageService";
 import { Progress } from "./ui/progress";
 
+// Define AttachmentPreview interface
+interface AttachmentPreview {
+  id: string;
+  file: File;
+  progress: number;
+  previewUrl?: string;
+  error?: string;
+}
+
 // Using a placeholder for image icon
 const imageIcon = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTIgMkgxNFYxNEgyVjJaIiBzdHJva2U9IiM2NjY2NjYiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIvPgo8cGF0aCBkPSJNMiAxMkw2IDhMOCAxMEwxMiA2TDE0IDhWMTJIMloiIGZpbGw9IiM2NjY2NjYiLz4KPC9zdmc+';
 

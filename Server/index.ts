@@ -82,6 +82,14 @@ try {
 const app = express();
 const port = Number(process.env.PORT ?? 8000);
 
+// In-memory upload handling for quick preprocessing
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: Number(process.env.MAX_IMAGE_UPLOAD_MB || 15) * 1024 * 1024,
+  },
+});
+
 // Helper function to check if origin is localhost or private LAN
 function isAllowedOrigin(origin: string): boolean {
   try {
@@ -146,96 +154,6 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
-  next();
-});
-
-// Serve local cached images quickly from disk when enabled
-try {
-  if (localImageCacheService.isEnabled()) {
-    const dir = localImageCacheService.getBaseDir();
-    console.log(`🗂️ Serving local images from: ${dir}`);
-    app.use(
-      "/local-images",
-      express.static(dir, {
-        maxAge: 5 * 60 * 1000, // 5 minutes
-        etag: true,
-        setHeaders: (res) => {
-          res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=60");
-          res.setHeader("Timing-Allow-Origin", "*");
-        },
-      })
-    );
-  }
-} catch (e) {
-  console.warn("⚠️ Failed to mount local image static route:", e);
-}
-
-// Early request logger BEFORE any body parsing to diagnose content-type issues
-app.use((req, _res, next) => {
-  const ct = req.headers['content-type'] || 'none';
-  console.log(`[REQ] ${req.method} ${req.url} | Content-Type: ${ct}`);
-  next();
-});
-
-// Conditionally parse body - skip JSON parsing for multipart/form-data
-app.use((req, res, next) => {
-  const contentType = (req.headers['content-type'] || '').toLowerCase();
-  
-  // Skip body parsing for multipart/form-data (let multer handle it)
-  if (contentType.startsWith('multipart/form-data') || contentType.includes('multipart/form-data')) {
-    console.log('⏭️ Skipping body parser for multipart request');
-    return next();
-  }
-  
-  // Parse JSON for other requests
-  express.json({ limit: "100mb" })(req, res, next);
-});
-
-app.use((req, res, next) => {
-  const contentType = (req.headers['content-type'] || '').toLowerCase();
-  
-  // Skip for multipart/form-data
-  if (contentType.startsWith('multipart/form-data') || contentType.includes('multipart/form-data')) {
-    return next();
-  }
-  
-  express.urlencoded({ limit: "100mb", extended: true })(req, res, next);
-});
-
-// Configure multer for multipart/form-data (image uploads)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
-});
-
-// Serve local image cache statically for instant client loads
-try {
-  if (localImageCacheService.isEnabled()) {
-    const dir = (localImageCacheService as any).getBaseDir?.() || require('path').resolve(__dirname, 'local-images');
-    app.use('/local-images', express.static(dir, {
-      setHeaders: (res) => {
-        res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
-        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-      }
-    }));
-    console.log(`🖼️ Local image cache enabled. Serving ${dir} at /local-images`);
-  } else {
-    console.log('🖼️ Local image cache disabled');
-  }
-} catch (e) {
-  console.warn('⚠️ Failed to mount local image cache static route:', e);
-}
-
-// 🔒 Security middleware
-app.use(securityHeadersMiddleware);
-app.use(sanitizeBodyMiddleware);
-
-// Add request logging
-app.use((req, res, next) => {
-  console.log(
-    `${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${req.headers.origin || "none"}`
-  );
   next();
 });
 
@@ -351,7 +269,7 @@ process.on("unhandledRejection", (reason, promise) => {
  * OR multipart/form-data: { prompt, image (file), type, userId, ... }
  * 🔒 SECURITY: Rate limited, input validated
  */
-app.post("/api/ask-ai", upload.single('image'), rateLimitMiddleware("general"), async (req, res) => {
+app.post("/api/ask-ai", express.json(), upload.single('image'), rateLimitMiddleware("general"), async (req, res) => {
   if (!vertex && !ai)
     return res.status(500).json({ error: "AI client not initialized" });
 
@@ -1289,24 +1207,41 @@ Valid intents: "imageEdit", "visionQA", "imageGenerate", "text".`;
           }
         }
 
-        // Save locally for instant load (if enabled)
-        try {
-          if (localImageCacheService.isEnabled()) {
-            if (editedBase64) {
-              const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", editedBase64, "png");
-              imageLocalUri = saved.localUri;
-            } else if (editedUri) {
-              const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", editedUri, "png");
-              imageLocalUri = saved.localUri;
-            }
-          }
-        } catch (e) {
-          console.warn("⚠️ Failed to save edited image locally:", e);
-        }
+        const editResponsePayload = {
+          success: true,
+          isImageGeneration: true,
+          text: sanitizeImageText(altText || undefined) || "Edited image",
+          imageBase64: editedBase64,
+          imageUri: editedUri,
+          imageLocalUri,
+          raw: response,
+          metadata: {
+            tokens: (response as any)?.usage?.totalTokenCount || 0,
+            candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+            promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
+          },
+        };
 
-        // Background upload to Firebase Storage if enabled
-        if (useMemory && effectiveUserId && (editedBase64 || editedUri)) {
-          setImmediate(async () => {
+        res.json(editResponsePayload);
+
+        setImmediate(async () => {
+          try {
+            if (localImageCacheService.isEnabled()) {
+              if (!imageLocalUri && editedBase64) {
+                const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", editedBase64, "png");
+                imageLocalUri = saved.localUri;
+                console.log(`🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`);
+              } else if (!imageLocalUri && editedUri) {
+                const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", editedUri, "png");
+                imageLocalUri = saved.localUri;
+                console.log(`🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`);
+              }
+            }
+          } catch (e) {
+            console.warn("⚠️ [BACKGROUND] Failed to save edited image locally:", e);
+          }
+
+          if (useMemory && effectiveUserId && (editedBase64 || editedUri)) {
             try {
               const hybridMemoryService = getHybridMemoryService();
               let firebaseImageUrl: string;
@@ -1353,23 +1288,10 @@ Valid intents: "imageEdit", "visionQA", "imageGenerate", "text".`;
             } catch (e) {
               console.warn("[BACKGROUND] Failed to upload/store edited image:", e);
             }
-          });
-        }
-
-        return res.json({
-          success: true,
-          isImageGeneration: true,
-          text: sanitizeImageText(altText || undefined) || "Edited image",
-          imageBase64: editedBase64,
-          imageUri: editedUri,
-          imageLocalUri,
-          raw: response,
-          metadata: {
-            tokens: (response as any)?.usage?.totalTokenCount || 0,
-            candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
-            promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
-          },
+          }
         });
+
+        return;
       } catch (e) {
         console.error("❌ Image editing failed, falling back to vision Q&A:", e);
         // Fall through to normal vision Q&A below
@@ -1473,7 +1395,7 @@ Valid intents: "imageEdit", "visionQA", "imageGenerate", "text".`;
 
 ${contextSummary}
 
-Create a detailed, visually compelling image that captures the essence and context of what we've been discussing. Make it relevant to the conversation topic.`;
+Create a detailed, visually compelling image that captures the essence and context(use the context if you think the user previous current request says i need other skip the context) of what we've been discussing. Make it relevant to the conversation topic.`;
 
             console.log(
               `✨ Enhanced image prompt with ${recentTurns.length} conversation turns from memory`
@@ -1577,11 +1499,11 @@ Create a detailed, visually compelling image that captures the essence and conte
         }
       }
 
-  const parts: any[] = (response as any)?.parts ?? [];
-  let imageBase64: string | null = null;
-  let imageUri: string | null = null;
-      let imageLocalUri: string | null = null;
-      let altText: string | null = null;
+    const parts: any[] = (response as any)?.parts ?? [];
+    let imageBase64: string | null = null;
+    let imageUri: string | null = null;
+    let imageLocalUri: string | null = null;
+    let altText: string | null = null;
 
       console.log(`📦 Received ${parts.length} parts from Gemini`);
 
@@ -1652,105 +1574,101 @@ Create a detailed, visually compelling image that captures the essence and conte
         }
       }
 
-      // Save locally for instant load (if enabled)
-      try {
-        if (localImageCacheService.isEnabled()) {
-          if (imageBase64) {
-            const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", imageBase64, "png");
-            imageLocalUri = saved.localUri;
-          } else if (imageUri) {
-            const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", imageUri, "png");
-            imageLocalUri = saved.localUri;
-          }
-        }
-      } catch (e) {
-        console.warn("⚠️ Failed to save generated image locally:", e);
-      }
+          const generationResponsePayload = {
+            success: true,
+            isImageGeneration: true,
+            text: sanitizeImageText(altText || undefined) || "Image generated",
+            imageBase64,
+            imageUri,
+            imageLocalUri,
+            altText,
+            raw: response,
+            metadata: {
+              tokens: (response as any)?.usage?.totalTokenCount || 0,
+              candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+              promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
+            },
+          };
 
-      // Upload image to Firebase Storage and store URL
-  if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
-        setImmediate(async () => {
-          try {
-            const hybridMemoryService = getHybridMemoryService();
-            let firebaseImageUrl: string;
+          res.json(generationResponsePayload);
 
-            // Upload to Firebase Storage
-            if (imageBase64) {
-              console.log("📤 Uploading base64 image to Firebase Storage...");
-              firebaseImageUrl = await firebaseStorageService.uploadImage(
-                effectiveUserId,
-                effectiveChatId || "default",
-                imageBase64,
-                prompt
-              );
-            } else if (imageUri) {
-              // Fallback: try downloading the URI and uploading it
-              console.log("📤 Attempting to download URI and upload to Firebase Storage...");
+          setImmediate(async () => {
+            try {
+              if (localImageCacheService.isEnabled()) {
+                if (!imageLocalUri && imageBase64) {
+                  const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", imageBase64, "png");
+                  imageLocalUri = saved.localUri;
+                  console.log(`🗃️ [BACKGROUND] Cached generated image locally: ${imageLocalUri}`);
+                } else if (!imageLocalUri && imageUri) {
+                  const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", imageUri, "png");
+                  imageLocalUri = saved.localUri;
+                  console.log(`🗃️ [BACKGROUND] Cached generated image locally: ${imageLocalUri}`);
+                }
+              }
+            } catch (e) {
+              console.warn("⚠️ [BACKGROUND] Failed to save generated image locally:", e);
+            }
+
+            if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
               try {
-                const resp = await fetch(imageUri);
-                if (resp.ok) {
-                  const arrayBuf = await resp.arrayBuffer();
-                  const buffer = Buffer.from(arrayBuf);
-                  const b64 = buffer.toString('base64');
+                const hybridMemoryService = getHybridMemoryService();
+                let firebaseImageUrl: string;
+
+                if (imageBase64) {
+                  console.log("📤 Uploading base64 image to Firebase Storage...");
                   firebaseImageUrl = await firebaseStorageService.uploadImage(
                     effectiveUserId,
                     effectiveChatId || "default",
-                    b64,
+                    imageBase64,
                     prompt
                   );
+                } else if (imageUri) {
+                  console.log("📤 Attempting to download URI and upload to Firebase Storage...");
+                  try {
+                    const resp = await fetch(imageUri);
+                    if (resp.ok) {
+                      const arrayBuf = await resp.arrayBuffer();
+                      const buffer = Buffer.from(arrayBuf);
+                      const b64 = buffer.toString('base64');
+                      firebaseImageUrl = await firebaseStorageService.uploadImage(
+                        effectiveUserId,
+                        effectiveChatId || "default",
+                        b64,
+                        prompt
+                      );
+                    } else {
+                      console.warn(`⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`);
+                      firebaseImageUrl = imageUri;
+                    }
+                  } catch (err) {
+                    console.warn("⚠️ Error downloading URI for upload, storing URI as-is:", err);
+                    firebaseImageUrl = imageUri;
+                  }
                 } else {
-                  console.warn(`⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`);
-                  firebaseImageUrl = imageUri;
+                  console.error("❌ No image data to upload");
+                  return;
                 }
-              } catch (err) {
-                console.warn("⚠️ Error downloading URI for upload, storing URI as-is:", err);
-                firebaseImageUrl = imageUri;
+
+                console.log(`✅ Image uploaded to Firebase: ${firebaseImageUrl}`);
+
+                const conversationTurn = hybridMemoryService.storeConversationTurn(
+                  effectiveUserId,
+                  prompt,
+                  altText || "Image generated",
+                  effectiveChatId,
+                  { url: firebaseImageUrl, prompt: prompt }
+                );
+
+                await firestoreChatService.saveTurn(conversationTurn);
+
+                console.log(`🖼️ [BACKGROUND] Stored image URL in conversation history`);
+              } catch (memoryError) {
+                console.error("❌ [BACKGROUND] Failed to upload/store image:", memoryError);
               }
-            } else {
-              console.error("❌ No image data to upload");
-              return;
             }
+          });
 
-            console.log(`✅ Image uploaded to Firebase: ${firebaseImageUrl}`);
-
-            // Store Firebase URL in conversation history (NOT base64)
-            const conversationTurn = hybridMemoryService.storeConversationTurn(
-              effectiveUserId,
-              prompt, // User's prompt
-              altText || "Image generated", // AI's response (alt text or placeholder)
-              effectiveChatId,
-              { url: firebaseImageUrl, prompt: prompt } // Store Firebase URL
-            );
-
-            await firestoreChatService.saveTurn(conversationTurn);
-
-            console.log(
-              `🖼️ [BACKGROUND] Stored image URL in conversation history`
-            );
-          } catch (memoryError) {
-            console.error(
-              "❌ [BACKGROUND] Failed to upload/store image:",
-              memoryError
-            );
-          }
-        });
-      }
-
-      return res.json({
-        success: true,
-        isImageGeneration: true,
-        text: sanitizeImageText(altText || undefined) || "Image generated",
-        imageBase64,
-        imageUri,
-        imageLocalUri,
-        altText,
-        raw: response,
-        metadata: {
-          tokens: (response as any)?.usage?.totalTokenCount || 0,
-          candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
-          promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
-        },
-      });
+      return;
     }
 
     // ✅ REMOVED: Automatic image generation detection
@@ -1881,6 +1799,7 @@ Create a detailed, visually compelling image that captures the essence and conte
 app.post(
   "/api/process-document",
   rateLimitMiddleware("general"),
+  express.json(),
   async (req, res) => {
     if (!vertex && !ai)
       return res
@@ -2177,6 +2096,7 @@ app.post(
  */
 app.post(
   "/api/process-image",
+  express.json(),
   upload.single('image'), // Handle multipart/form-data
   rateLimitMiddleware("general"),
   async (req, res) => {
@@ -2305,7 +2225,7 @@ Provide a comprehensive description that will help answer questions about this i
  * OR multipart/form-data with 'image' field and editPrompt
  * Edit an image using AI - provide either imageBase64, imageId from cache, or upload file directly
  */
-app.post("/api/edit-image", upload.single('image'), rateLimitMiddleware("image"), async (req, res) => {
+app.post("/api/edit-image", express.json(), upload.single('image'), rateLimitMiddleware("image"), async (req, res) => {
   if (!vertex && !ai)
     return res.status(500).json({ error: "AI client not initialized" });
 
@@ -2458,6 +2378,7 @@ Generate a new image that matches the original description but with the requeste
  */
 app.post(
   "/api/edit-image-with-mask",
+  express.json(),
   upload.fields([{ name: 'image', maxCount: 1 }, { name: 'mask', maxCount: 1 }]),
   rateLimitMiddleware("image"),
   async (req, res) => {
@@ -2626,6 +2547,7 @@ Generate a new version of the image with the edit applied ONLY to the masked are
 app.post(
   "/api/store-memory",
   rateLimitMiddleware("general"),
+  express.json(),
   async (req, res) => {
     try {
       const { content, type = "note", source, userId, tags } = req.body;
@@ -2681,6 +2603,7 @@ app.post(
 app.post(
   "/api/store-memories",
   rateLimitMiddleware("general"),
+  express.json(),
   async (req, res) => {
     try {
       const { memories } = req.body;
@@ -2758,6 +2681,7 @@ app.post(
 app.post(
   "/api/search-memory",
   rateLimitMiddleware("general"),
+  express.json(),
   async (req, res) => {
     try {
       const { query, topK = 5, threshold = 0.7, userId, type } = req.body;
@@ -2821,6 +2745,7 @@ app.post(
 app.delete(
   "/api/memory/:id",
   rateLimitMiddleware("general"),
+  express.json(),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -3013,7 +2938,7 @@ app.get("/api/recent-context/:userId", async (req, res) => {
  * POST /api/hybrid-memory-search
  * Search using hybrid memory system
  */
-app.post("/api/hybrid-memory-search", async (req, res) => {
+app.post("/api/hybrid-memory-search", express.json(), async (req, res) => {
   try {
     const {
       userId,
@@ -3062,6 +2987,7 @@ app.post("/api/hybrid-memory-search", async (req, res) => {
 app.post(
   "/api/set-user-profile",
   rateLimitMiddleware("general"),
+  express.json(),
   async (req, res) => {
     try {
       const { userId, name, role, interests, preferences, background } =
@@ -3219,7 +3145,7 @@ app.get("/api/performance-stats", (req, res) => {
  * Called when user switches chats - persists current chat to Pinecone
  * 🎯 OPTIMIZED: Respects cooldown to avoid spam uploads
  */
-app.post("/api/end-chat", rateLimitMiddleware("general"), async (req, res) => {
+app.post("/api/end-chat", rateLimitMiddleware("general"), express.json(), async (req, res) => {
   try {
     const { userId, chatId, force } = req.body;
 
@@ -3268,6 +3194,7 @@ app.post("/api/end-chat", rateLimitMiddleware("general"), async (req, res) => {
 app.post(
   "/api/save-all-chats",
   rateLimitMiddleware("general"),
+  express.json(),
   async (req, res) => {
     try {
       const { userId, chatIds } = req.body;
