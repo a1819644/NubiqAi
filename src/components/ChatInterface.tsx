@@ -170,6 +170,7 @@ export function ChatInterface({
   const [isHeaderVisible, setIsHeaderVisible] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
   const [lastScrollY, setLastScrollY] = useState(0);
+  const dragCounter = useRef(0);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -1498,7 +1499,27 @@ ${procResp.extractedText}`,
       onDragOver={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        setIsDragging(true);
+      }}
+      onDrop={(e) => {
+        // Prevent browser from opening the file
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      onDragEnter={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounter.current++;
+        if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+          setIsDragging(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounter.current--;
+        if (dragCounter.current === 0) {
+          setIsDragging(false);
+        }
       }}
     >
       {/* Messages Area */}
@@ -1602,8 +1623,8 @@ ${procResp.extractedText}`,
                       autoFocus
                       rows={1}
                       onKeyDown={(e) => {
-                        // Cmd/Ctrl + Enter to submit
-                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                        // Submit on Enter (but not Shift+Enter)
+                        if (e.key === 'Enter' && !e.shiftKey) {
                           e.preventDefault();
                           handleEditMessage(message.id);
                         } else if (e.key === 'Escape') {
@@ -1962,12 +1983,11 @@ ${procResp.extractedText}`,
       {isDragging && (
         <div
           className="absolute inset-0 z-20 bg-primary/10 backdrop-blur-sm flex flex-col items-center justify-center border-4 border-dashed border-primary/50 rounded-2xl transition-all"
+          onDrop={handleFileDrop}
           onDragLeave={(e) => {
             e.preventDefault();
-            e.stopPropagation();
             setIsDragging(false);
           }}
-          onDrop={handleFileDrop}
         >
           <UploadCloud className="w-16 h-16 text-primary/80 mb-4" />
           <p className="text-lg font-semibold text-primary">Drop files here to attach</p>
