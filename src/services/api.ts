@@ -28,12 +28,18 @@ class ApiService {
   ): Promise<ApiResponse<T>> {
     const url = `${this.baseURL}${endpoint}`;
     
+    // If sending FormData, DO NOT set Content-Type manually (browser must set boundary)
+    const isFormData = typeof FormData !== 'undefined' && (options as any)?.body instanceof FormData;
+    const mergedHeaders: Record<string, string> = {
+      ...(options.headers as any),
+    };
+    if (!isFormData) {
+      mergedHeaders['Content-Type'] = mergedHeaders['Content-Type'] || 'application/json';
+    }
+
     const config: RequestInit = {
       ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
+      headers: mergedHeaders,
     };
 
     // Add auth token if available
@@ -185,10 +191,15 @@ class ApiService {
     conversationHistory?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>; // 🎯 Includes system messages for document context
     conversationSummary?: string; // 🎯 NEW! Summary of older messages to save tokens
     useMemory?: boolean; // Enable/disable memory
+    documentId?: string; // 🎯 NEW! Document ID for RAG retrieval
   }): Promise<{ 
     success: boolean; 
     text?: string; 
     error?: string;
+    imageBase64?: string | null;
+    imageUri?: string | null;
+    imageLocalUri?: string | null;
+    isImageGeneration?: boolean;
     metadata?: {
       tokens?: number;
       candidatesTokenCount?: number;
@@ -207,6 +218,7 @@ class ApiService {
       if (data.chatId) formData.append('chatId', data.chatId); // 🎯 NEW!
       if (data.messageCount !== undefined) formData.append('messageCount', String(data.messageCount)); // 🎯 NEW!
       if (data.useMemory !== undefined) formData.append('useMemory', String(data.useMemory));
+      if (data.documentId) formData.append('documentId', data.documentId); // 🎯 NEW! For RAG
       
       return this.request('/ask-ai', {
         method: 'POST',
@@ -226,7 +238,8 @@ class ApiService {
           messageCount: data.messageCount,        // 🎯 NEW! Detect new vs continuing
           conversationHistory: data.conversationHistory, // 🎯 NEW! Previous messages for context
           conversationSummary: data.conversationSummary, // 🎯 NEW! Summary of older messages
-          useMemory: data.useMemory !== false // Default to true if not specified
+          useMemory: data.useMemory !== false, // Default to true if not specified
+          documentId: data.documentId            // 🎯 NEW! For RAG document retrieval
         }),
       });
     }
@@ -246,6 +259,7 @@ class ApiService {
     success: boolean;
     imageBase64?: string | null;
     imageUri?: string | null;
+    imageLocalUri?: string | null;
     altText?: string | null;
     error?: string;
     metadata?: {
