@@ -170,6 +170,9 @@ export function ChatInterface({
   const [isHeaderVisible, setIsHeaderVisible] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
   const [lastScrollY, setLastScrollY] = useState(0);
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null); // State for lightbox
+  const [imageActionSrc, setImageActionSrc] = useState<string | null>(null); // State for the new action dialog
+  const [imageActionAlt, setImageActionAlt] = useState<string | null>(null);
   const dragCounter = useRef(0);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1061,6 +1064,7 @@ ${procResp.extractedText}`,
   const [viewerSrc, setViewerSrc] = useState<string | null>(null);
   const [viewerAlt, setViewerAlt] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
+  const [isEditMode, setIsEditMode] = useState(false); // State to control edit UI visibility
   const [editPrompt, setEditPrompt] = useState('');
   const [maskFile, setMaskFile] = useState<File | null>(null);
   // Mask drawing state
@@ -1073,10 +1077,11 @@ ${procResp.extractedText}`,
   const maskFadeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [lastPoint, setLastPoint] = useState<{ x: number; y: number } | null>(null);
 
-  const openImageViewer = (src: string, alt?: string) => {
+  const openImageViewer = (src: string, alt?: string, editMode: boolean = false) => {
     setViewerSrc(src);
     setViewerAlt(alt || null);
     setViewerOpen(true);
+    setIsEditMode(editMode); // Set the mode
   };
 
   // Ensure mask canvas matches image dimensions when viewer opens
@@ -1484,6 +1489,64 @@ ${procResp.extractedText}`,
     return () => document.removeEventListener('keydown', handleGlobalKeyDown);
   }, [activeChat?.messages]); // Rerun when messages change
 
+  // New Image Action Dialog
+  const ImageActionDialog = () => {
+    if (!imageActionSrc) return null;
+
+    const handleEdit = () => {
+      setImageActionSrc(null);
+      openImageViewer(imageActionSrc, imageActionAlt || undefined, true);
+    };
+
+    const handleDownload = () => {
+      downloadImage(imageActionSrc);
+      setImageActionSrc(null);
+    };
+
+    return (
+      <Dialog open={!!imageActionSrc} onOpenChange={() => setImageActionSrc(null)}>
+        <DialogContent className="sm:max-w-2xl p-0">
+          <div className="p-4">
+            <img
+              src={imageActionSrc}
+              alt={imageActionAlt || 'Image action preview'}
+              className="max-w-full max-h-[70vh] object-contain rounded-lg mx-auto"
+            />
+          </div>
+          <DialogFooter className="p-4 border-t bg-muted/50">
+            <Button variant="outline" onClick={handleDownload}><Download className="mr-2 h-4 w-4" /> Download</Button>
+            <Button onClick={handleEdit}><Pencil className="mr-2 h-4 w-4" /> Edit</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  };
+
+  // Simple Lightbox Component for "Open" functionality
+  const Lightbox = ({ src, onClose }: { src: string | null; onClose: () => void }) => {
+    if (!src) return null;
+
+    return (
+      <div
+        className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center animate-fade-in cursor-pointer"
+        onClick={onClose}
+      >
+        <button
+          className="absolute top-4 right-4 text-white/70 hover:text-white transition-colors"
+          onClick={onClose}
+          aria-label="Close image viewer"
+        >
+          <X className="h-8 w-8" />
+        </button>
+        <img
+          src={src}
+          alt="Lightbox preview"
+          className="max-w-[90vw] max-h-[90vh] object-contain shadow-2xl rounded-lg cursor-default"
+          onClick={(e) => e.stopPropagation()} // Prevent closing when clicking the image itself
+        />
+      </div>
+    );
+  };
   // If no active chat, show a placeholder
   if (!activeChat) {
     return (
@@ -1522,6 +1585,12 @@ ${procResp.extractedText}`,
         }
       }}
     >
+      {/* Render the lightbox */}
+      <ImageActionDialog />
+
+      {/* Render the lightbox (kept for now, can be removed if "Open" button is removed) */}
+      <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />
+
       {/* Messages Area */}
       <div
         className="flex-1 overflow-auto relative"
@@ -1698,10 +1767,10 @@ ${procResp.extractedText}`,
                                       {/* Image Preview */}
                                       <div>
                                         <img
-                                          src={buildImageSrc(file, attachmentId)}
+                                          src={file} // Use the direct file URL here
                                           alt={message.content || `generated-${idx}`}
                                           className="w-full h-auto object-contain rounded-xl shadow-md cursor-pointer transition-opacity hover:opacity-90"
-                                          onClick={() => openImageViewer(file, message.content)}
+                                          onClick={() => { setImageActionSrc(file); setImageActionAlt(message.content); }}
                                           onLoad={() => setImageStatus((prev) => ({ ...prev, [attachmentId]: 'success' }))}
                                           onError={() => {
                                             console.error('Failed to load image:', file);
@@ -1712,11 +1781,11 @@ ${procResp.extractedText}`,
                                       {/* Prompt and Actions */}
                                       <div className="text-center mt-2">
                                         <p className="text-xs text-muted-foreground/80 line-clamp-2 mb-2">{message.content}</p>
-                                        <div className="flex items-center justify-center gap-2">
-                                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => openImageViewer(file, message.content)}>
+                                        <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => { setImageActionSrc(file); setImageActionAlt(message.content); }}>
                                             <Eye className="mr-1.5 h-4 w-4" /> Open
                                           </Button>
-                                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => openImageViewer(file, message.content)}>
+                                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => openImageViewer(file, message.content, true)}>
                                             <Pencil className="mr-1.5 h-4 w-4" /> Edit
                                           </Button>
                                           <Button size="sm" variant="ghost" className="h-7 px-2 text-xs hover:bg-accent" onClick={() => downloadImage(file)}>
@@ -1995,10 +2064,10 @@ ${procResp.extractedText}`,
       )}
       {/* Image viewer modal */}
       <Dialog open={viewerOpen} onOpenChange={(open) => setViewerOpen(open)}>
-        <DialogContent className="sm:max-w-2xl max-h-[95vh] flex flex-col p-0">
+        <DialogContent className={cn("max-h-[95vh] flex flex-col p-0 transition-all duration-300", isEditMode ? "sm:max-w-4xl" : "sm:max-w-2xl")}>
           <DialogHeader>
             <DialogTitle className="text-lg font-medium p-6 pb-2">Image Preview</DialogTitle>
-            <DialogDescription className="px-6 text-sm text-muted-foreground/80">{viewerAlt}</DialogDescription>
+            <DialogDescription className="px-6 text-sm text-muted-foreground/80 truncate">{viewerAlt}</DialogDescription>
           </DialogHeader>
           <div className="flex-1 overflow-hidden px-6 grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
             {viewerSrc ? (
@@ -2093,47 +2162,51 @@ ${procResp.extractedText}`,
             ) : (
               <div>No image</div>
             )}
-            {/* Controls Column */}
-            <div className="flex flex-col h-full space-y-6 pt-2 md:pl-8 md:border-l border-border">
-              <div className="flex-1 flex flex-col space-y-3 overflow-hidden">
-                <label className="text-sm font-medium">Edit Prompt</label>
-                <Textarea
-                  value={editPrompt}
-                  onChange={(e) => setEditPrompt(e.target.value)} // This is a standard textarea, not the autosize one
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey && editPrompt && !isEditing) {
-                      e.preventDefault();
-                      performImageEdit(true);
+            {/* Controls Column - Conditionally rendered */}
+            {isEditMode && (
+              <div className="flex flex-col h-full space-y-6 pt-2 md:pl-8 md:border-l border-border">
+                <div className="flex-1 flex flex-col space-y-3 overflow-hidden">
+                  <label className="text-sm font-medium">Edit Prompt</label>
+                  <Textarea
+                    value={editPrompt}
+                    onChange={(e) => setEditPrompt(e.target.value)} // This is a standard textarea, not the autosize one
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey && editPrompt && !isEditing) {
+                        e.preventDefault();
+                        performImageEdit(true);
+                      }
+                    }}
+                    placeholder="e.g., 'make the background a sunset'"
+                    className="w-full flex-1 resize-none text-sm p-2 bg-background border border-gray-300 dark:border-gray-600 rounded-md placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    rows={3}
+                  />
+                </div>
+                <div className="space-y-3">
+                  <label className="text-sm font-medium">Brush Size</label>
+                  <div className="flex items-center gap-4">
+                    <input type="range" min={4} max={64} value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} className="flex-1" />
+                    <span className="text-sm font-mono w-8 text-center">{brushSize}px</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Button size="sm" variant="outline" onClick={() => {
+                    if (maskCanvasRef.current) {
+                      const ctx = maskCanvasRef.current.getContext('2d')!;
+                      ctx.clearRect(0,0,maskCanvasRef.current.width, maskCanvasRef.current.height);
+                      setMaskDirty(false);
                     }
-                  }}
-                  placeholder="e.g., 'make the background a sunset'"
-                  className="w-full flex-1 resize-none text-sm p-2 bg-background border border-gray-300 dark:border-gray-600 rounded-md placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                  rows={3}
-                />
-              </div>
-              <div className="space-y-3">
-                <label className="text-sm font-medium">Brush Size</label>
-                <div className="flex items-center gap-4">
-                  <input type="range" min={4} max={64} value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} className="flex-1" />
-                  <span className="text-sm font-mono w-8 text-center">{brushSize}px</span>
+                  }}>Clear Mask</Button>
+                  <Button size="sm" variant="ghost" onClick={() => setShowMaskPreview(s => !s)}>{showMaskPreview ? 'Hide' : 'Show'} Mask</Button>
                 </div>
               </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <Button size="sm" variant="outline" onClick={() => {
-                  if (maskCanvasRef.current) {
-                    const ctx = maskCanvasRef.current.getContext('2d')!;
-                    ctx.clearRect(0,0,maskCanvasRef.current.width, maskCanvasRef.current.height);
-                    setMaskDirty(false);
-                  }
-                }}>Clear Mask</Button>
-                <Button size="sm" variant="ghost" onClick={() => setShowMaskPreview(s => !s)}>{showMaskPreview ? 'Hide' : 'Show'} Mask</Button>
-              </div>
-            </div>
+            )}
           </div>
           <DialogFooter className="p-6 mt-6 bg-muted/50 border-t flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2">
-            <Button onClick={() => performImageEdit(true)} disabled={!editPrompt || isEditing}>
-              {isEditing ? 'Editing...' : 'Edit'}
-            </Button>
+            {isEditMode && (
+              <Button onClick={() => performImageEdit(true)} disabled={!editPrompt || isEditing}>
+                {isEditing ? 'Editing...' : 'Apply Edit'}
+              </Button>
+            )}
             <Button onClick={() => downloadImage(viewerSrc)}>Download</Button>
           </DialogFooter>
         </DialogContent>
