@@ -15,13 +15,11 @@ import {
   SearchResult,
 } from "./services/embeddingService";
 import { getHybridMemoryService } from "./services/hybridMemoryService";
-import { extractDocumentTopics } from "./services/conversationService";
+import { extractDocumentTopics, getConversationService } from "./services/conversationService";
 import * as userProfileService from "./services/userProfileService";
 import { firebaseStorageService } from "./services/firebaseStorageService";
 import { localImageCacheService } from "./services/localImageCacheService";
-import {
-  extractTextFromDocument,
-} from "./services/documentExtractionService";
+import { extractTextFromDocument } from "./services/documentExtractionService";
 import { storeDocument, searchChunks } from "./services/documentCacheService";
 import {
   rateLimitMiddleware,
@@ -33,6 +31,7 @@ import {
 } from "./services/securityMiddleware";
 import { firestoreChatService } from "./services/firestoreChatService";
 import { getJobQueue } from "./services/jobQueue";
+import { getResponseCacheService } from "./services/responseCacheService";
 
 // Import performance optimizations with error handling
 let profileCache: any;
@@ -95,17 +94,18 @@ function isAllowedOrigin(origin: string): boolean {
   try {
     const url = new URL(origin);
     const hostname = url.hostname;
-    
+
     // Allow localhost and 127.0.0.1
-    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+    if (hostname === "localhost" || hostname === "127.0.0.1") {
       return true;
     }
-    
+
     // Allow private IP ranges: 10.x.x.x, 192.168.x.x, 172.16-31.x.x
     if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
     if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
-    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
-    
+    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname))
+      return true;
+
     return false;
   } catch {
     return false;
@@ -157,6 +157,16 @@ app.use((req, res, next) => {
   next();
 });
 
+// Body parser middleware with increased size limits (must come BEFORE routes)
+// Skip JSON parsing for multipart requests (multer handles those)
+app.use((req, res, next) => {
+  if (req.is("multipart/form-data")) {
+    return next(); // Let multer handle multipart
+  }
+  express.json({ limit: "50mb" })(req, res, next);
+});
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
 // Initialize Vertex AI client (preferred for scalability)
 let vertex: VertexAI | undefined;
 try {
@@ -199,7 +209,10 @@ try {
 
 // Unified generation helper using Vertex first, then Google as fallback
 type GenResult = { parts: any[]; raw: any; usage?: any };
-async function generateContent(args: { model: string; contents: any[] }): Promise<GenResult> {
+async function generateContent(args: {
+  model: string;
+  contents: any[];
+}): Promise<GenResult> {
   const { model, contents } = args;
   // Try Vertex first
   if (vertex) {
@@ -214,7 +227,11 @@ async function generateContent(args: { model: string; contents: any[] }): Promis
             parts: contents.map((t) => ({ text: String(t) })),
           },
         ];
-      } else if (contents[0] && typeof contents[0] === "object" && "parts" in contents[0]) {
+      } else if (
+        contents[0] &&
+        typeof contents[0] === "object" &&
+        "parts" in contents[0]
+      ) {
         vContents = [
           {
             role: "user",
@@ -225,17 +242,24 @@ async function generateContent(args: { model: string; contents: any[] }): Promis
         vContents = contents as any[];
       }
       const resp: any = await gm.generateContent({ contents: vContents });
-      const parts: any[] = resp?.response?.candidates?.[0]?.content?.parts ?? [];
+      const parts: any[] =
+        resp?.response?.candidates?.[0]?.content?.parts ?? [];
       const usage = resp?.response?.usageMetadata;
       return { parts, raw: resp, usage };
     } catch (err) {
-      console.warn("Vertex generateContent failed, will try Google fallback:", err);
+      console.warn(
+        "Vertex generateContent failed, will try Google fallback:",
+        err
+      );
     }
   }
 
   // Fallback: Google AI Studio client
   if (ai) {
-    const resp: any = await (ai as any).models.generateContent({ model, contents });
+    const resp: any = await (ai as any).models.generateContent({
+      model,
+      contents,
+    });
     const parts: any[] = resp?.candidates?.[0]?.content?.parts ?? [];
     const usage = resp?.usageMetadata;
     return { parts, raw: resp, usage };
@@ -244,8 +268,108 @@ async function generateContent(args: { model: string; contents: any[] }): Promis
   throw new Error("No AI client initialized");
 }
 
+/**
+ * Generate content with streaming support (Server-Sent Events)
+ * Returns an async generator that yields text chunks as they arrive
+ */
+async function* generateContentStream(args: {
+  model: string;
+  contents: any[];
+}): AsyncGenerator<string, void, unknown> {
+  const { model, contents } = args;
+  
+  // Try Vertex first (preferred for streaming)
+  if (vertex) {
+    try {
+      const gm = vertex.getGenerativeModel({ model });
+      
+      // Normalize contents to Vertex format
+      let vContents: any[];
+      if (typeof contents[0] === "string") {
+        vContents = [
+          {
+            role: "user",
+            parts: contents.map((t) => ({ text: String(t) })),
+          },
+        ];
+      } else if (
+        contents[0] &&
+        typeof contents[0] === "object" &&
+        "parts" in contents[0]
+      ) {
+        vContents = [
+          {
+            role: "user",
+            parts: (contents[0] as any).parts,
+          },
+        ];
+      } else {
+        vContents = contents as any[];
+      }
+      
+      // Use generateContentStream for real-time chunks
+      const streamResult = await gm.generateContentStream({ contents: vContents });
+      
+      // Yield each chunk as it arrives
+      for await (const chunk of streamResult.stream) {
+        const chunkText = chunk.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        if (chunkText) {
+          yield chunkText;
+        }
+      }
+      
+      return;
+    } catch (err) {
+      console.warn(
+        "Vertex streaming failed, falling back to non-streaming:",
+        err
+      );
+    }
+  }
+
+  // Fallback: Google AI Studio doesn't support streaming well, so use regular generation
+  if (ai) {
+    const resp: any = await (ai as any).models.generateContent({
+      model,
+      contents,
+    });
+    const parts: any[] = resp?.candidates?.[0]?.content?.parts ?? [];
+    const fullText = parts.map((p: any) => p.text ?? "").join("");
+    
+    // Simulate streaming by yielding in chunks for consistent UX
+    const chunkSize = 50;
+    for (let i = 0; i < fullText.length; i += chunkSize) {
+      yield fullText.substring(i, i + chunkSize);
+      // Small delay to simulate streaming
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    
+    return;
+  }
+
+  throw new Error("No AI client initialized");
+}
+
 // In-flight request locks per user/chat to prevent concurrent generations
 const inFlightChatRequests: Map<string, NodeJS.Timeout> = new Map();
+
+// 🎯 Intent Caching - Module-level cache for classification results
+const intentCache = new Map<
+  string,
+  {
+    intent: "imageEdit" | "visionQA" | "imageGenerate" | "text";
+    confidence: number;
+    timestamp: number;
+  }
+>();
+
+const INTENT_CACHE_TTL = parseInt(process.env.INTENT_CACHE_TTL || "60000"); // 1 minute default
+let cacheHits = 0;
+let cacheMisses = 0;
+
+// 📊 Intent Analytics - Track which intents users request
+const intentAnalytics = new Map<string, number>();
+const classificationTimes: number[] = [];
 
 // Home / health
 app.get("/api", (req, res) => res.json({ ok: true }));
@@ -269,38 +393,19 @@ process.on("unhandledRejection", (reason, promise) => {
  * OR multipart/form-data: { prompt, image (file), type, userId, ... }
  * 🔒 SECURITY: Rate limited, input validated
  */
-app.post("/api/ask-ai", express.json(), upload.single('image'), rateLimitMiddleware("general"), async (req, res) => {
-  if (!vertex && !ai)
-    return res.status(500).json({ error: "AI client not initialized" });
+app.post(
+  "/api/ask-ai",
+  upload.single("image"),
+  rateLimitMiddleware("general"),
+  async (req, res) => {
+    if (!vertex && !ai)
+      return res.status(500).json({ error: "AI client not initialized" });
 
-  try {
-    console.log("📥 Request received at /api/ask-ai");
-    
-    // Handle both multipart (with image file) and JSON requests
-    let prompt, chatId, userId, model, temperature, max_tokens, memory, documentId, conversationHistory, conversationSummary, messageCount, userName, type, imageBase64;
-    
-    if (req.file) {
-      // Multipart request with image file
-      console.log("🖼️ Multipart request with image file");
-      imageBase64 = req.file.buffer.toString('base64');
-      prompt = req.body.prompt;
-      chatId = req.body.chatId;
-      userId = req.body.userId;
-      model = req.body.model;
-      temperature = req.body.temperature;
-      max_tokens = req.body.max_tokens;
-      memory = req.body.memory;
-      documentId = req.body.documentId;
-      messageCount = req.body.messageCount;
-      userName = req.body.userName;
-      // Default to text/vision analysis when an image file is uploaded
-      // (image generation is only triggered explicitly or when no image is uploaded)
-      type = req.body.type || 'text';
-      // Note: conversationHistory and conversationSummary are typically not sent with images
-    } else {
-      // JSON request
-      ({
-        prompt,
+    try {
+      console.log("📥 Request received at /api/ask-ai");
+
+      // Handle both multipart (with image file) and JSON requests
+      let prompt,
         chatId,
         userId,
         model,
@@ -313,214 +418,277 @@ app.post("/api/ask-ai", express.json(), upload.single('image'), rateLimitMiddlew
         messageCount,
         userName,
         type,
-      } = req.body);
-    }
+        imageBase64;
 
-  const useMemory = memory !== false; // Default to true if not specified
-
-  // Normalize type to handle typos like "iamge", synonyms like "img", etc.
-  const normalizedType = normalizeRequestType(type);
-
-    if (!prompt) {
-      return res.status(400).json({ error: "Prompt is required" });
-    }
-
-    // � Concurrency guard per user/chat
-    const keyUser = userId || "anonymous";
-    const keyChat = chatId || "global";
-    const inFlightKey = `${keyUser}:${keyChat}`;
-    if (inFlightChatRequests.has(inFlightKey)) {
-      return res.status(409).json({
-        success: false,
-        error: "Another request is already processing for this chat. Please wait for it to finish.",
-      });
-    }
-    // Set a TTL to avoid stale locks (e.g., 2 minutes)
-    const ttl = setTimeout(() => {
-      inFlightChatRequests.delete(inFlightKey);
-      console.warn(`⏱️ Cleared stale lock for ${inFlightKey}`);
-    }, 2 * 60 * 1000);
-    inFlightChatRequests.set(inFlightKey, ttl);
-
-    // �🔒 Validate prompt
-    const promptValidation = SecurityValidator.validatePrompt(prompt);
-    if (!promptValidation.valid) {
-      logSecurityEvent("Invalid prompt blocked", {
-        userId,
-        error: promptValidation.error,
-      });
-      return res.status(400).json({ error: promptValidation.error });
-    }
-
-    // 🔒 Validate userId if provided
-    if (userId) {
-      const userIdValidation = SecurityValidator.validateUserId(userId);
-      if (!userIdValidation.valid) {
-        logSecurityEvent("Invalid userId blocked", {
-          userId,
-          error: userIdValidation.error,
-        });
-        return res.status(400).json({ error: userIdValidation.error });
-      }
-    }
-
-    // 🔒 Validate chatId if provided
-    if (chatId) {
-      const chatIdValidation = SecurityValidator.validateChatId(chatId);
-      if (!chatIdValidation.valid) {
-        logSecurityEvent("Invalid chatId blocked", {
-          userId,
+      if (req.file) {
+        // Multipart request with image file
+        console.log("🖼️ Multipart request with image file");
+        imageBase64 = req.file.buffer.toString("base64");
+        prompt = req.body.prompt;
+        chatId = req.body.chatId;
+        userId = req.body.userId;
+        model = req.body.model;
+        temperature = req.body.temperature;
+        max_tokens = req.body.max_tokens;
+        memory = req.body.memory;
+        documentId = req.body.documentId;
+        messageCount = req.body.messageCount;
+        userName = req.body.userName;
+        // Default to text/vision analysis when an image file is uploaded
+        // (image generation is only triggered explicitly or when no image is uploaded)
+        type = req.body.type || "text";
+        // Note: conversationHistory and conversationSummary are typically not sent with images
+      } else {
+        // JSON request
+        ({
+          prompt,
           chatId,
-          error: chatIdValidation.error,
-        });
-        return res.status(400).json({ error: chatIdValidation.error });
+          userId,
+          model,
+          temperature,
+          max_tokens,
+          memory,
+          documentId,
+          conversationHistory,
+          conversationSummary,
+          messageCount,
+          userName,
+          type,
+        } = req.body);
       }
-    }
 
-    // For testing purposes, use anoop123 if no userId provided
-    const effectiveUserId = userId || "anoop123";
-    const effectiveChatId = chatId; // 🎯 NEW! Get chatId from request
-    const effectiveMessageCount =
-      messageCount !== undefined ? messageCount : undefined; // 🎯 NEW! Track message count
+      const useMemory = memory !== false; // Default to true if not specified
 
-    // 🎯 AUTO-CREATE PROFILE: If user doesn't have a profile yet, create one with their name
-    if (effectiveUserId && userName) {
-      const existingProfile =
-        userProfileService.getUserProfile(effectiveUserId);
-      if (!existingProfile) {
-        userProfileService.upsertUserProfile(effectiveUserId, {
-          name: userName,
-        });
-        console.log(
-          `✅ Auto-created profile for ${effectiveUserId} (name: ${userName})`
-        );
+      // Normalize type to handle typos like "iamge", synonyms like "img", etc.
+      const normalizedType = normalizeRequestType(type);
+
+      if (!prompt) {
+        return res.status(400).json({ error: "Prompt is required" });
       }
-    }
 
-    console.log(
-      `💬 Chat request - User: ${effectiveUserId}, Chat: ${effectiveChatId || "none"}, Message#: ${effectiveMessageCount !== undefined ? effectiveMessageCount + 1 : "?"}, History: ${conversationHistory?.length || 0} msgs, Memory: ${useMemory}, Prompt: "${prompt.substring(0, 50)}..."`
-    );
+      // � Concurrency guard per user/chat
+      const keyUser = userId || "anonymous";
+      const keyChat = chatId || "global";
+      const inFlightKey = `${keyUser}:${keyChat}`;
+      if (inFlightChatRequests.has(inFlightKey)) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "Another request is already processing for this chat. Please wait for it to finish.",
+        });
+      }
+      // Set a TTL to avoid stale locks (e.g., 2 minutes)
+      const ttl = setTimeout(
+        () => {
+          inFlightChatRequests.delete(inFlightKey);
+          console.warn(`⏱️ Cleared stale lock for ${inFlightKey}`);
+        },
+        2 * 60 * 1000
+      );
+      inFlightChatRequests.set(inFlightKey, ttl);
 
-    let enhancedPrompt = prompt;
+      // �🔒 Validate prompt
+      const promptValidation = SecurityValidator.validatePrompt(prompt);
+      if (!promptValidation.valid) {
+        logSecurityEvent("Invalid prompt blocked", {
+          userId,
+          error: promptValidation.error,
+        });
+        return res.status(400).json({ error: promptValidation.error });
+      }
 
-    // Smart memory search decision - determine search depth based on query complexity
-    const determineSearchStrategy = (
-      query: string,
-      messageCount: number
-    ): "full" | "profile-only" | "skip" => {
-      const queryLower = query.toLowerCase().trim();
+      // 🔒 Validate userId if provided
+      if (userId) {
+        const userIdValidation = SecurityValidator.validateUserId(userId);
+        if (!userIdValidation.valid) {
+          logSecurityEvent("Invalid userId blocked", {
+            userId,
+            error: userIdValidation.error,
+          });
+          return res.status(400).json({ error: userIdValidation.error });
+        }
+      }
 
-      // 1. For greetings, use profile-only (so AI can greet by name!)
-      const greetingPatterns = [
-        /^(hi|hello|hey|sup|yo|greetings|morning|afternoon|evening)$/i,
-        /^(hi|hello|hey|sup|yo|greetings|morning|afternoon|evening)\s/i, // With extra text
-      ];
-      if (greetingPatterns.some((pattern) => pattern.test(queryLower))) {
-        // Use profile for first few messages (greeting) - messageCount can be 0, 1, or 2
-        if (messageCount <= 2) {
+      // 🔒 Validate chatId if provided
+      if (chatId) {
+        const chatIdValidation = SecurityValidator.validateChatId(chatId);
+        if (!chatIdValidation.valid) {
+          logSecurityEvent("Invalid chatId blocked", {
+            userId,
+            chatId,
+            error: chatIdValidation.error,
+          });
+          return res.status(400).json({ error: chatIdValidation.error });
+        }
+      }
+
+      // For testing purposes, use anoop123 if no userId provided
+      const effectiveUserId = userId || "anoop123";
+      const effectiveChatId = chatId; // 🎯 NEW! Get chatId from request
+      const effectiveMessageCount =
+        messageCount !== undefined ? messageCount : undefined; // 🎯 NEW! Track message count
+
+      // 🎯 AUTO-CREATE PROFILE: If user doesn't have a profile yet, create one with their name
+      if (effectiveUserId && userName) {
+        const existingProfile =
+          userProfileService.getUserProfile(effectiveUserId);
+        if (!existingProfile) {
+          userProfileService.upsertUserProfile(effectiveUserId, {
+            name: userName,
+          });
+          console.log(
+            `✅ Auto-created profile for ${effectiveUserId} (name: ${userName})`
+          );
+        }
+      }
+
+      console.log(
+        `💬 Chat request - User: ${effectiveUserId}, Chat: ${effectiveChatId || "none"}, Message#: ${effectiveMessageCount !== undefined ? effectiveMessageCount + 1 : "?"}, History: ${conversationHistory?.length || 0} msgs, Memory: ${useMemory}, Prompt: "${prompt.substring(0, 50)}..."`
+      );
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // 💾 RESPONSE CACHE: Check if we have a cached response
+      // Skip cache for image requests and document-based queries
+      // ═══════════════════════════════════════════════════════════════════════
+      const cacheService = getResponseCacheService();
+      if (normalizedType === "text" && !imageBase64 && !documentId) {
+        const cachedResponse = cacheService.get(prompt, effectiveUserId);
+        if (cachedResponse) {
+          const cacheStats = cacheService.getStats();
+          return res.json({
+            success: true,
+            text: cachedResponse,
+            cached: true,
+            metadata: {
+              tokens: 0,
+              duration: 0,
+              cacheHitRate: cacheStats.hitRate,
+              instant: true,
+            },
+          });
+        }
+      }
+
+      let enhancedPrompt = prompt;
+
+      // Smart memory search decision - determine search depth based on query complexity
+      const determineSearchStrategy = (
+        query: string,
+        messageCount: number
+      ): "full" | "profile-only" | "skip" => {
+        const queryLower = query.toLowerCase().trim();
+
+        // 1. For greetings, use profile-only (so AI can greet by name!)
+        const greetingPatterns = [
+          /^(hi|hello|hey|sup|yo|greetings|morning|afternoon|evening)$/i,
+          /^(hi|hello|hey|sup|yo|greetings|morning|afternoon|evening)\s/i, // With extra text
+        ];
+        if (greetingPatterns.some((pattern) => pattern.test(queryLower))) {
+          // Use profile for first few messages (greeting) - messageCount can be 0, 1, or 2
+          if (messageCount <= 2) {
+            return "profile-only";
+          }
+          // Skip for subsequent greetings
+          return "skip";
+        }
+
+        // 2. Skip simple acknowledgments
+        const skipPatterns = [
+          /^(thanks|thank you|thx|ty)$/i,
+          /^(yes|no|yep|nope|yeah|nah)$/i,
+        ];
+        if (skipPatterns.some((pattern) => pattern.test(queryLower))) {
+          return "skip";
+        }
+
+        // 3. ALWAYS do full search if user explicitly references memory/past
+        const memoryKeywords = [
+          "remember",
+          "recall",
+          "earlier",
+          "before",
+          "previous",
+          "last time",
+          "we discussed",
+          "you said",
+          "you told",
+          "conversation",
+          "history",
+          "ago",
+          "yesterday",
+        ];
+        if (memoryKeywords.some((kw) => queryLower.includes(kw))) {
+          return "full";
+        }
+
+        // 4. For short personal questions (name, preferences, etc), use profile only
+        const personalKeywords = [
+          "my name",
+          "who am i",
+          "what's my",
+          "whats my",
+          "do you know me",
+          "about me",
+          "i work",
+          "i like",
+          "my preference",
+          "my favorite",
+          "my role",
+        ];
+        if (
+          query.length < 30 &&
+          personalKeywords.some((kw) => queryLower.includes(kw))
+        ) {
           return "profile-only";
         }
-        // Skip for subsequent greetings
-        return "skip";
-      }
 
-      // 2. Skip simple acknowledgments
-      const skipPatterns = [
-        /^(thanks|thank you|thx|ty)$/i,
-        /^(yes|no|yep|nope|yeah|nah)$/i,
-      ];
-      if (skipPatterns.some((pattern) => pattern.test(queryLower))) {
-        return "skip";
-      }
+        // 5. For longer queries or complex questions, do full search
+        if (query.length >= 30) {
+          return "full";
+        }
 
-      // 3. ALWAYS do full search if user explicitly references memory/past
-      const memoryKeywords = [
-        "remember",
-        "recall",
-        "earlier",
-        "before",
-        "previous",
-        "last time",
-        "we discussed",
-        "you said",
-        "you told",
-        "conversation",
-        "history",
-        "ago",
-        "yesterday",
-      ];
-      if (memoryKeywords.some((kw) => queryLower.includes(kw))) {
-        return "full";
-      }
-
-      // 4. For short personal questions (name, preferences, etc), use profile only
-      const personalKeywords = [
-        "my name",
-        "who am i",
-        "what's my",
-        "whats my",
-        "do you know me",
-        "about me",
-        "i work",
-        "i like",
-        "my preference",
-        "my favorite",
-        "my role",
-      ];
-      if (
-        query.length < 30 &&
-        personalKeywords.some((kw) => queryLower.includes(kw))
-      ) {
+        // 6. Medium queries - use profile only (lightweight)
         return "profile-only";
-      }
+      };
 
-      // 5. For longer queries or complex questions, do full search
-      if (query.length >= 30) {
-        return "full";
-      }
-
-      // 6. Medium queries - use profile only (lightweight)
-      return "profile-only";
-    };
-
-    // Use memory system based on search strategy
-  if (useMemory && normalizedType === "text") {
-      // ⚡ OPTIMIZATION: Use smart strategy determination
-      const memoryStrategy = determineMemoryStrategy(
-        prompt,
-        effectiveMessageCount || 0
-      );
-      console.log(`🎯 Memory strategy selected: ${memoryStrategy}`);
-
-      let strategy: "full" | "profile-only" | "skip" = "profile-only";
-
-      if (memoryStrategy === "none") {
-        strategy = "skip";
-      } else if (memoryStrategy === "search") {
-        strategy = "full";
-      } else if (memoryStrategy === "cache" && effectiveChatId) {
-        // Try to use cached context first
-        const cachedTurns = recentContextCache.get(
-          effectiveUserId,
-          effectiveChatId
+      // Use memory system based on search strategy
+      if (useMemory && normalizedType === "text") {
+        // ⚡ OPTIMIZATION: Use smart strategy determination
+        const memoryStrategy = determineMemoryStrategy(
+          prompt,
+          effectiveMessageCount || 0
         );
-        if (
-          cachedTurns &&
-          Array.isArray(cachedTurns) &&
-          cachedTurns.length > 0
-        ) {
-          console.log(
-            `⚡ Using cached context (${cachedTurns.length} turns) - instant retrieval!`
-          );
-          // Build prompt from cached turns
-          const contextText = cachedTurns
-            .map(
-              (turn: any) =>
-                `User: ${turn.userMessage}\nAssistant: ${turn.aiResponse}`
-            )
-            .join("\n\n");
+        console.log(`🎯 Memory strategy selected: ${memoryStrategy}`);
 
-          enhancedPrompt = `SYSTEM: You are NubiqAI ✨
+        let strategy: "full" | "profile-only" | "skip" = "profile-only";
+
+        if (memoryStrategy === "none") {
+          strategy = "skip";
+        } else if (memoryStrategy === "search") {
+          strategy = "full";
+        } else if (memoryStrategy === "cache" && effectiveChatId) {
+          // Try to use cached context first
+          const cachedTurns = recentContextCache.get(
+            effectiveUserId,
+            effectiveChatId
+          );
+          if (
+            cachedTurns &&
+            Array.isArray(cachedTurns) &&
+            cachedTurns.length > 0
+          ) {
+            console.log(
+              `⚡ Using cached context (${cachedTurns.length} turns) - instant retrieval!`
+            );
+            // Build prompt from cached turns
+            const contextText = cachedTurns
+              .map(
+                (turn: any) =>
+                  `User: ${turn.userMessage}\nAssistant: ${turn.aiResponse}`
+              )
+              .join("\n\n");
+
+            enhancedPrompt = `SYSTEM: You are NubiqAI ✨
 
 RECENT CONVERSATION:
 ${contextText}
@@ -530,56 +698,66 @@ ${prompt}
 
 Respond naturally.`;
 
-          strategy = "skip"; // Skip full memory search
-        } else {
-          strategy = "profile-only"; // Fall back to profile
-        }
-      }
-
-      const originalStrategy = determineSearchStrategy(
-        prompt,
-        effectiveMessageCount || 0
-      );
-
-      if (strategy === "skip") {
-        console.log("⏭️ Skipping memory - simple greeting/acknowledgment");
-      } else if (strategy === "profile-only") {
-        // Lightweight: Only use user profile (no expensive searches)
-        console.log(
-          "👤 Using profile-only memory (lightweight) for user:",
-          effectiveUserId
-        );
-        try {
-          // ⚡ OPTIMIZATION: Check cache first
-          let profileContextCached = profileCache.get(effectiveUserId);
-          let profileContext: string | null = null;
-
-          if (profileContextCached === undefined) {
-            // Cache miss - fetch from service
-            console.log("📥 Profile cache miss - fetching from service");
-            profileContext =
-              userProfileService.generateProfileContext(effectiveUserId);
-            // Cache the profile object for future use
-            const profile = userProfileService.getUserProfile(effectiveUserId);
-            profileCache.set(effectiveUserId, profile);
+            strategy = "skip"; // Skip full memory search
           } else {
-            console.log("⚡ Profile cache hit - instant retrieval!");
-            // Generate context from cached profile
-            profileContext = profileContextCached
-              ? userProfileService.generateProfileContext(effectiveUserId)
-              : null;
+            strategy = "profile-only"; // Fall back to profile
           }
+        }
 
-          if (profileContext) {
-            enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent assistant with persistent memory.
+        const originalStrategy = determineSearchStrategy(
+          prompt,
+          effectiveMessageCount || 0
+        );
 
-⚠️ CRITICAL: NEVER use # ## ### or * symbols in your response!
+        if (strategy === "skip") {
+          console.log("⏭️ Skipping memory - simple greeting/acknowledgment");
+        } else if (strategy === "profile-only") {
+          // Lightweight: Only use user profile (no expensive searches)
+          console.log(
+            "👤 Using profile-only memory (lightweight) for user:",
+            effectiveUserId
+          );
+          try {
+            // ⚡ OPTIMIZATION: Check cache first
+            let profileContextCached = profileCache.get(effectiveUserId);
+            let profileContext: string | null = null;
 
-🎯 CORRECT FORMAT:
-Write naturally with emojis at the start of sections
-Use 1️⃣ 2️⃣ 3️⃣ for numbered lists
-Use ✅ for list items, NOT asterisks
-Add blank lines between topics
+            if (profileContextCached === undefined) {
+              // Cache miss - fetch from service
+              console.log("📥 Profile cache miss - fetching from service");
+              profileContext =
+                userProfileService.generateProfileContext(effectiveUserId);
+              // Cache the profile object for future use
+              const profile =
+                userProfileService.getUserProfile(effectiveUserId);
+              profileCache.set(effectiveUserId, profile);
+            } else {
+              console.log("⚡ Profile cache hit - instant retrieval!");
+              // Generate context from cached profile
+              profileContext = profileContextCached
+                ? userProfileService.generateProfileContext(effectiveUserId)
+                : null;
+            }
+
+            if (profileContext) {
+              enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent assistant with persistent memory.
+
+📝 **FORMATTING GUIDELINES** (Use ChatGPT-style markdown):
+- Use **bold** for emphasis and key terms
+- Use *italic* for subtle emphasis
+- Use ## for section headings (not # which is too large)
+- Use ### for subsections
+- Use \`code\` for technical terms, commands, or code snippets
+- Use bullet points with - or * for lists
+- Use 1. 2. 3. for numbered lists
+- Add blank lines between sections for readability
+- Use > for quotes or important callouts
+- Use code blocks with \`\`\`language for multi-line code
+
+⚠️ **CRITICAL INSTRUCTIONS**:
+- Do NOT address the user by name (e.g., "Okay, [Name]" or "Hi [Name]")
+- When user asks "do you know about X" or "tell me about X", provide comprehensive detailed information
+- Treat "write an article" or "tell me about" as requests for full content, not just confirmation
 
 ${"=".repeat(60)}
 👤 USER PROFILE:
@@ -589,279 +767,180 @@ ${"=".repeat(60)}
 💬 CURRENT USER QUESTION:
 ${prompt}
 
-🎨 Respond using ONLY emojis and natural text. NO markdown symbols!`;
+💡 Respond like ChatGPT: For CODE - use "Here's a [type] example 👍", add "💡 How to use it:" steps, "🔑 Key Points" section. For EXPLANATIONS - use ## headings with emojis, **bold** key terms, end with follow-up question. Be engaging and educational!`;
 
-            console.log("✅ Enhanced prompt with user profile context");
-          } else {
-            console.log("❌ No user profile found for", effectiveUserId);
-          }
-        } catch (error) {
-          console.warn("⚠️ Profile lookup failed:", error);
-        }
-      } else {
-        // Full search: Use hybrid memory (local + Pinecone + profile)
-        try {
-          const hybridMemoryService = getHybridMemoryService();
-          console.log(
-            `🧠 Using full hybrid memory search for user: ${effectiveUserId}${effectiveChatId ? `, chat: ${effectiveChatId}` : ""}`
-          );
-
-          const memoryResult = await hybridMemoryService.searchMemory(
-            effectiveUserId,
-            prompt,
-            effectiveChatId,
-            effectiveMessageCount,
-            {
-              maxLocalResults: 3,
-              maxLongTermResults: 1, // ⚡ OPTIMIZED: Reduced from 2 to 1 (saves 100-200ms)
-              localWeight: 0.8,
-              threshold: 0.35, // ⚡ OPTIMIZED: Slightly higher threshold (faster, more relevant)
-              skipPineconeIfLocalFound: true,
-              minLocalResultsForSkip: 2,
+              console.log("✅ Enhanced prompt with user profile context");
+            } else {
+              console.log("❌ No user profile found for", effectiveUserId);
             }
-          );
-
-          console.log(
-            `🧠 Memory search results - Type: ${memoryResult.type}, Local: ${memoryResult.resultCount.local}, Long-term: ${memoryResult.resultCount.longTerm}`
-          );
-
-          if (memoryResult.optimization?.skippedPinecone) {
-            console.log(
-              `💰 Cost optimization: ${memoryResult.optimization.reason}`
-            );
+          } catch (error) {
+            console.warn("⚠️ Profile lookup failed:", error);
           }
+        } else {
+          // Full search: Use hybrid memory (local + Pinecone + profile)
+          try {
+            const hybridMemoryService = getHybridMemoryService();
+            console.log(
+              `🧠 Using full hybrid memory search for user: ${effectiveUserId}${effectiveChatId ? `, chat: ${effectiveChatId}` : ""}`
+            );
 
-          if (
-            memoryResult.combinedContext &&
-            memoryResult.combinedContext !==
-              "No relevant conversation history found."
-          ) {
-            // 🔎 NEW: Build a compact rolling summary to lead the context
-            let rollingSummarySection = '';
-            try {
-              const roll = await buildRollingSummary(effectiveUserId, effectiveChatId);
-              if (roll) {
-                const facts = roll.keyFacts.map((f) => `• ${f}`).join("\n");
-                rollingSummarySection = `${"=".repeat(60)}\n🧾 ROLLING SUMMARY\n${"=".repeat(60)}\n\n${roll.summary}\n\nKEY FACTS:\n${facts}\n`;
+            const memoryResult = await hybridMemoryService.searchMemory(
+              effectiveUserId,
+              prompt,
+              effectiveChatId,
+              effectiveMessageCount,
+              {
+                maxLocalResults: 3,
+                maxLongTermResults: 1, // ⚡ OPTIMIZED: Reduced from 2 to 1 (saves 100-200ms)
+                localWeight: 0.8,
+                threshold: 0.35, // ⚡ OPTIMIZED: Slightly higher threshold (faster, more relevant)
+                skipPineconeIfLocalFound: true,
+                minLocalResultsForSkip: 2,
               }
-            } catch (e) {
-              console.warn('⚠️ Rolling summary generation failed (non-fatal):', e);
+            );
+
+            console.log(
+              `🧠 Memory search results - Type: ${memoryResult.type}, Local: ${memoryResult.resultCount.local}, Long-term: ${memoryResult.resultCount.longTerm}`
+            );
+
+            if (memoryResult.optimization?.skippedPinecone) {
+              console.log(
+                `💰 Cost optimization: ${memoryResult.optimization.reason}`
+              );
             }
 
-            enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent, helpful assistant with persistent memory and excellent communication skills.
+            if (
+              memoryResult.combinedContext &&
+              memoryResult.combinedContext !==
+                "No relevant conversation history found."
+            ) {
+              // 🔎 NEW: Build a compact rolling summary to lead the context
+              let rollingSummarySection = "";
+              try {
+                const roll = await buildRollingSummary(
+                  effectiveUserId,
+                  effectiveChatId
+                );
+                if (roll) {
+                  const facts = roll.keyFacts.map((f) => `• ${f}`).join("\n");
+                  rollingSummarySection = `${"=".repeat(60)}\n🧾 ROLLING SUMMARY\n${"=".repeat(60)}\n\n${roll.summary}\n\nKEY FACTS:\n${facts}\n`;
+                }
+              } catch (e) {
+                console.warn(
+                  "⚠️ Rolling summary generation failed (non-fatal):",
+                  e
+                );
+              }
 
-⚠️ CRITICAL FORMATTING RULES - READ CAREFULLY:
+              enhancedPrompt = `You are NubiqAI ✨ - helpful AI assistant with memory.
 
-🚫 NEVER EVER USE THESE SYMBOLS:
-DO NOT use # or ## or ### for headers
-DO NOT use * or ** for bold or bullets  
-DO NOT use - for lists
-DO NOT use markdown syntax at all
-These symbols make responses look technical and ugly!
+⚠️ RULES:
+- Never use user's name
+- Answer "do you know X" with full explanations, not "yes I know"
+- "write an article" = detailed content
 
-✅ INSTEAD USE THIS FORMAT:
 
-For lists, write like this:
-"🎯 Main Topic
+📝 FORMAT:
+**CODE:** "Here's [type] 👍" + code + "💡 How to:" (steps) + "🔑 Key:" (concepts) + question
+**EXPLAIN:** ## headings + **bold** terms + bullets + "💡 Summary"
 
-✅ First point - explanation here
-✅ Second point - explanation here  
-✅ Third point - explanation here"
-
-For sections, write like this:
-"💡 Important Information
-
-Here is the explanation in natural sentences. Use emojis to mark important points ✅ or warnings ⚠️ within the text itself.
-
-🚀 Next Section
-
-More content here with emojis naturally integrated into the text flow."
-
-For steps, write like this:
-"🎯 How to Do Something
-
-1️⃣ First do this - clear explanation
-2️⃣ Then do this - more details
-3️⃣ Finally do this - wrap up"
-
-🎯 YOUR CORE CAPABILITIES:
-🧠 Access to conversation history and user profile information
-💭 Remember past conversations and reference them naturally
-📝 Provide well-structured, visually appealing responses
-🤝 Confident, friendly, and professional communication
-🎨 Creative use of emojis for better readability
-
-💬 WRITING STYLE:
-Write in natural, flowing sentences
-Use emojis at the START of new ideas, not as bullets
-Add blank lines between different topics
-Keep paragraphs short (2-3 sentences)
-Be warm, friendly, and conversational 😊
-
-🎭 EMOJI USAGE (use strategically):
-Sections: �, �, ⚡, �, �, �, 🌟
-Lists: ✅, ▶️, �, ⭐
-Steps: 1️⃣, 2️⃣, 3️⃣, 4️⃣, 5️⃣
-Important: ⚠️, 🔥, �, 🎯
-Tips: 💡, 🎓, ⭐
-Positive: ✅, 🎉, �, �
-Questions: ❓, 🤔, �
-
-🚫 ABSOLUTELY FORBIDDEN:
-### Headers like this
-** Bold like this **
-* Bullet points like this
-- List items like this
-Any markdown syntax
-
-✅ CORRECT EXAMPLES:
-
-Example 1:
-"Hey there! 👋
-
-🎯 Coffee Making Guide
-
-Making great coffee is easy! Let me show you three popular methods.
-
-☕ Drip Coffee Machine
-
-1️⃣ Add filter to the basket
-2️⃣ Add 2 tablespoons of ground coffee per 6 ounces of water
-3️⃣ Pour cold water into the reservoir
-4️⃣ Turn it on and wait for the magic! ✨
-
-🇫🇷 French Press
-
-1️⃣ Add coarse-ground coffee to the press
-2️⃣ Pour hot water (around 200°F)
-3️⃣ Let it steep for 4 minutes
-4️⃣ Press down slowly and pour
-
-💡 Pro Tip: Always use fresh, cold filtered water for the best taste!
-
-Which method sounds good to you? 😊"
-
-Example 2:
-"🎯 Five Productivity Tips
-
-Here are some game-changing strategies:
-
-1️⃣ Time Blocking
-Schedule specific tasks in your calendar. This keeps you focused and prevents multitasking chaos!
-
-2️⃣ Pomodoro Technique  
-Work for 25 minutes, then take a 5-minute break. Your brain will thank you! ⏰
-
-3️⃣ Single-Tasking
-Focus on ONE thing at a time. Studies show multitasking kills productivity by 40%!
-
-4️⃣ Morning Routine
-Tackle your hardest task first thing. Your willpower is strongest in the AM! 🌅
-
-5️⃣ Regular Breaks
-Step away every hour. Movement and fresh air reset your mind.
-
-Which tip will you try first? 🚀"
-
-❌ WRONG EXAMPLES (NEVER DO THIS):
-
-### This is wrong - no hashtags!
-** This is wrong - no asterisks! **
-* This is wrong - no bullet symbols!
-- This is wrong - no dashes!
-
-${"=".repeat(60)}
-🧠 CONVERSATION HISTORY & USER PROFILE:
+============================================================
+🧠 CONTEXT:
 ${rollingSummarySection}${memoryResult.combinedContext}
-${"=".repeat(60)}
+============================================================
 
-💬 CURRENT USER QUESTION:
-${prompt}
+💬 Q: ${prompt}
 
-🎨 NOW RESPOND: Use the correct format shown above. Natural language with emojis. NO # or * symbols. Make it visually beautiful and easy to read!`;
+Be engaging!`;
 
-            console.log(
-              `✅ Enhanced prompt with ${memoryResult.type} memory context + structured response instructions`
-            );
-          } else {
-            console.log(
-              `❌ No relevant memory context found for user ${effectiveUserId}`
+              console.log(
+                `✅ Enhanced prompt with ${memoryResult.type} memory context + ChatGPT-style formatting`
+              );
+            } else {
+              console.log(
+                `❌ No relevant memory context found for user ${effectiveUserId}`
+              );
+            }
+          } catch (memoryError) {
+            console.warn(
+              "⚠️ Hybrid memory search failed, proceeding without memory context:",
+              memoryError
             );
           }
-        } catch (memoryError) {
-          console.warn(
-            "⚠️ Hybrid memory search failed, proceeding without memory context:",
-            memoryError
-          );
         }
       }
-    }
 
-    // 💬 Add conversation history from current chat for context continuity
-    if (conversationHistory && conversationHistory.length > 0) {
-      const historyText = conversationHistory
-        .map((msg: any) => `${msg.role.toUpperCase()}: ${msg.content}`)
-        .join("\n\n");
+      // 💬 Add conversation history from current chat for context continuity
+      // 🎯 SMART CONTEXT SELECTION: Only last 5 messages + summarize older ones
+      if (conversationHistory && conversationHistory.length > 0) {
+        const maxRecentMessages = 5;
+        
+        // Split into recent and older messages
+        const recentMessages = conversationHistory.slice(-maxRecentMessages);
+        const olderMessages = conversationHistory.slice(0, -maxRecentMessages);
+        
+        // Build recent conversation text
+        const historyText = recentMessages
+          .map((msg: any) => `${msg.role.toUpperCase()}: ${msg.content}`)
+          .join("\n\n");
 
-      // Add summary of older messages if provided
-      const summarySection = conversationSummary 
-        ? `\n\n📚 OLDER MESSAGES CONTEXT:\n${conversationSummary}\n${"=".repeat(60)}\n\n`
-        : '';
+        // Summarize older messages if they exist (instead of including full text)
+        let summarySection = "";
+        if (conversationSummary) {
+          summarySection = `\n\n📚 OLDER MESSAGES:\n${conversationSummary}\n${"=".repeat(60)}\n\n`;
+        } else if (olderMessages.length > 0) {
+          // Create a quick summary of older messages
+          const topicsFromOlder = olderMessages
+            .map((msg: any) => msg.content.substring(0, 50))
+            .slice(0, 3) // Only first 3
+            .join(", ");
+          summarySection = `\n\n📚 EARLIER CONTEXT: User discussed ${topicsFromOlder}...\n${"=".repeat(60)}\n\n`;
+        }
 
-      enhancedPrompt = `${summarySection}RECENT CONVERSATION (LAST ${conversationHistory.length} MESSAGES):
+        enhancedPrompt = `${summarySection}RECENT CONVERSATION (LAST ${recentMessages.length} MESSAGES):
 ${"=".repeat(60)}
 ${historyText}
 ${"=".repeat(60)}
 
 ${enhancedPrompt}
 
-Remember: The conversation above is from the CURRENT chat session. ${conversationSummary ? 'Earlier messages are summarized above for context. ' : ''}Use it to maintain context and continuity in your responses.`;
+Remember: Use recent conversation for context continuity.`;
 
-      console.log(
-        `💬 Added ${conversationHistory.length} recent messages${conversationSummary ? ' + older message summary' : ''} from current conversation for context`
-      );
-    } else if (!enhancedPrompt.includes("SYSTEM:")) {
-      // If no memory context and no conversation history, add base structured prompt
-      enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent, helpful assistant.
+        console.log(
+          `💬 Added ${recentMessages.length} recent messages${summarySection ? " + older summary" : ""} (optimized context)`
+        );
+      } else if (!enhancedPrompt.includes("SYSTEM:")) {
+        // If no memory context and no conversation history, add base structured prompt
+        enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent, helpful assistant.
 
-⚠️ CRITICAL FORMATTING RULE:
-NEVER use # ## ### or * - symbols in your responses!
-These are forbidden markdown symbols.
+⚠️ **CRITICAL INSTRUCTIONS**:
+- Do NOT address the user by name. Start directly with your answer.
+- When user asks "do you know about X" or "tell me about X", provide comprehensive information - don't just say "yes I know"
+- Treat questions like "write an article" or "tell me about" as requests for detailed content
 
-✅ CORRECT FORMAT EXAMPLES:
-
-For sections:
-"🎯 Topic Name
-
-Explanation in natural sentences here.
-
-💡 Another Topic
-
-More content here."
-
-For lists:
-"✅ First point - details
-✅ Second point - details
-✅ Third point - details"
-
-For steps:
-"1️⃣ Do this first
-2️⃣ Then do this
-3️⃣ Finally this"
+📝 **FORMATTING GUIDELINES** (Use ChatGPT-style markdown):
+- Use **bold** for emphasis
+- Use *italic* for subtle emphasis
+- Use ## for section headings
+- Use \`code\` for technical terms
+- Use bullet lists with - or *
+- Use 1. 2. 3. for numbered lists
+- Add blank lines between sections
+- Use > for important callouts
 
 USER QUESTION:
 ${prompt}
 
-� Respond using ONLY emojis and natural language. NO # or * symbols!`;
-      console.log(`📋 Using base structured response prompt`);
-    }
-// ADD THIS CODE AT LINE 817 (right after: console.log(`📋 Using base structured response prompt`);)
+💡 Respond like ChatGPT: For CODE - friendly intro ("Here's a [type] example 👍"), code block, "💡 How to use it:" with steps, "🔑 Key Points" explaining concepts, follow-up question. For EXPLANATIONS - ## headings with emojis, **bold** terms, engaging style!`;
+        console.log(`📋 Using base structured response prompt`);
+      }
+      // ADD THIS CODE AT LINE 817 (right after: console.log(`📋 Using base structured response prompt`);)
 
-    // 📚 Add document context if documentId is provided
-    if (documentId) {
-      const searchResult = searchChunks(documentId, prompt);
-      if (searchResult) {
-        const documentContextSection = `
+      // 📚 Add document context if documentId is provided
+      if (documentId) {
+        const searchResult = searchChunks(documentId, prompt);
+        if (searchResult) {
+          const documentContextSection = `
 ${"=".repeat(60)}
 📄 DOCUMENT CONTEXT
 ${"=".repeat(60)}
@@ -873,27 +952,36 @@ ${searchResult.relevantChunks.join("\n\n")}
 
 ${"=".repeat(60)}
 `;
-        enhancedPrompt = documentContextSection + "\n\n" + enhancedPrompt;
-        console.log(`📚 Added document context to prompt. Chunks: ${searchResult.relevantChunks.length}`);
-      } else {
-        console.warn(`⚠️ Document ID "${documentId}" provided but not found in cache.`);
+          enhancedPrompt = documentContextSection + "\n\n" + enhancedPrompt;
+          console.log(
+            `📚 Added document context to prompt. Chunks: ${searchResult.relevantChunks.length}`
+          );
+        } else {
+          console.warn(
+            `⚠️ Document ID "${documentId}" provided but not found in cache.`
+          );
+        }
       }
-    }
 
-    // 🖼️ Add image context if imageId is provided OR if image was uploaded via multipart
-    const { imageId } = req.body;
-    let imageContextData: { description: string, imageBase64: string } | null = null;
-    
-    // Priority: Use uploaded image file first, then imageId from cache
-    if (imageBase64) {
-      // Image uploaded via multipart/form-data
-      console.log(`🖼️ Using uploaded image file for vision analysis (${imageBase64.length} chars base64)`);
-      imageContextData = {
-        description: "User uploaded image",
-        imageBase64: imageBase64
-      };
-      
-      const imageContextSection = `
+      // 🖼️ Add image context if imageId is provided OR if image was uploaded via multipart
+      const { imageId } = req.body;
+      let imageContextData: {
+        description: string;
+        imageBase64: string;
+      } | null = null;
+
+      // Priority: Use uploaded image file first, then imageId from cache
+      if (imageBase64) {
+        // Image uploaded via multipart/form-data
+        console.log(
+          `🖼️ Using uploaded image file for vision analysis (${imageBase64.length} chars base64)`
+        );
+        imageContextData = {
+          description: "User uploaded image",
+          imageBase64: imageBase64,
+        };
+
+        const imageContextSection = `
 ${"=".repeat(60)}
 🖼️ IMAGE CONTEXT
 ${"=".repeat(60)}
@@ -903,19 +991,19 @@ Type: Vision analysis with uploaded image
 
 ${"=".repeat(60)}
 `;
-      enhancedPrompt = imageContextSection + "\n\n" + enhancedPrompt;
-    } else if (imageId) {
-      // Image from cache (imageId reference)
-      const { getImage } = require("./services/imageCacheService");
-      const imageData = getImage(imageId);
-      
-      if (imageData) {
-        imageContextData = {
-          description: imageData.description,
-          imageBase64: imageData.imageBase64
-        };
-        
-        const imageContextSection = `
+        enhancedPrompt = imageContextSection + "\n\n" + enhancedPrompt;
+      } else if (imageId) {
+        // Image from cache (imageId reference)
+        const { getImage } = require("./services/imageCacheService");
+        const imageData = getImage(imageId);
+
+        if (imageData) {
+          imageContextData = {
+            description: imageData.description,
+            imageBase64: imageData.imageBase64,
+          };
+
+          const imageContextSection = `
 ${"=".repeat(60)}
 🖼️ IMAGE CONTEXT
 ${"=".repeat(60)}
@@ -925,341 +1013,1274 @@ Description: ${imageData.description}
 
 ${"=".repeat(60)}
 `;
-        enhancedPrompt = imageContextSection + "\n\n" + enhancedPrompt;
-        console.log(`🖼️ Added image context to prompt. Image: ${imageData.fileName}`);
-      } else {
-        console.warn(`⚠️ Image ID "${imageId}" provided but not found in cache.`);
-      }
-    }
-
-  // Prefer explicit request model, then env overrides, then safe defaults
-  const textModel = (model as string | undefined) || process.env.TEXT_MODEL || "gemini-2.5-pro"; // 🎯 GA model for text/chat
-  const imageModel = (model as string | undefined) || process.env.IMAGE_MODEL || "gemini-2.5-flash-image"; // 🎯 GA model for image generation
-  // Use a fast, lightweight model for classification by default
-  const intentModel = process.env.INTENT_MODEL || "gemini-1.5-flash-001"; // Default to v1 model id to avoid 404s
-
-    // 🔍 Intent helpers: fuzzy matching + optional model-based classification
-    function levenshtein(a: string, b: string): number {
-      const m = a.length, n = b.length;
-      if (m === 0) return n;
-      if (n === 0) return m;
-      const dp = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
-      for (let i = 0; i <= m; i++) dp[i][0] = i;
-      for (let j = 0; j <= n; j++) dp[0][j] = j;
-      for (let i = 1; i <= m; i++) {
-        for (let j = 1; j <= n; j++) {
-          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-          dp[i][j] = Math.min(
-            dp[i - 1][j] + 1,
-            dp[i][j - 1] + 1,
-            dp[i - 1][j - 1] + cost
+          enhancedPrompt = imageContextSection + "\n\n" + enhancedPrompt;
+          console.log(
+            `🖼️ Added image context to prompt(use the content only when you feel like user wants to seperate image ). Image: ${imageData.fileName}`
+          );
+        } else {
+          console.warn(
+            `⚠️ Image ID "${imageId}" provided but not found in cache.`
           );
         }
       }
-      return dp[m][n];
-    }
 
-    function fuzzyIncludes(haystack: string, needles: string[], maxDistance = 1): { matched: string | null } {
-      const s = haystack.toLowerCase();
-      for (const needle of needles) {
-        const n = needle.toLowerCase();
-        if (s.includes(n)) return { matched: needle };
-        // Sliding window fuzzy search
-        const w = n.length;
-        for (let i = 0; i <= s.length - w; i++) {
-          const seg = s.slice(i, i + w);
-          if (levenshtein(seg, n) <= maxDistance) return { matched: needle };
+      // Prefer explicit request model, then env overrides, then safe defaults
+      const textModel =
+        (model as string | undefined) ||
+        process.env.TEXT_MODEL ||
+        "gemini-2.5-pro"; // 🎯 GA model for text/chat
+      const imageModel =
+        (model as string | undefined) ||
+        process.env.IMAGE_MODEL ||
+        "gemini-2.5-flash-image"; // 🎯 GA model for image generation
+      // Use a fast, lightweight model for classification by default
+      const intentModel = process.env.INTENT_MODEL || "gemini-1.5-flash-001"; // Default to v1 model id to avoid 404s
+
+      // 🔍 Intent helpers: fuzzy matching + optional model-based classification
+      function levenshtein(a: string, b: string): number {
+        const m = a.length,
+          n = b.length;
+        if (m === 0) return n;
+        if (n === 0) return m;
+        const dp = Array.from({ length: m + 1 }, () =>
+          new Array<number>(n + 1).fill(0)
+        );
+        for (let i = 0; i <= m; i++) dp[i][0] = i;
+        for (let j = 0; j <= n; j++) dp[0][j] = j;
+        for (let i = 1; i <= m; i++) {
+          for (let j = 1; j <= n; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            dp[i][j] = Math.min(
+              dp[i - 1][j] + 1,
+              dp[i][j - 1] + 1,
+              dp[i - 1][j - 1] + cost
+            );
+          }
+        }
+        return dp[m][n];
+      }
+
+      function fuzzyIncludes(
+        haystack: string,
+        needles: string[],
+        maxDistance = 1
+      ): { matched: string | null } {
+        const s = haystack.toLowerCase();
+        for (const needle of needles) {
+          const n = needle.toLowerCase();
+          if (s.includes(n)) return { matched: needle };
+          // Sliding window fuzzy search
+          const w = n.length;
+          for (let i = 0; i <= s.length - w; i++) {
+            const seg = s.slice(i, i + w);
+            if (levenshtein(seg, n) <= maxDistance) return { matched: needle };
+          }
+        }
+        return { matched: null };
+      }
+
+      function normalizeRequestType(t?: string): "text" | "image" {
+        if (!t) return "text";
+        const s = String(t).toLowerCase().trim();
+        const imageSynonyms = [
+          "image",
+          "img",
+          "picture",
+          "pic",
+          "generate",
+          "gen",
+          "art",
+          "logo",
+        ];
+        if (imageSynonyms.some((syn) => s === syn)) return "image";
+        // Fuzzy for common typos: iamge, imgae
+        if (levenshtein(s, "image") <= 2) return "image";
+        return "text";
+      }
+
+      function detectImageEditIntentHeuristic(p: string): {
+        likely: boolean;
+        confidence: number;
+        signal?: string;
+      } {
+        if (!p) return { likely: false, confidence: 0 };
+        
+        console.log(`🔎 Heuristic check for: "${p}"`);
+        
+        const verbs = [
+          "add",
+          "insert",
+          "place",
+          "put",
+          "overlay",
+          "draw",
+          "paint",
+          "write",
+          "stamp",
+          "apply",
+          "remove",
+          "erase",
+          "delete",
+          "clean",
+          "clear",
+          "hide",
+          "cut",
+          "replace",
+          "swap",
+          "change",
+          "modify",
+          "edit",
+          "adjust",
+          "tweak",
+          "fix",
+          "update",
+          "blur",
+          "sharpen",
+          "denoise",
+          "enhance",
+          "brighten",
+          "darken",
+          "exposure",
+          "contrast",
+          "saturation",
+          "vibrance",
+          "hue",
+          "crop",
+          "resize",
+          "rotate",
+          "flip",
+          "scale",
+          "border",
+          "frame",
+          "background",
+          "bg",
+          "mask",
+          "cutout",
+          "transparent",
+          "text",
+          "caption",
+          "label",
+          "watermark",
+        ];
+        const { matched } = fuzzyIncludes(p, verbs, 1);
+        console.log(`🔎 Heuristic - matched verb: "${matched || "none"}"`);
+        
+        if (matched) {
+          // Boost confidence for strong edit verbs (add, remove, change)
+          const strongVerbs = ["add", "insert", "remove", "delete", "change", "replace"];
+          const strongVerbMatch = strongVerbs.some((v) => p.toLowerCase().includes(v));
+          
+          // Boost confidence for strong edit nouns
+          const strongNouns = [
+            "background",
+            "mask",
+            "border",
+            "frame",
+            "watermark",
+            "dog",        // Adding objects
+            "person",
+            "text",
+            "object",
+          ];
+          const nounBoost = strongNouns.some((n) => p.toLowerCase().includes(n))
+            ? 0.2
+            : 0;
+          const verbBoost = strongVerbMatch ? 0.15 : 0;
+          
+          const finalConf = Math.min(0.95, 0.6 + nounBoost + verbBoost);
+          console.log(`🔎 Heuristic boost - strongVerb:${strongVerbMatch} noun:${nounBoost} verb:${verbBoost} final:${finalConf}`);
+          
+          return {
+            likely: true,
+            confidence: finalConf,
+            signal: matched,
+          };
+        }
+        console.log(`🔎 Heuristic - no edit intent detected`);
+        return { likely: false, confidence: 0.2 };
+      }
+
+      // Helper functions for intent classification (using module-level cache)
+      function getCachedIntent(prompt: string) {
+        const normalized = prompt.toLowerCase().trim().substring(0, 200); // Limit key size
+        const cached = intentCache.get(normalized);
+        if (cached && Date.now() - cached.timestamp < INTENT_CACHE_TTL) {
+          cacheHits++;
+          console.log(
+            `⚡ Intent cache HIT - returning cached result (${cached.intent})`
+          );
+          return {
+            intent: cached.intent,
+            confidence: cached.confidence,
+            method: "cache" as const,
+          };
+        }
+        cacheMisses++;
+        return null;
+      }
+
+      function setCachedIntent(
+        prompt: string,
+        intent: "imageEdit" | "visionQA" | "imageGenerate" | "text",
+        confidence: number
+      ) {
+        const normalized = prompt.toLowerCase().trim().substring(0, 200);
+        intentCache.set(normalized, {
+          intent,
+          confidence,
+          timestamp: Date.now(),
+        });
+        // Limit cache size to prevent memory issues
+        if (intentCache.size > 1000) {
+          const firstKey = intentCache.keys().next().value;
+          if (firstKey) intentCache.delete(firstKey);
         }
       }
-      return { matched: null };
-    }
 
-    function normalizeRequestType(t?: string): 'text' | 'image' {
-      if (!t) return 'text';
-      const s = String(t).toLowerCase().trim();
-      const imageSynonyms = ['image', 'img', 'picture', 'pic', 'generate', 'gen', 'art', 'logo'];
-      if (imageSynonyms.some((syn) => s === syn)) return 'image';
-      // Fuzzy for common typos: iamge, imgae
-      if (levenshtein(s, 'image') <= 2) return 'image';
-      return 'text';
-    }
-
-    function detectImageEditIntentHeuristic(p: string): { likely: boolean; confidence: number; signal?: string } {
-      if (!p) return { likely: false, confidence: 0 };
-      const verbs = [
-        'add','insert','place','put','overlay','draw','paint','write','stamp','apply',
-        'remove','erase','delete','clean','clear','hide','cut',
-        'replace','swap','change','modify','edit','adjust','tweak','fix','update',
-        'blur','sharpen','denoise','enhance','brighten','darken','exposure','contrast','saturation','vibrance','hue',
-        'crop','resize','rotate','flip','scale','border','frame',
-        'background','bg','mask','cutout','transparent',
-        'text','caption','label','watermark'
-      ];
-      const { matched } = fuzzyIncludes(p, verbs, 1);
-      if (matched) {
-        // Boost confidence for strong edit nouns
-        const strongNouns = ['background','mask','border','frame','watermark'];
-        const boost = strongNouns.some(n => p.toLowerCase().includes(n)) ? 0.2 : 0;
-        return { likely: true, confidence: Math.min(0.9, 0.6 + boost), signal: matched };
+      function logIntentUsage(
+        intent: string,
+        confidence: number,
+        method: string
+      ) {
+        intentAnalytics.set(intent, (intentAnalytics.get(intent) || 0) + 1);
+        const count = intentAnalytics.get(intent);
+        console.log(
+          `🎯 Intent: ${intent} (conf: ${confidence.toFixed(2)}, method: ${method}) | Usage: ${count}`
+        );
       }
-      return { likely: false, confidence: 0.2 };
-    }
 
-    async function classifyIntentWithModel(p: string, hasImage: boolean): Promise<{ intent: 'imageEdit'|'visionQA'|'imageGenerate'|'text'; confidence: number } | null> {
-      try {
-        let classificationPrompt: string;
-        if (hasImage) {
-          // Binary classification when an image is present: edit vs vision Q&A
-          classificationPrompt = `Task: Classify the user's intent when an image is provided.
+      async function classifyIntentWithModel(
+        p: string,
+        hasImage: boolean,
+        conversationContext?: string
+      ): Promise<{
+        intent: "imageEdit" | "visionQA" | "imageGenerate" | "text";
+        confidence: number;
+        method: "ai" | "heuristic" | "cache" | "default";
+      } | null> {
+        const startTime = Date.now();
+
+        // Try cache first (only cache when no conversation context to avoid stale results)
+        if (!conversationContext) {
+          const cached = getCachedIntent(p);
+          if (cached) {
+            return cached;
+          }
+        }
+        
+        try {
+          let classificationPrompt: string;
+          if (hasImage) {
+            // Binary classification when an image is present: edit vs vision Q&A vs generate new
+            classificationPrompt = `Task: Classify the user's intent when an image is provided.
 Return a JSON object with fields intent and confidence (0-1).
-Valid intents: "imageEdit" or "visionQA" only.
-If the user is asking to modify the image (add/remove/replace/crop/background/change colors/etc), choose imageEdit.
-If the user is asking questions about the image (what is this, count, describe, compare), choose visionQA.
+Valid intents: "imageEdit", "visionQA", or "imageGenerate".
+
+IMPORTANT CONTEXT RULES:
+1. If user wants to MODIFY THE UPLOADED IMAGE → "imageEdit"
+2. If user asks QUESTIONS ABOUT THE UPLOADED IMAGE → "visionQA"  
+3. If user wants to CREATE A COMPLETELY NEW IMAGE (ignoring uploaded image) → "imageGenerate"
+
+${conversationContext ? `CONVERSATION CONTEXT:\n${conversationContext}\n\n` : ''}
+
+CRITICAL: Analyze if the prompt is about the UPLOADED image or requesting a NEW unrelated image.
+
+EXAMPLES:
+"add another dog" [with dog image] → {"intent": "imageEdit", "confidence": 0.95}
+"remove the background" [with any image] → {"intent": "imageEdit", "confidence": 0.95}
+"what's in this image?" [with any image] → {"intent": "visionQA", "confidence": 0.95}
+"draw me a picture of god from india" [with dog image, after discussing dogs] → {"intent": "imageGenerate", "confidence": 0.9}
+"create a sunset landscape" [with any unrelated image] → {"intent": "imageGenerate", "confidence": 0.9}
+"show me a car" [with any image] → {"intent": "imageGenerate", "confidence": 0.85}
+
+KEYWORDS FOR EDITING: add to this, remove from this, change this, modify this, edit this, adjust this
+KEYWORDS FOR QUESTIONS: what, who, where, analyze this, describe this, count in this
+KEYWORDS FOR NEW IMAGE: draw, create, show me, imagine, generate, picture of, image of (when unrelated to uploaded image)
 
 INPUT PROMPT:
-${p}`;
-        } else {
-          // Full classification for text-only prompts
-          const instruction = `You are an intent classifier. Decide the user's intent given a prompt.
-Return ONLY a compact JSON object with fields intent and confidence (0-1).
-Valid intents: "imageEdit", "visionQA", "imageGenerate", "text".`;
-          classificationPrompt = `${instruction}\nPROMPT:\n${p}`;
+${p}
+
+Return ONLY valid JSON: {"intent": "<intent>", "confidence": <0-1>}`;
+          } else {
+            // Full classification when no image is present: text vs imageGenerate
+            classificationPrompt = `Task: Classify the user's intent when NO image is provided.
+Return a JSON object with fields intent and confidence (0-1).
+Valid intents: "imageGenerate" or "text".
+
+${conversationContext ? `CONVERSATION CONTEXT:\n${conversationContext}\n\n` : ''}
+
+EXAMPLES:
+"draw a cat" → {"intent": "imageGenerate", "confidence": 0.95}
+"show me a sunset" → {"intent": "imageGenerate", "confidence": 0.9}
+"create a logo" → {"intent": "imageGenerate", "confidence": 0.95}
+"picture of god from india" → {"intent": "imageGenerate", "confidence": 0.95}
+"how are you?" → {"intent": "text", "confidence": 0.99}
+"explain this" → {"intent": "text", "confidence": 0.98}
+
+INPUT PROMPT:
+${p}
+
+Return ONLY valid JSON: {"intent": "<intent>", "confidence": <0-1>}`;
+          }
+
+          const resp = await generateContent({
+            model: intentModel,
+            contents: [classificationPrompt],
+            // Note: Low temperature for deterministic output would be ideal
+            // but the generateContent wrapper doesn't support generationConfig yet
+          });
+
+          const parts: any[] = (resp as any)?.parts ?? [];
+          const txt = parts
+            .map((q: any) => q.text ?? "")
+            .join("")
+            .trim();
+
+          // Try JSON first
+          const jsonText = txt.match(/\{[\s\S]*\}/)?.[0] || txt;
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(jsonText);
+          } catch {
+            console.warn("⚠️ Failed to parse JSON response:", txt);
+          }
+
+          // Fallback: accept simple outputs like "edit", "ask", "vision"
+          if (!parsed) {
+            const t = txt.toLowerCase();
+            if (/\b(edit|image\s*edit)\b/.test(t))
+              parsed = { intent: "imageEdit", confidence: 0.55 };
+            else if (/\b(ask|vision|q&a|qa|analy[sz]e)\b/.test(t))
+              parsed = { intent: "visionQA", confidence: 0.55 };
+            else if (/\b(generate|gen(erate)?\s*image|image\s*gen)\b/.test(t))
+              parsed = { intent: "imageGenerate", confidence: 0.55 };
+            else parsed = { intent: "text", confidence: 0.5 };
+          }
+
+          const intent = parsed.intent as any;
+          const confidence = Number(parsed.confidence ?? 0.5);
+          const threshold = parseFloat(
+            process.env.INTENT_CONFIDENCE_THRESHOLD || "0.5"
+          );
+
+          if (
+            ["imageEdit", "visionQA", "imageGenerate", "text"].includes(
+              intent
+            ) &&
+            confidence >= threshold
+          ) {
+            // Cache the result
+            setCachedIntent(p, intent, confidence);
+
+            // Track performance
+            const duration = Date.now() - startTime;
+            classificationTimes.push(duration);
+            if (classificationTimes.length > 100)
+              classificationTimes.shift(); // Keep last 100
+
+            const avgTime =
+              classificationTimes.reduce((a, b) => a + b, 0) /
+              classificationTimes.length;
+            console.log(
+              `⏱️ Intent classification took ${duration}ms (avg: ${avgTime.toFixed(0)}ms)`
+            );
+
+            // Log usage
+            logIntentUsage(intent, confidence, "ai");
+
+            return {
+              intent,
+              confidence: Math.max(0, Math.min(1, confidence)),
+              method: "ai",
+            };
+          } else if (!["imageEdit", "visionQA", "imageGenerate", "text"].includes(intent)) {
+            console.warn(`⚠️ Invalid intent returned: ${intent}`);
+          } else {
+            console.warn(
+              `⚠️ Confidence too low: ${confidence.toFixed(2)} < ${threshold}`
+            );
+          }
+        } catch (e: any) {
+          console.warn(
+            "⚠️ Intent classifier failed, using fallback:",
+            e.message || e
+          );
         }
-        const resp = await generateContent({ model: intentModel, contents: [classificationPrompt] });
-        const parts: any[] = (resp as any)?.parts ?? [];
-        const txt = parts.map((q: any) => q.text ?? '').join('').trim();
-        // Try JSON first
-        const jsonText = txt.match(/\{[\s\S]*\}/)?.[0] || txt;
-        let parsed: any = null;
-        try { parsed = JSON.parse(jsonText); } catch {}
 
-        // Fallback: accept simple outputs like "edit", "ask", "vision"
-        if (!parsed) {
-          const t = txt.toLowerCase();
-          if (/\b(edit|image\s*edit)\b/.test(t)) parsed = { intent: 'imageEdit', confidence: 0.55 };
-          else if (/\b(ask|vision|q&a|qa|analy[sz]e)\b/.test(t)) parsed = { intent: 'visionQA', confidence: 0.55 };
-          else if (/\b(generate|gen(erate)?\s*image|image\s*gen)\b/.test(t)) parsed = { intent: 'imageGenerate', confidence: 0.55 };
-          else parsed = { intent: 'text', confidence: 0.5 };
+        // Fallback to heuristic if AI classification failed
+        if (!hasImage) {
+          const heuristic = detectImageGenerateIntentHeuristic(p);
+          if (heuristic.likely && heuristic.confidence >= 0.6) {
+            console.log(
+              `🔄 Using heuristic fallback: ${heuristic.signal} (conf: ${heuristic.confidence})`
+            );
+            logIntentUsage("imageGenerate", heuristic.confidence, "heuristic");
+            return {
+              intent: "imageGenerate",
+              confidence: heuristic.confidence,
+              method: "heuristic",
+            };
+          }
         }
 
-        const intent = parsed.intent as any;
-        const confidence = Number(parsed.confidence ?? 0.5);
-        if (['imageEdit','visionQA','imageGenerate','text'].includes(intent)) {
-          return { intent, confidence: Math.max(0, Math.min(1, confidence)) };
+        // Final fallback: default to text
+        console.log(`⚠️ No confident intent detected, defaulting to text`);
+        logIntentUsage("text", 0.5, "default");
+        return {
+          intent: "text",
+          confidence: 0.5,
+          method: "default",
+        };
+      }
+
+      // 🔎 Extract a usable image URL when model returns markdown/link instead of inline image
+      function extractImageUrlFromText(text: string): string | null {
+        if (!text) return null;
+        const t = text.trim();
+        // Markdown image ![alt](url)
+        const md = t.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i);
+        if (md && md[1]) return md[1];
+        // Plain URL ending with common image extensions
+        const plain = t.match(
+          /(https?:\/\/[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|svg))(?!\S)/i
+        );
+        if (plain && plain[1]) return plain[1];
+        // Hosted attachments or storage paths that are likely images
+        const hosted = t.match(
+          /(https?:\/\/[\w.-]+\/(?:assistants|storage|firebasestorage|googleusercontent)[^\s)]+)/i
+        );
+        if (hosted && hosted[1]) return hosted[1];
+        return null;
+      }
+
+      // 🧼 Remove markdown image links and raw URLs from text so UI doesn't show links instead of images
+      function sanitizeImageText(text?: string): string | undefined {
+        if (!text) return text;
+        let out = text;
+        // Remove markdown image syntax
+        out = out.replace(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi, "").trim();
+        // Remove standalone URLs likely pointing to images/attachments
+        out = out.replace(/https?:\/\/[^\s)]+/gi, "").trim();
+        // Collapse multiple spaces/newlines
+        out = out.replace(/\n{3,}/g, "\n\n").replace(/\s{2,}/g, " ");
+        return out || undefined;
+      }
+
+      // 🧠 Build conversation context for intent classification
+      function buildConversationContextForIntent(
+        userId: string,
+        chatId?: string
+      ): string | undefined {
+        try {
+          const {
+            getConversationService,
+          } = require("./services/conversationService");
+          const conversationService = getConversationService();
+
+          // Get last 2 turns for context (concise for intent classification)
+          const recentTurns = conversationService.getRecentConversations(
+            userId,
+            2
+          );
+
+          if (recentTurns.length > 0) {
+            return recentTurns
+              .reverse()
+              .map(
+                (turn: any) =>
+                  `User: ${turn.userPrompt.substring(0, 100)}\nAI: ${turn.aiResponse.substring(0, 100)}`
+              )
+              .join("\n");
+          }
+        } catch (e) {
+          console.warn("⚠️ Could not fetch conversation context:", e);
         }
-      } catch (e) {
-        console.warn('⚠️ Intent classifier failed, using heuristic:', e);
+        return undefined;
       }
-      return null;
-    }
 
-    // 🔎 Extract a usable image URL when model returns markdown/link instead of inline image
-    function extractImageUrlFromText(text: string): string | null {
-      if (!text) return null;
-      const t = text.trim();
-      // Markdown image ![alt](url)
-      const md = t.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i);
-      if (md && md[1]) return md[1];
-      // Plain URL ending with common image extensions
-      const plain = t.match(/(https?:\/\/[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|svg))(?!\S)/i);
-      if (plain && plain[1]) return plain[1];
-      // Hosted attachments or storage paths that are likely images
-      const hosted = t.match(/(https?:\/\/[\w.-]+\/(?:assistants|storage|firebasestorage|googleusercontent)[^\s)]+)/i);
-      if (hosted && hosted[1]) return hosted[1];
-      return null;
-    }
-
-    // 🧼 Remove markdown image links and raw URLs from text so UI doesn't show links instead of images
-    function sanitizeImageText(text?: string): string | undefined {
-      if (!text) return text;
-      let out = text;
-      // Remove markdown image syntax
-      out = out.replace(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi, '').trim();
-      // Remove standalone URLs likely pointing to images/attachments
-      out = out.replace(/https?:\/\/[^\s)]+/gi, '').trim();
-      // Collapse multiple spaces/newlines
-      out = out.replace(/\n{3,}/g, '\n\n').replace(/\s{2,}/g, ' ');
-      return out || undefined;
-    }
-
-    async function detectFinalImageIntent(p: string): Promise<'edit'|'vision'> {
-      const heuristic = detectImageEditIntentHeuristic(p);
-      if (heuristic.likely && heuristic.confidence >= 0.6) {
-        console.log(`🧭 Heuristic intent: edit (signal: ${heuristic.signal}, conf: ${heuristic.confidence})`);
-        return 'edit';
-      }
-  const mode = (process.env.INTENT_CLASSIFIER || 'always').toLowerCase(); // 'off' | 'fallback' | 'always'
-      if (mode === 'off') {
-        console.log('🧭 Intent classifier OFF → default to vision Q&A');
-        return 'vision';
-      }
-      if (mode === 'always' || (mode === 'fallback' && (!heuristic.likely || heuristic.confidence < 0.6))) {
-        const cls = await classifyIntentWithModel(p, true);
-        if (cls) {
-          console.log(`🧭 Model intent: ${cls.intent} (conf: ${cls.confidence})`);
-          if (cls.intent === 'imageEdit' && cls.confidence >= 0.5) return 'edit';
-          return 'vision';
+      async function detectFinalImageIntent(
+        p: string,
+        userId: string,
+        chatId?: string
+      ): Promise<"edit" | "vision" | "generate"> {
+        const heuristic = detectImageEditIntentHeuristic(p);
+        if (heuristic.likely && heuristic.confidence >= 0.6) {
+          console.log(
+            `🧭 Heuristic intent: edit (signal: ${heuristic.signal}, conf: ${heuristic.confidence})`
+          );
+          return "edit";
         }
+        const mode = (process.env.INTENT_CLASSIFIER || "always").toLowerCase(); // 'off' | 'fallback' | 'always'
+        if (mode === "off") {
+          console.log("🧭 Intent classifier OFF → default to vision Q&A");
+          return "vision";
+        }
+        if (
+          mode === "always" ||
+          (mode === "fallback" &&
+            (!heuristic.likely || heuristic.confidence < 0.6))
+        ) {
+          // Get conversation context for better intent detection
+          const context = buildConversationContextForIntent(userId, chatId);
+          const cls = await classifyIntentWithModel(p, true, context);
+          if (cls) {
+            console.log(
+              `🧭 Model intent: ${cls.intent} (conf: ${cls.confidence}) ${context ? '[with context]' : '[no context]'}`
+            );
+            if (cls.intent === "imageEdit" && cls.confidence >= 0.5)
+              return "edit";
+            if (cls.intent === "imageGenerate" && cls.confidence >= 0.5)
+              return "generate";
+            return "vision";
+          }
+        }
+        return "vision";
       }
-      return 'vision';
-    }
 
-    // 🔍 New: Image GENERATION intent detection for text-only prompts
-    function detectImageGenerateIntentHeuristic(p: string): { likely: boolean; confidence: number; signal?: string } {
-      if (!p) return { likely: false, confidence: 0 };
-      const terms = [
-        'generate', 'create', 'make', 'draw', 'illustrate', 'visualize', 'render', 'produce', 'design',
-        'image of', 'picture of', 'photo of', 'art of', 'logo', 'icon', 'avatar', '/imagine',
-        'wallpaper', 'poster', 'banner', 'thumbnail'
-      ];
-      const cont = ['another', 'more', 'again', 'one more'];
-      const lower = p.toLowerCase();
-      const { matched } = fuzzyIncludes(lower, terms, 1);
-      const continuation = cont.some(w => new RegExp(`\\b${w}\\b`, 'i').test(lower));
-      if (matched || continuation) {
-        // If phrase has descriptors like "of a", assume specific generation intent
-        const specific = lower.includes(' of a ') || lower.includes(' with a ') || lower.includes(' that has ');
-        let conf = 0.6 + (specific ? 0.2 : 0);
-        if (continuation && p.length < 60) conf = Math.max(conf, 0.7);
-        return { likely: true, confidence: Math.min(0.95, conf), signal: matched || 'continuation' };
+      // 🔍 New: Image GENERATION intent detection for text-only prompts
+      function detectImageGenerateIntentHeuristic(p: string): {
+        likely: boolean;
+        confidence: number;
+        signal?: string;
+      } {
+        if (!p) return { likely: false, confidence: 0 };
+        const terms = [
+          "generate",
+          "create",
+          "make",
+          "draw",
+          "illustrate",
+          "visualize",
+          "render",
+          "produce",
+          "design",
+          "image of",
+          "picture of",
+          "photo of",
+          "art of",
+          "logo",
+          "icon",
+          "avatar",
+          "/imagine",
+          "wallpaper",
+          "poster",
+          "banner",
+          "thumbnail",
+        ];
+        const cont = ["another", "more", "again", "one more"];
+        const lower = p.toLowerCase();
+        const { matched } = fuzzyIncludes(lower, terms, 1);
+        const continuation = cont.some((w) =>
+          new RegExp(`\\b${w}\\b`, "i").test(lower)
+        );
+        if (matched || continuation) {
+          // If phrase has descriptors like "of a", assume specific generation intent
+          const specific =
+            lower.includes(" of a ") ||
+            lower.includes(" with a ") ||
+            lower.includes(" that has ");
+          let conf = 0.6 + (specific ? 0.2 : 0);
+          if (continuation && p.length < 60) conf = Math.max(conf, 0.7);
+          return {
+            likely: true,
+            confidence: Math.min(0.95, conf),
+            signal: matched || "continuation",
+          };
+        }
+        return { likely: false, confidence: 0.2 };
       }
-      return { likely: false, confidence: 0.2 };
-    }
 
-    async function shouldGenerateImage(promptText: string, normalizedType: 'text'|'image'): Promise<boolean> {
-      // If client explicitly requested image, honor it
-      if (normalizedType === 'image') return true;
+      async function shouldGenerateImage(
+        promptText: string,
+        normalizedType: "text" | "image"
+      ): Promise<boolean> {
+        // If client explicitly requested image, honor it
+        if (normalizedType === "image") return true;
 
-      const mode = (process.env.AUTO_GENERATE_INTENT || 'fallback').toLowerCase(); // 'off' | 'fallback' | 'always'
-      if (mode === 'off') return false;
+        const mode = (
+          process.env.AUTO_GENERATE_INTENT || "fallback"
+        ).toLowerCase(); // 'off' | 'fallback' | 'always'
+        if (mode === "off") return false;
 
-      const h = detectImageGenerateIntentHeuristic(promptText);
-      if (mode === 'always') {
-        // Always run classifier for stronger signal when no explicit type
+        const h = detectImageGenerateIntentHeuristic(promptText);
+        if (mode === "always") {
+          // Always run classifier for stronger signal when no explicit type
+          const cls = await classifyIntentWithModel(promptText, false);
+          if (cls?.intent === "imageGenerate" && cls.confidence >= 0.55)
+            return true;
+          // Fall back to heuristic if classifier uncertain
+          return h.likely && h.confidence >= 0.7;
+        }
+
+        // Fallback mode: Use heuristic first, then model if weak
+        if (h.likely && h.confidence >= 0.7) return true;
         const cls = await classifyIntentWithModel(promptText, false);
-        if (cls?.intent === 'imageGenerate' && cls.confidence >= 0.55) return true;
-        // Fall back to heuristic if classifier uncertain
-        return h.likely && h.confidence >= 0.7;
+        return !!(
+          cls &&
+          cls.intent === "imageGenerate" &&
+          cls.confidence >= 0.6
+        );
       }
 
-      // Fallback mode: Use heuristic first, then model if weak
-      if (h.likely && h.confidence >= 0.7) return true;
-      const cls = await classifyIntentWithModel(promptText, false);
-      return !!(cls && cls.intent === 'imageGenerate' && cls.confidence >= 0.6);
-    }
+      // 🖼️ Handle uploaded image: check if user wants to edit, generate new, or ask questions
+      if (imageContextData) {
+        console.log(`🔍 Image uploaded - detecting intent for prompt: "${prompt}"`);
+        
+        const imageIntent = await detectFinalImageIntent(
+          prompt,
+          effectiveUserId,
+          effectiveChatId
+        );
 
-    if (imageContextData && (await detectFinalImageIntent(prompt)) === 'edit') {
-      console.log("✏️ Edit intent detected with uploaded image - performing image editing");
+        console.log(`🎯 Final image intent decision: ${imageIntent}`);
 
-      const editInstruction = `Edit this image as follows: ${prompt}\n\nRules:\n- Make only the requested modifications\n- Preserve all other parts of the image\n- Return a single edited image output`;
+        if (imageIntent === "edit") {
+        console.log(
+          "✏️ Edit intent detected with uploaded image - performing image editing"
+        );
 
-      let response;
-      try {
-        response = await generateContent({
-          model: imageModel,
-          contents: [
-            {
-              parts: [
-                { inlineData: { data: imageContextData.imageBase64, mimeType: "image/png" } },
-                { text: editInstruction },
-              ],
+        const editInstruction = `Edit this image as follows: ${prompt}\n\nRules:\n- Make only the requested modifications\n- Preserve all other parts of the image\n- Return a single edited image output`;
+
+        let response;
+        try {
+          response = await generateContent({
+            model: imageModel,
+            contents: [
+              {
+                parts: [
+                  {
+                    inlineData: {
+                      data: imageContextData.imageBase64,
+                      mimeType: "image/png",
+                    },
+                  },
+                  { text: editInstruction },
+                ],
+              },
+            ],
+          });
+
+          const parts: any[] = (response as any)?.parts ?? [];
+          let editedBase64: string | null = null;
+          let editedUri: string | null = null;
+          let imageLocalUri: string | null = null;
+          let altText: string | null = null;
+
+          for (const part of parts) {
+            if ((part as any).inlineData) {
+              editedBase64 = (part as any).inlineData.data;
+            }
+            if ((part as any).fileData) {
+              editedUri = (part as any).fileData.fileUri;
+            }
+            if ((part as any).text) {
+              altText = (part as any).text ?? altText;
+            }
+          }
+
+          // Fallback: extract URL from text when no inline/fileData
+          if (!editedBase64 && !editedUri && altText) {
+            const extracted = extractImageUrlFromText(altText);
+            if (extracted) {
+              editedUri = extracted;
+              console.log(
+                `🔗 [edit] Extracted image URL from text: ${editedUri}`
+              );
+              try {
+                const resp = await fetch(extracted);
+                if (resp.ok) {
+                  const arrayBuf = await resp.arrayBuffer();
+                  const buffer = Buffer.from(arrayBuf);
+                  editedBase64 = buffer.toString("base64");
+                  console.log(
+                    `✅ [edit] Converted extracted URL image to base64 (${editedBase64.length} chars)`
+                  );
+                } else {
+                  console.warn(
+                    `⚠️ [edit] Failed to fetch extracted image URL (status ${resp.status})`
+                  );
+                }
+              } catch (e) {
+                console.warn(
+                  `⚠️ [edit] Could not download extracted image URL:`,
+                  e
+                );
+              }
+            }
+          }
+
+          const editResponsePayload = {
+            success: true,
+            isImageGeneration: true,
+            text: sanitizeImageText(altText || undefined) || "Edited image",
+            imageBase64: editedBase64,
+            imageUri: editedUri,
+            imageLocalUri,
+            raw: response,
+            metadata: {
+              tokens: (response as any)?.usage?.totalTokenCount || 0,
+              candidatesTokenCount:
+                (response as any)?.usage?.candidatesTokenCount || 0,
+              promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
             },
-          ],
-        });
+          };
+
+          res.json(editResponsePayload);
+
+          setImmediate(async () => {
+            try {
+              if (localImageCacheService.isEnabled()) {
+                if (!imageLocalUri && editedBase64) {
+                  const saved = await localImageCacheService.saveBase64(
+                    effectiveUserId,
+                    effectiveChatId || "default",
+                    editedBase64,
+                    "png"
+                  );
+                  imageLocalUri = saved.localUri;
+                  console.log(
+                    `🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`
+                  );
+                } else if (!imageLocalUri && editedUri) {
+                  const saved = await localImageCacheService.saveFromUri(
+                    effectiveUserId,
+                    effectiveChatId || "default",
+                    editedUri,
+                    "png"
+                  );
+                  imageLocalUri = saved.localUri;
+                  console.log(
+                    `🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`
+                  );
+                }
+              }
+            } catch (e) {
+              console.warn(
+                "⚠️ [BACKGROUND] Failed to save edited image locally:",
+                e
+              );
+            }
+
+            if (useMemory && effectiveUserId && (editedBase64 || editedUri)) {
+              try {
+                const hybridMemoryService = getHybridMemoryService();
+                let firebaseImageUrl: string;
+
+                if (editedBase64) {
+                  firebaseImageUrl = await firebaseStorageService.uploadImage(
+                    effectiveUserId,
+                    effectiveChatId || "default",
+                    editedBase64,
+                    prompt
+                  );
+                } else if (editedUri) {
+                  try {
+                    const resp = await fetch(editedUri);
+                    if (resp.ok) {
+                      const arrayBuf = await resp.arrayBuffer();
+                      const buffer = Buffer.from(arrayBuf);
+                      const b64 = buffer.toString("base64");
+                      firebaseImageUrl =
+                        await firebaseStorageService.uploadImage(
+                          effectiveUserId,
+                          effectiveChatId || "default",
+                          b64,
+                          prompt
+                        );
+                    } else {
+                      firebaseImageUrl = editedUri;
+                    }
+                  } catch (err) {
+                    firebaseImageUrl = editedUri!;
+                  }
+                } else {
+                  return;
+                }
+
+                const conversationTurn =
+                  hybridMemoryService.storeConversationTurn(
+                    effectiveUserId,
+                    prompt,
+                    altText || "Image edited",
+                    effectiveChatId,
+                    { url: firebaseImageUrl, prompt }
+                  );
+                await firestoreChatService.saveTurn(conversationTurn);
+                console.log(
+                  `🖼️ [BACKGROUND] Stored edited image URL in conversation history`
+                );
+              } catch (e) {
+                console.warn(
+                  "[BACKGROUND] Failed to upload/store edited image:",
+                  e
+                );
+              }
+            }
+          });
+
+          return;
+        } catch (e) {
+          console.error(
+            "❌ Image editing failed, falling back to vision Q&A:",
+            e
+          );
+          // Fall through to normal vision Q&A below
+        }
+        } else if (imageIntent === "generate") {
+          // User wants to generate a NEW image despite having one uploaded
+          console.log(
+            "🎨 Generate intent detected even with uploaded image - user wants NEW image, ignoring uploaded one"
+          );
+          // Set imageContextData to null to trigger image generation flow below
+          imageContextData = null;
+        } else {
+          // imageIntent === "vision" - fall through to vision Q&A handling
+          console.log(
+            "👁️ Vision Q&A intent detected with uploaded image"
+          );
+        }
+      }
+
+      // Only run image generation when explicitly requested AND there is no uploaded/cached image context
+      const wantsGeneration = await shouldGenerateImage(prompt, normalizedType);
+      if (wantsGeneration && !imageContextData) {
+        // 🔒 Apply image-specific rate limiting
+        const { rateLimiter } = require("./services/securityMiddleware");
+        if (!rateLimiter.checkRateLimit(effectiveUserId, "image")) {
+          logSecurityEvent("Image rate limit exceeded", {
+            userId: effectiveUserId,
+          });
+          return res.status(429).json({
+            success: false,
+            error:
+              "Image generation rate limit exceeded. Please try again later.",
+          });
+        }
+
+        // 🎨 Smart context-aware image generation
+        let imagePrompt = prompt;
+
+        // Check if prompt is generic (e.g., "generate an image", "create image", "show me")
+        const genericImageKeywords = [
+          "generate an image",
+          "create an image",
+          "make an image",
+          "show me an image",
+          "draw",
+          "illustrate",
+          "visualize",
+          "generate image",
+          "create image",
+          "make image",
+          "show me",
+          "draw something",
+          "illustrate this",
+          "visualize this",
+          "another image",
+          "more image",
+          "one more",
+          "again",
+          "image of",
+          "image",
+          "logo",
+        ];
+        const promptLower = prompt.toLowerCase().trim();
+
+        // More flexible detection: check if prompt CONTAINS keywords (not just starts with)
+        // and is relatively short (< 50 chars), indicating it's not a specific description
+        // Also detect continuation words like "another", "more", "again" (even with typos like "AAANOTHER")
+        const hasContinuationWord = /\b(another|more|again|one more)\b/i.test(
+          promptLower
+        );
+        const hasGenericKeyword = genericImageKeywords.some((kw) =>
+          promptLower.includes(kw)
+        );
+        const hasSpecificDescriptor =
+          promptLower.includes(" of a ") ||
+          promptLower.includes(" with a ") ||
+          promptLower.includes(" that has ");
+
+        const isGenericRequest =
+          (hasGenericKeyword || hasContinuationWord) &&
+          prompt.length < 50 &&
+          !hasSpecificDescriptor;
+
+        // If generic request and we have chat history, add conversation context
+        if (isGenericRequest && effectiveUserId) {
+          console.log(
+            `🧠 Generic image request detected - fetching conversation context...`
+          );
+          try {
+            // Get conversation service (contains local memory)
+            const {
+              getConversationService,
+            } = require("./services/conversationService");
+            const conversationService = getConversationService();
+
+            // Get last 2 conversation turns for context (tighter context for images)
+            const recentTurns = conversationService.getRecentConversations(
+              effectiveUserId,
+              2
+            );
+
+            if (recentTurns.length > 0) {
+              // Build context from recent conversation (reverse to get chronological order)
+              const contextSummary = recentTurns
+                .reverse() // Most recent last
+                .map(
+                  (turn: any) =>
+                    `User: ${turn.userPrompt}\nAI: ${turn.aiResponse}`
+                )
+                .join("\n\n");
+
+              // Analyze if current prompt is completely independent (new topic)
+              const currentPromptLower = prompt.toLowerCase();
+              const isNewTopic = 
+                // Check if prompt has specific descriptive words (suggests new image request)
+                /\b(of|from|with|showing|depicting|featuring)\b/.test(currentPromptLower) ||
+                // Check if prompt is long enough to be self-contained (>20 chars)
+                prompt.length > 20 ||
+                // Check if prompt mentions specific subjects
+                /\b(person|animal|place|scene|landscape|portrait|god|deity|character)\b/i.test(currentPromptLower);
+
+              if (isNewTopic) {
+                // User provided enough detail - use their prompt directly with minimal context
+                console.log(`🎯 Detected self-contained image request - using user's exact prompt`);
+                imagePrompt = prompt; // Use original prompt as-is
+              } else {
+                // Generic continuation like "another", "more" - use conversation context
+                imagePrompt = `Based on this recent conversation:
+
+${contextSummary}
+
+The user now says: "${prompt}"
+
+Create a detailed, visually compelling image that builds upon or relates to our conversation context. Make it relevant and coherent with what we've been discussing.`;
+
+                console.log(
+                  `✨ Enhanced image prompt with ${recentTurns.length} conversation turns from memory`
+                );
+                console.log(
+                  `📝 Context-aware prompt: "${imagePrompt.substring(0, 150)}..."`
+                );
+              }
+            } else if (conversationHistory && conversationHistory.length > 0) {
+              // Fallback: Use conversation history from the request (current chat session)
+              console.log(
+                `💬 Using ${conversationHistory.length} messages from current chat session`
+              );
+              const contextSummary = conversationHistory
+                .slice(-2) // Last 2 messages
+                .map(
+                  (msg: any) =>
+                    `${msg.role === "user" ? "User" : "AI"}: ${msg.content}`
+                )
+                .join("\n\n");
+
+              // 🤖 Use AI to intelligently decide if prompt needs conversation context
+              console.log(`🤖 Asking AI to analyze if image prompt needs conversation context...`);
+              
+              const contextDecisionPrompt = `You are a smart intent analyzer. Your job is to determine if an image generation request needs conversation context or is self-contained.
+
+CONVERSATION HISTORY:
+${contextSummary}
+
+USER'S IMAGE REQUEST:
+"${prompt}"
+
+ANALYSIS TASK:
+Does this image request reference or depend on information from the conversation above?
+
+Examples that NEED context:
+- "generate an image of the website we discussed" (references "website we discussed")
+- "show me what this would look like" (references "this")
+- "create an image based on the proposal" (references "the proposal")
+- "make an image of it" (references something mentioned before)
+
+Examples that DON'T need context (self-contained):
+- "a sunset over snow-capped mountains with a lake"
+- "a futuristic city with flying cars at night"
+- "a portrait of a wise old wizard with a long beard"
+- "an abstract painting with blue and gold colors"
+
+Respond with ONLY one word: "CONTEXT" if it needs conversation history, or "STANDALONE" if it's self-contained.`;
+
+              let needsContext = false;
+              try {
+                const decisionResponse = await generateContent({
+                  model: intentModel,
+                  contents: [contextDecisionPrompt],
+                });
+                
+                const decision = (decisionResponse as any)?.text?.trim().toUpperCase() || '';
+                needsContext = decision.includes('CONTEXT');
+                
+                console.log(`🎯 AI Decision: ${decision} → ${needsContext ? 'Using conversation context' : 'Using standalone prompt'}`);
+              } catch (error) {
+                console.warn(`⚠️ Context decision failed, defaulting to context-aware:`, error);
+                needsContext = true; // Safer to include context if AI fails
+              }
+
+              if (needsContext) {
+                // Prompt references previous conversation or is too vague - use context
+                imagePrompt = `Based on this recent conversation:
+
+${contextSummary}
+
+The user now says: "${prompt}"
+
+Create a detailed, visually compelling image that directly relates to and visualizes the concepts from our conversation above. Make it highly relevant and coherent with the specific topic we've been discussing.`;
+
+                console.log(
+                  `✨ Enhanced image prompt with ${conversationHistory.length} messages from conversation context`
+                );
+                console.log(
+                  `📝 Context-aware prompt: "${imagePrompt.substring(0, 150)}..."`
+                );
+              } else {
+                // User provided a complete standalone description - use their prompt directly
+                console.log(`🎯 Detected self-contained image request (e.g., "a sunset over mountains") - using user's exact prompt`);
+                imagePrompt = prompt;
+              }
+            } else {
+              // No conversation history - provide a helpful default prompt
+              console.log(
+                `⚠️ No conversation history found, creating a beautiful surprise image`
+              );
+              imagePrompt = `Create a beautiful, high-quality, visually stunning image. Since no specific subject was mentioned, create something inspiring and artistic. Think: nature scenery, abstract art, or a serene landscape. Make it photorealistic and captivating.`;
+            }
+          } catch (error) {
+            console.warn(
+              "⚠️ Could not fetch conversation context, using default prompt:",
+              error
+            );
+            imagePrompt = `Create a beautiful, high-quality, visually stunning image. Since no specific subject was mentioned, create something inspiring and artistic. Think: nature scenery, abstract art, or a serene landscape. Make it photorealistic and captivating.`;
+          }
+        } else if (!isGenericRequest) {
+          console.log(
+            `🎯 Specific image request detected - using exact prompt: "${prompt}"`
+          );
+        }
+
+        console.log(`🎨 Generating image...`);
+
+        // Retry logic: Gemini sometimes returns text instead of image
+        let retryCount = 0;
+        const maxRetries = 2;
+        let response;
+        let imageGenerated = false;
+
+        while (!imageGenerated && retryCount <= maxRetries) {
+          if (retryCount > 0) {
+            console.log(
+              `🔄 Retry ${retryCount}/${maxRetries} - Gemini returned text instead of image, retrying...`
+            );
+            // Make prompt more explicit for retry
+            imagePrompt =
+              imagePrompt +
+              `\n\nIMPORTANT: Generate an actual IMAGE, not text. Do not describe the image, CREATE it.`;
+          }
+
+          response = await generateContent({
+            model: imageModel,
+            contents: [imagePrompt],
+          });
+
+          const parts: any[] = (response as any)?.parts ?? [];
+
+          // Check if we got an actual image
+          const hasImage = parts.some(
+            (part) => (part as any).inlineData || (part as any).fileData
+          );
+
+          if (hasImage) {
+            imageGenerated = true;
+            console.log(
+              `✅ Image generated successfully on attempt ${retryCount + 1}`
+            );
+          } else {
+            retryCount++;
+            if (retryCount <= maxRetries) {
+              console.log(
+                `⚠️ Attempt ${retryCount} returned text only, retrying...`
+              );
+              await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1 second before retry
+            } else {
+              console.error(
+                `❌ Failed to generate image after ${maxRetries + 1} attempts`
+              );
+            }
+          }
+        }
 
         const parts: any[] = (response as any)?.parts ?? [];
-  let editedBase64: string | null = null;
-  let editedUri: string | null = null;
-  let imageLocalUri: string | null = null;
+        let imageBase64: string | null = null;
+        let imageUri: string | null = null;
+        let imageLocalUri: string | null = null;
         let altText: string | null = null;
 
+        console.log(`📦 Received ${parts.length} parts from Gemini`);
+
         for (const part of parts) {
+          // Log what we find in each part
           if ((part as any).inlineData) {
-            editedBase64 = (part as any).inlineData.data;
+            console.log(
+              `📸 Found inlineData - mimeType: ${(part as any).inlineData.mimeType}, data length: ${(part as any).inlineData.data?.length || 0}`
+            );
+            imageBase64 = (part as any).inlineData.data;
           }
           if ((part as any).fileData) {
-            editedUri = (part as any).fileData.fileUri;
+            console.log(
+              `📁 Found fileData - URI: ${(part as any).fileData.fileUri}`
+            );
+            imageUri = (part as any).fileData.fileUri;
           }
           if ((part as any).text) {
+            console.log(
+              `📝 Found text: ${(part as any).text.substring(0, 100)}`
+            );
             altText = (part as any).text ?? altText;
           }
         }
 
-        // Fallback: extract URL from text when no inline/fileData
-        if (!editedBase64 && !editedUri && altText) {
-          const extracted = extractImageUrlFromText(altText);
-          if (extracted) {
-            editedUri = extracted;
-            console.log(`🔗 [edit] Extracted image URL from text: ${editedUri}`);
+        if (imageBase64) {
+          console.log(
+            `✅ Image generated successfully - base64 data (${imageBase64.length} chars)`
+          );
+        } else if (imageUri) {
+          console.log(`✅ Image generated successfully - URI: ${imageUri}`);
+          // ⚡ Speed optimization: return URI immediately; optional inline base64 behind flag
+          if (process.env.INLINE_IMAGE_BASE64 === "true") {
             try {
-              const resp = await fetch(extracted);
+              console.log(
+                "📥 Downloading image from URI to base64 for immediate display (opt-in)..."
+              );
+              const resp = await fetch(imageUri);
               if (resp.ok) {
                 const arrayBuf = await resp.arrayBuffer();
                 const buffer = Buffer.from(arrayBuf);
-                editedBase64 = buffer.toString('base64');
-                console.log(`✅ [edit] Converted extracted URL image to base64 (${editedBase64.length} chars)`);
+                imageBase64 = buffer.toString("base64");
+                console.log(
+                  `✅ Converted URI image to base64 (${imageBase64.length} chars)`
+                );
               } else {
-                console.warn(`⚠️ [edit] Failed to fetch extracted image URL (status ${resp.status})`);
+                console.warn(
+                  `⚠️ Failed to fetch image URI (status ${resp.status}) - will return URI only`
+                );
               }
             } catch (e) {
-              console.warn(`⚠️ [edit] Could not download extracted image URL:`, e);
+              console.warn(
+                "⚠️ Could not convert image URI to base64 (opt-in)",
+                e
+              );
+            }
+          }
+        } else {
+          console.error(
+            `❌ No image data found in response! Attempting to extract from text...`
+          );
+          const combinedText = parts.map((p: any) => p.text ?? "").join(" ");
+          const extractedUrl = extractImageUrlFromText(combinedText);
+          if (extractedUrl) {
+            imageUri = extractedUrl;
+            console.log(`🔗 Extracted image URL from text: ${imageUri}`);
+            // Try to convert to base64 for immediate display
+            try {
+              const resp = await fetch(extractedUrl);
+              if (resp.ok) {
+                const arrayBuf = await resp.arrayBuffer();
+                const buffer = Buffer.from(arrayBuf);
+                imageBase64 = buffer.toString("base64");
+                console.log(
+                  `✅ Converted extracted URL image to base64 (${imageBase64.length} chars)`
+                );
+              } else {
+                console.warn(
+                  `⚠️ Failed to fetch extracted image URL (status ${resp.status}) - will return URL only`
+                );
+              }
+            } catch (e) {
+              console.warn(`⚠️ Could not download extracted image URL:`, e);
             }
           }
         }
 
-        const editResponsePayload = {
+        const generationResponsePayload = {
           success: true,
           isImageGeneration: true,
-          text: sanitizeImageText(altText || undefined) || "Edited image",
-          imageBase64: editedBase64,
-          imageUri: editedUri,
+          text: sanitizeImageText(altText || undefined) || "Image generated",
+          imageBase64,
+          imageUri,
           imageLocalUri,
+          altText,
           raw: response,
           metadata: {
             tokens: (response as any)?.usage?.totalTokenCount || 0,
-            candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
+            candidatesTokenCount:
+              (response as any)?.usage?.candidatesTokenCount || 0,
             promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
           },
         };
 
-        res.json(editResponsePayload);
+        res.json(generationResponsePayload);
 
         setImmediate(async () => {
           try {
             if (localImageCacheService.isEnabled()) {
-              if (!imageLocalUri && editedBase64) {
-                const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", editedBase64, "png");
+              if (!imageLocalUri && imageBase64) {
+                const saved = await localImageCacheService.saveBase64(
+                  effectiveUserId,
+                  effectiveChatId || "default",
+                  imageBase64,
+                  "png"
+                );
                 imageLocalUri = saved.localUri;
-                console.log(`🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`);
-              } else if (!imageLocalUri && editedUri) {
-                const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", editedUri, "png");
+                console.log(
+                  `🗃️ [BACKGROUND] Cached generated image locally: ${imageLocalUri}`
+                );
+              } else if (!imageLocalUri && imageUri) {
+                const saved = await localImageCacheService.saveFromUri(
+                  effectiveUserId,
+                  effectiveChatId || "default",
+                  imageUri,
+                  "png"
+                );
                 imageLocalUri = saved.localUri;
-                console.log(`🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`);
+                console.log(
+                  `🗃️ [BACKGROUND] Cached generated image locally: ${imageLocalUri}`
+                );
               }
             }
           } catch (e) {
-            console.warn("⚠️ [BACKGROUND] Failed to save edited image locally:", e);
+            console.warn(
+              "⚠️ [BACKGROUND] Failed to save generated image locally:",
+              e
+            );
           }
 
-          if (useMemory && effectiveUserId && (editedBase64 || editedUri)) {
+          if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
             try {
               const hybridMemoryService = getHybridMemoryService();
               let firebaseImageUrl: string;
 
-              if (editedBase64) {
+              if (imageBase64) {
+                console.log("📤 Uploading base64 image to Firebase Storage...");
                 firebaseImageUrl = await firebaseStorageService.uploadImage(
                   effectiveUserId,
                   effectiveChatId || "default",
-                  editedBase64,
+                  imageBase64,
                   prompt
                 );
-              } else if (editedUri) {
+              } else if (imageUri) {
+                console.log(
+                  "📤 Attempting to download URI and upload to Firebase Storage..."
+                );
                 try {
-                  const resp = await fetch(editedUri);
+                  const resp = await fetch(imageUri);
                   if (resp.ok) {
                     const arrayBuf = await resp.arrayBuffer();
                     const buffer = Buffer.from(arrayBuf);
-                    const b64 = buffer.toString('base64');
+                    const b64 = buffer.toString("base64");
                     firebaseImageUrl = await firebaseStorageService.uploadImage(
                       effectiveUserId,
                       effectiveChatId || "default",
@@ -1267,391 +2288,27 @@ Valid intents: "imageEdit", "visionQA", "imageGenerate", "text".`;
                       prompt
                     );
                   } else {
-                    firebaseImageUrl = editedUri;
+                    console.warn(
+                      `⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`
+                    );
+                    firebaseImageUrl = imageUri;
                   }
                 } catch (err) {
-                  firebaseImageUrl = editedUri!;
+                  console.warn(
+                    "⚠️ Error downloading URI for upload, storing URI as-is:",
+                    err
+                  );
+                  firebaseImageUrl = imageUri;
                 }
               } else {
+                console.error("❌ No image data to upload");
                 return;
               }
 
-              const conversationTurn = hybridMemoryService.storeConversationTurn(
-                effectiveUserId,
-                prompt,
-                altText || "Image edited",
-                effectiveChatId,
-                { url: firebaseImageUrl, prompt }
-              );
-              await firestoreChatService.saveTurn(conversationTurn);
-              console.log(`🖼️ [BACKGROUND] Stored edited image URL in conversation history`);
-            } catch (e) {
-              console.warn("[BACKGROUND] Failed to upload/store edited image:", e);
-            }
-          }
-        });
+              console.log(`✅ Image uploaded to Firebase: ${firebaseImageUrl}`);
 
-        return;
-      } catch (e) {
-        console.error("❌ Image editing failed, falling back to vision Q&A:", e);
-        // Fall through to normal vision Q&A below
-      }
-    }
-
-  // Only run image generation when explicitly requested AND there is no uploaded/cached image context
-  const wantsGeneration = await shouldGenerateImage(prompt, normalizedType);
-  if (wantsGeneration && !imageContextData) {
-      // 🔒 Apply image-specific rate limiting
-      const { rateLimiter } = require("./services/securityMiddleware");
-      if (!rateLimiter.checkRateLimit(effectiveUserId, "image")) {
-        logSecurityEvent("Image rate limit exceeded", {
-          userId: effectiveUserId,
-        });
-        return res.status(429).json({
-          success: false,
-          error:
-            "Image generation rate limit exceeded. Please try again later.",
-        });
-      }
-
-      // 🎨 Smart context-aware image generation
-      let imagePrompt = prompt;
-
-      // Check if prompt is generic (e.g., "generate an image", "create image", "show me")
-      const genericImageKeywords = [
-        "generate an image",
-        "create an image",
-        "make an image",
-        "show me an image",
-        "draw",
-        "illustrate",
-        "visualize",
-        "generate image",
-        "create image",
-        "make image",
-        "show me",
-        "draw something",
-        "illustrate this",
-        "visualize this",
-        "another image",
-        "more image",
-        "one more",
-        "again",
-        "image of",
-        "image",
-        "logo"
-      ];
-      const promptLower = prompt.toLowerCase().trim();
-
-      // More flexible detection: check if prompt CONTAINS keywords (not just starts with)
-      // and is relatively short (< 50 chars), indicating it's not a specific description
-      // Also detect continuation words like "another", "more", "again" (even with typos like "AAANOTHER")
-      const hasContinuationWord = /\b(another|more|again|one more)\b/i.test(
-        promptLower
-      );
-      const hasGenericKeyword = genericImageKeywords.some((kw) =>
-        promptLower.includes(kw)
-      );
-      const hasSpecificDescriptor =
-        promptLower.includes(" of a ") ||
-        promptLower.includes(" with a ") ||
-        promptLower.includes(" that has ");
-
-      const isGenericRequest =
-        (hasGenericKeyword || hasContinuationWord) &&
-        prompt.length < 50 &&
-        !hasSpecificDescriptor;
-
-      // If generic request and we have chat history, add conversation context
-      if (isGenericRequest && effectiveUserId) {
-        console.log(
-          `🧠 Generic image request detected - fetching conversation context...`
-        );
-        try {
-          // Get conversation service (contains local memory)
-          const {
-            getConversationService,
-          } = require("./services/conversationService");
-          const conversationService = getConversationService();
-
-          // Get last 2 conversation turns for context (tighter context for images)
-          const recentTurns = conversationService.getRecentConversations(
-            effectiveUserId,
-            2
-          );
-
-          if (recentTurns.length > 0) {
-            // Build context from recent conversation (reverse to get chronological order)
-            const contextSummary = recentTurns
-              .reverse() // Most recent last
-              .map(
-                (turn: any) =>
-                  `User: ${turn.userPrompt}\nAI: ${turn.aiResponse}`
-              )
-              .join("\n\n");
-
-            // Enhance prompt with conversation context
-            imagePrompt = `Based on this recent conversation:
-
-${contextSummary}
-
-Create a detailed, visually compelling image that captures the essence and context(use the context if you think the user previous current request says i need other skip the context) of what we've been discussing. Make it relevant to the conversation topic.`;
-
-            console.log(
-              `✨ Enhanced image prompt with ${recentTurns.length} conversation turns from memory`
-            );
-            console.log(
-              `📝 Context-aware prompt: "${imagePrompt.substring(0, 150)}..."`
-            );
-          } else if (conversationHistory && conversationHistory.length > 0) {
-            // Fallback: Use conversation history from the request (current chat session)
-            console.log(
-              `💬 Using ${conversationHistory.length} messages from current chat session`
-            );
-            const contextSummary = conversationHistory
-              .slice(-2) // Last 2 messages
-              .map(
-                (msg: any) =>
-                  `${msg.role === "user" ? "User" : "AI"}: ${msg.content}`
-              )
-              .join("\n\n");
-
-            imagePrompt = `Based on this recent conversation:
-
-${contextSummary}
-
-Create a detailed, visually compelling image that captures the essence and context of what we've been discussing. Make it relevant to the conversation topic.`;
-
-            console.log(
-              `✨ Enhanced image prompt with ${conversationHistory.length} messages from request`
-            );
-            console.log(
-              `📝 Context-aware prompt: "${imagePrompt.substring(0, 150)}..."`
-            );
-          } else {
-            // No conversation history - provide a helpful default prompt
-            console.log(
-              `⚠️ No conversation history found, creating a beautiful surprise image`
-            );
-            imagePrompt = `Create a beautiful, high-quality, visually stunning image. Since no specific subject was mentioned, create something inspiring and artistic. Think: nature scenery, abstract art, or a serene landscape. Make it photorealistic and captivating.`;
-          }
-        } catch (error) {
-          console.warn(
-            "⚠️ Could not fetch conversation context, using default prompt:",
-            error
-          );
-          imagePrompt = `Create a beautiful, high-quality, visually stunning image. Since no specific subject was mentioned, create something inspiring and artistic. Think: nature scenery, abstract art, or a serene landscape. Make it photorealistic and captivating.`;
-        }
-      } else if (!isGenericRequest) {
-        console.log(
-          `🎯 Specific image request detected - using exact prompt: "${prompt}"`
-        );
-      }
-
-      console.log(`🎨 Generating image...`);
-
-      // Retry logic: Gemini sometimes returns text instead of image
-      let retryCount = 0;
-      const maxRetries = 2;
-      let response;
-      let imageGenerated = false;
-
-      while (!imageGenerated && retryCount <= maxRetries) {
-        if (retryCount > 0) {
-          console.log(
-            `🔄 Retry ${retryCount}/${maxRetries} - Gemini returned text instead of image, retrying...`
-          );
-          // Make prompt more explicit for retry
-          imagePrompt =
-            imagePrompt +
-            `\n\nIMPORTANT: Generate an actual IMAGE, not text. Do not describe the image, CREATE it.`;
-        }
-
-        response = await generateContent({
-          model: imageModel,
-          contents: [imagePrompt],
-        });
-
-        const parts: any[] = (response as any)?.parts ?? [];
-
-        // Check if we got an actual image
-        const hasImage = parts.some(
-          (part) => (part as any).inlineData || (part as any).fileData
-        );
-
-        if (hasImage) {
-          imageGenerated = true;
-          console.log(
-            `✅ Image generated successfully on attempt ${retryCount + 1}`
-          );
-        } else {
-          retryCount++;
-          if (retryCount <= maxRetries) {
-            console.log(
-              `⚠️ Attempt ${retryCount} returned text only, retrying...`
-            );
-            await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1 second before retry
-          } else {
-            console.error(
-              `❌ Failed to generate image after ${maxRetries + 1} attempts`
-            );
-          }
-        }
-      }
-
-    const parts: any[] = (response as any)?.parts ?? [];
-    let imageBase64: string | null = null;
-    let imageUri: string | null = null;
-    let imageLocalUri: string | null = null;
-    let altText: string | null = null;
-
-      console.log(`📦 Received ${parts.length} parts from Gemini`);
-
-      for (const part of parts) {
-        // Log what we find in each part
-        if ((part as any).inlineData) {
-          console.log(
-            `📸 Found inlineData - mimeType: ${(part as any).inlineData.mimeType}, data length: ${(part as any).inlineData.data?.length || 0}`
-          );
-          imageBase64 = (part as any).inlineData.data;
-        }
-        if ((part as any).fileData) {
-          console.log(
-            `📁 Found fileData - URI: ${(part as any).fileData.fileUri}`
-          );
-          imageUri = (part as any).fileData.fileUri;
-        }
-        if ((part as any).text) {
-          console.log(`📝 Found text: ${(part as any).text.substring(0, 100)}`);
-          altText = (part as any).text ?? altText;
-        }
-      }
-
-      if (imageBase64) {
-        console.log(
-          `✅ Image generated successfully - base64 data (${imageBase64.length} chars)`
-        );
-      } else if (imageUri) {
-        console.log(`✅ Image generated successfully - URI: ${imageUri}`);
-        // ⚡ Speed optimization: return URI immediately; optional inline base64 behind flag
-        if (process.env.INLINE_IMAGE_BASE64 === 'true') {
-          try {
-            console.log("📥 Downloading image from URI to base64 for immediate display (opt-in)...");
-            const resp = await fetch(imageUri);
-            if (resp.ok) {
-              const arrayBuf = await resp.arrayBuffer();
-              const buffer = Buffer.from(arrayBuf);
-              imageBase64 = buffer.toString('base64');
-              console.log(`✅ Converted URI image to base64 (${imageBase64.length} chars)`);
-            } else {
-              console.warn(`⚠️ Failed to fetch image URI (status ${resp.status}) - will return URI only`);
-            }
-          } catch (e) {
-            console.warn("⚠️ Could not convert image URI to base64 (opt-in)", e);
-          }
-        }
-      } else {
-        console.error(`❌ No image data found in response! Attempting to extract from text...`);
-        const combinedText = parts.map((p: any) => p.text ?? '').join(' ');
-        const extractedUrl = extractImageUrlFromText(combinedText);
-        if (extractedUrl) {
-          imageUri = extractedUrl;
-          console.log(`🔗 Extracted image URL from text: ${imageUri}`);
-          // Try to convert to base64 for immediate display
-          try {
-            const resp = await fetch(extractedUrl);
-            if (resp.ok) {
-              const arrayBuf = await resp.arrayBuffer();
-              const buffer = Buffer.from(arrayBuf);
-              imageBase64 = buffer.toString('base64');
-              console.log(`✅ Converted extracted URL image to base64 (${imageBase64.length} chars)`);
-            } else {
-              console.warn(`⚠️ Failed to fetch extracted image URL (status ${resp.status}) - will return URL only`);
-            }
-          } catch (e) {
-            console.warn(`⚠️ Could not download extracted image URL:`, e);
-          }
-        }
-      }
-
-          const generationResponsePayload = {
-            success: true,
-            isImageGeneration: true,
-            text: sanitizeImageText(altText || undefined) || "Image generated",
-            imageBase64,
-            imageUri,
-            imageLocalUri,
-            altText,
-            raw: response,
-            metadata: {
-              tokens: (response as any)?.usage?.totalTokenCount || 0,
-              candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
-              promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
-            },
-          };
-
-          res.json(generationResponsePayload);
-
-          setImmediate(async () => {
-            try {
-              if (localImageCacheService.isEnabled()) {
-                if (!imageLocalUri && imageBase64) {
-                  const saved = await localImageCacheService.saveBase64(effectiveUserId, effectiveChatId || "default", imageBase64, "png");
-                  imageLocalUri = saved.localUri;
-                  console.log(`🗃️ [BACKGROUND] Cached generated image locally: ${imageLocalUri}`);
-                } else if (!imageLocalUri && imageUri) {
-                  const saved = await localImageCacheService.saveFromUri(effectiveUserId, effectiveChatId || "default", imageUri, "png");
-                  imageLocalUri = saved.localUri;
-                  console.log(`🗃️ [BACKGROUND] Cached generated image locally: ${imageLocalUri}`);
-                }
-              }
-            } catch (e) {
-              console.warn("⚠️ [BACKGROUND] Failed to save generated image locally:", e);
-            }
-
-            if (useMemory && effectiveUserId && (imageBase64 || imageUri)) {
-              try {
-                const hybridMemoryService = getHybridMemoryService();
-                let firebaseImageUrl: string;
-
-                if (imageBase64) {
-                  console.log("📤 Uploading base64 image to Firebase Storage...");
-                  firebaseImageUrl = await firebaseStorageService.uploadImage(
-                    effectiveUserId,
-                    effectiveChatId || "default",
-                    imageBase64,
-                    prompt
-                  );
-                } else if (imageUri) {
-                  console.log("📤 Attempting to download URI and upload to Firebase Storage...");
-                  try {
-                    const resp = await fetch(imageUri);
-                    if (resp.ok) {
-                      const arrayBuf = await resp.arrayBuffer();
-                      const buffer = Buffer.from(arrayBuf);
-                      const b64 = buffer.toString('base64');
-                      firebaseImageUrl = await firebaseStorageService.uploadImage(
-                        effectiveUserId,
-                        effectiveChatId || "default",
-                        b64,
-                        prompt
-                      );
-                    } else {
-                      console.warn(`⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`);
-                      firebaseImageUrl = imageUri;
-                    }
-                  } catch (err) {
-                    console.warn("⚠️ Error downloading URI for upload, storing URI as-is:", err);
-                    firebaseImageUrl = imageUri;
-                  }
-                } else {
-                  console.error("❌ No image data to upload");
-                  return;
-                }
-
-                console.log(`✅ Image uploaded to Firebase: ${firebaseImageUrl}`);
-
-                const conversationTurn = hybridMemoryService.storeConversationTurn(
+              const conversationTurn =
+                hybridMemoryService.storeConversationTurn(
                   effectiveUserId,
                   prompt,
                   altText || "Image generated",
@@ -1659,138 +2316,382 @@ Create a detailed, visually compelling image that captures the essence and conte
                   { url: firebaseImageUrl, prompt: prompt }
                 );
 
-                await firestoreChatService.saveTurn(conversationTurn);
+              await firestoreChatService.saveTurn(conversationTurn);
 
-                console.log(`🖼️ [BACKGROUND] Stored image URL in conversation history`);
-              } catch (memoryError) {
-                console.error("❌ [BACKGROUND] Failed to upload/store image:", memoryError);
-              }
+              console.log(
+                `🖼️ [BACKGROUND] Stored image URL in conversation history`
+              );
+            } catch (memoryError) {
+              console.error(
+                "❌ [BACKGROUND] Failed to upload/store image:",
+                memoryError
+              );
             }
-          });
-
-      return;
-    }
-
-    // ✅ REMOVED: Automatic image generation detection
-    // Frontend now handles image generation explicitly via type='image' parameter
-    // This prevents unwanted interception of text messages containing image keywords
-
-    // Normal text response
-    const startTime = Date.now();
-    let response;
-    
-    // If we have image context, include the actual image in the request for visual analysis
-    if (imageContextData) {
-      console.log("🖼️ Including image data in vision model request for visual Q&A");
-      response = await generateContent({ 
-        model: textModel, 
-        contents: [
-          {
-            parts: [
-              { inlineData: { data: imageContextData.imageBase64, mimeType: "image/png" } },
-              { text: enhancedPrompt }
-            ]
           }
-        ]
-      });
-    } else {
-      // Text-only request
-      response = await generateContent({ model: textModel, contents: [enhancedPrompt] });
+        });
+
+        return;
+      }
+
+      // ✅ REMOVED: Automatic image generation detection
+      // Frontend now handles image generation explicitly via type='image' parameter
+      // This prevents unwanted interception of text messages containing image keywords
+
+      // Normal text response
+      const startTime = Date.now();
+      let response;
+
+      // If we have image context, include the actual image in the request for visual analysis
+      if (imageContextData) {
+        console.log(
+          "🖼️ Including image data in vision model request for visual Q&A"
+        );
+        response = await generateContent({
+          model: textModel,
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: {
+                    data: imageContextData.imageBase64,
+                    mimeType: "image/png",
+                  },
+                },
+                { text: enhancedPrompt },
+              ],
+            },
+          ],
+        });
+      } else {
+        // Text-only request
+        response = await generateContent({
+          model: textModel,
+          contents: [enhancedPrompt],
+        });
+      }
+
+      const duration = (Date.now() - startTime) / 1000; // Convert to seconds
+      const parts = (response as any)?.parts ?? [];
+      const text = parts.map((p: any) => p.text ?? "").join("");
+
+      console.log(
+        `✅ AI response generated (${text.length} chars) in ${duration.toFixed(2)}s - sending to user immediately...`
+      );
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // � CACHE RESPONSE: Store successful text responses for future reuse
+      // ═══════════════════════════════════════════════════════════════════════
+      if (normalizedType === "text" && !imageBase64 && !documentId && text) {
+        const cacheService = getResponseCacheService();
+        // Determine TTL based on content type
+        let ttl = 3600; // Default: 1 hour
+        
+        // Code-related queries get 24 hours (more stable)
+        const codeKeywords = ["code", "function", "html", "css", "javascript", "react", "component", "example"];
+        if (codeKeywords.some(kw => prompt.toLowerCase().includes(kw))) {
+          ttl = 86400; // 24 hours
+        }
+        
+        cacheService.set(prompt, effectiveUserId, text, ttl);
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // �🚀 CRITICAL: Send response to user FIRST (don't make them wait!)
+      // ═══════════════════════════════════════════════════════════════════════
+      const jsonResponse = {
+        success: true,
+        text,
+        raw: response,
+        metadata: {
+          tokens: (response as any)?.usage?.totalTokenCount || 0,
+          candidatesTokenCount:
+            (response as any)?.usage?.candidatesTokenCount || 0,
+          promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
+          duration: parseFloat(duration.toFixed(2)),
+        },
+      };
+      res.json(jsonResponse);
+      console.log(`📤 Response sent to user!`);
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // 💾 LIGHTWEIGHT: Store in local memory only (no Pinecone, super fast!)
+      // Pinecone upload happens only when user switches chats (see /api/end-chat endpoint)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (useMemory && text && effectiveUserId) {
+        setImmediate(async () => {
+          try {
+            const hybridMemoryService = getHybridMemoryService();
+
+            // Store in local memory only (in-memory, instant)
+            const conversationTurn = hybridMemoryService.storeConversationTurn(
+              effectiveUserId,
+              prompt,
+              text,
+              effectiveChatId
+            );
+
+            await firestoreChatService.saveTurn(conversationTurn);
+
+            console.log(
+              `💬 [BACKGROUND] Stored turn in session (chat: ${effectiveChatId}): "${prompt.substring(0, 50)}..."`
+            );
+
+            // ⚡ OPTIMIZATION: Preload memory for next query
+            if (effectiveChatId) {
+              preloadMemoryForNextQuery(
+                effectiveUserId,
+                effectiveChatId,
+                hybridMemoryService
+              ).catch((err: any) => console.warn("Preload failed:", err));
+            }
+          } catch (memoryError) {
+            console.error(
+              "❌ [BACKGROUND] Failed to store conversation turn:",
+              memoryError
+            );
+          }
+        });
+      }
+
+      // Return is not needed as response already sent
+      return;
+    } catch (err: any) {
+      console.error("❌ FATAL ERROR in /api/ask-ai:", err);
+      console.error("❌ Error stack:", err?.stack);
+      console.error("❌ Error name:", err?.name);
+      console.error("❌ Error message:", err?.message);
+
+      // Don't let the server crash - always return a response
+      if (!res.headersSent) {
+        return res.status(500).json({
+          success: false,
+          error: err?.message ?? String(err),
+          details:
+            process.env.NODE_ENV === "development" ? err?.stack : undefined,
+        });
+      }
+    } finally {
+      try {
+        const keyUser = req.body?.userId || "anonymous";
+        const keyChat = req.body?.chatId || "global";
+        const inFlightKey = `${keyUser}:${keyChat}`;
+        const existing = inFlightChatRequests.get(inFlightKey);
+        if (existing) clearTimeout(existing);
+        inFlightChatRequests.delete(inFlightKey);
+      } catch {}
     }
-    
-    const duration = (Date.now() - startTime) / 1000; // Convert to seconds
-    const parts = (response as any)?.parts ?? [];
-    const text = parts.map((p: any) => p.text ?? "").join("");
+  }
+);
 
-    console.log(
-      `✅ AI response generated (${text.length} chars) in ${duration.toFixed(2)}s - sending to user immediately...`
-    );
+/**
+ * POST /api/ask-ai-stream
+ * Streaming version using Server-Sent Events (SSE)
+ * body: { prompt: string, userId?: string, chatId?: string, useMemory?: boolean, ... }
+ * 🔒 SECURITY: Rate limited, input validated
+ * 🌊 STREAMING: Sends text chunks as they're generated
+ */
+app.post(
+  "/api/ask-ai-stream",
+  rateLimitMiddleware("general"),
+  async (req, res) => {
+    if (!vertex && !ai)
+      return res.status(500).json({ error: "AI client not initialized" });
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 🚀 CRITICAL: Send response to user FIRST (don't make them wait!)
-    // ═══════════════════════════════════════════════════════════════════════
-    const jsonResponse = { 
-      success: true, 
-      text, 
-      raw: response,
-      metadata: {
-        tokens: (response as any)?.usage?.totalTokenCount || 0,
-        candidatesTokenCount: (response as any)?.usage?.candidatesTokenCount || 0,
-        promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
-        duration: parseFloat(duration.toFixed(2)),
-      },
-    };
-    res.json(jsonResponse);
-    console.log(`📤 Response sent to user!`);
+    try {
+      // Set SSE headers
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 💾 LIGHTWEIGHT: Store in local memory only (no Pinecone, super fast!)
-    // Pinecone upload happens only when user switches chats (see /api/end-chat endpoint)
-    // ═══════════════════════════════════════════════════════════════════════
-    if (useMemory && text && effectiveUserId) {
-      setImmediate(async () => {
-        try {
-          const hybridMemoryService = getHybridMemoryService();
+      const {
+        prompt,
+        chatId,
+        userId,
+        memory,
+        conversationHistory,
+        conversationSummary,
+        messageCount,
+        userName,
+      } = req.body;
 
-          // Store in local memory only (in-memory, instant)
-          const conversationTurn = hybridMemoryService.storeConversationTurn(
+      const useMemory = memory !== false;
+      const effectiveUserId = userId || "anoop123";
+      const effectiveChatId = chatId;
+      const effectiveMessageCount =
+        messageCount !== undefined ? messageCount : undefined;
+
+      if (!prompt) {
+        res.write(`data: ${JSON.stringify({ error: "Prompt is required" })}\n\n`);
+        return res.end();
+      }
+
+      console.log(
+        `🌊 Streaming request - User: ${effectiveUserId}, Chat: ${effectiveChatId || "none"}, Prompt: "${prompt.substring(0, 50)}..."`
+      );
+
+      // Check cache first (instant response even for streaming)
+      const cacheService = getResponseCacheService();
+      const cachedResponse = cacheService.get(prompt, effectiveUserId);
+      if (cachedResponse) {
+        // Stream cached response in chunks for consistent UX
+        const chunkSize = 50;
+        for (let i = 0; i < cachedResponse.length; i += chunkSize) {
+          const chunk = cachedResponse.substring(i, i + chunkSize);
+          res.write(`data: ${JSON.stringify({ text: chunk, cached: true })}\n\n`);
+          // Small delay to simulate streaming
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        res.write(`data: ${JSON.stringify({ done: true, cached: true })}\n\n`);
+        return res.end();
+      }
+
+      // Auto-create profile if needed
+      if (effectiveUserId && userName) {
+        const existingProfile =
+          userProfileService.getUserProfile(effectiveUserId);
+        if (!existingProfile) {
+          userProfileService.upsertUserProfile(effectiveUserId, {
+            name: userName,
+          });
+        }
+      }
+
+      let enhancedPrompt = prompt;
+
+      // Build context (same logic as non-streaming endpoint)
+      // Memory system
+      if (useMemory) {
+        const searchStrategy = effectiveMessageCount <= 2 ? "profile-only" : "full";
+        
+        if (searchStrategy === "profile-only") {
+          const profileContext = userProfileService.generateProfileContext(effectiveUserId);
+          if (profileContext) {
+            enhancedPrompt = `${profileContext}\n\n${enhancedPrompt}`;
+          }
+        } else {
+          // Full memory search
+          const hybridService = getHybridMemoryService();
+          const memoryResult = await hybridService.searchMemory(
             effectiveUserId,
             prompt,
-            text,
-            effectiveChatId
+            effectiveChatId,
+            effectiveMessageCount,
+            {
+              maxLocalResults: 3,
+              maxLongTermResults: 1,
+              threshold: 0.35,
+            }
           );
 
-          await firestoreChatService.saveTurn(conversationTurn);
+          if (memoryResult.combinedContext) {
+            enhancedPrompt = `You are NubiqAI ✨ - helpful AI assistant with memory.
 
-          console.log(
-            `💬 [BACKGROUND] Stored turn in session (chat: ${effectiveChatId}): "${prompt.substring(0, 50)}..."`
-          );
+⚠️ RULES:
+- Never use user's name
+- Answer "do you know X" with full explanations, not "yes I know"
+- "write an article" = detailed content
 
-          // ⚡ OPTIMIZATION: Preload memory for next query
-          if (effectiveChatId) {
-            preloadMemoryForNextQuery(
-              effectiveUserId,
-              effectiveChatId,
-              hybridMemoryService
-            ).catch((err: any) => console.warn("Preload failed:", err));
+📝 FORMAT:
+**CODE:** "Here's [type] 👍" + code + "💡 How to:" (steps) + "🔑 Key:" (concepts) + question
+**EXPLAIN:** ## headings + **bold** terms + bullets + "💡 Summary"
+
+${"=".repeat(60)}
+🧠 CONTEXT:
+${memoryResult.combinedContext}
+${"=".repeat(60)}
+
+💬 Q: ${prompt}
+
+Be engaging!`;
           }
-        } catch (memoryError) {
-          console.error(
-            "❌ [BACKGROUND] Failed to store conversation turn:",
-            memoryError
-          );
         }
-      });
-    }
+      }
 
-    // Return is not needed as response already sent
-    return;
-  } catch (err: any) {
-    console.error("❌ FATAL ERROR in /api/ask-ai:", err);
-    console.error("❌ Error stack:", err?.stack);
-    console.error("❌ Error name:", err?.name);
-    console.error("❌ Error message:", err?.message);
+      // Add conversation history (smart context selection)
+      if (conversationHistory && conversationHistory.length > 0) {
+        const maxRecentMessages = 5;
+        const recentMessages = conversationHistory.slice(-maxRecentMessages);
+        const olderMessages = conversationHistory.slice(0, -maxRecentMessages);
+        
+        const historyText = recentMessages
+          .map((msg: any) => `${msg.role.toUpperCase()}: ${msg.content}`)
+          .join("\n\n");
 
-    // Don't let the server crash - always return a response
-    if (!res.headersSent) {
-      return res.status(500).json({
-        success: false,
-        error: err?.message ?? String(err),
-        details:
-          process.env.NODE_ENV === "development" ? err?.stack : undefined,
-      });
+        let summarySection = "";
+        if (conversationSummary) {
+          summarySection = `\n\n📚 OLDER MESSAGES:\n${conversationSummary}\n${"=".repeat(60)}\n\n`;
+        } else if (olderMessages.length > 0) {
+          const topicsFromOlder = olderMessages
+            .map((msg: any) => msg.content.substring(0, 50))
+            .slice(0, 3)
+            .join(", ");
+          summarySection = `\n\n📚 EARLIER CONTEXT: User discussed ${topicsFromOlder}...\n${"=".repeat(60)}\n\n`;
+        }
+
+        enhancedPrompt = `${summarySection}RECENT CONVERSATION (LAST ${recentMessages.length} MESSAGES):
+${"=".repeat(60)}
+${historyText}
+${"=".repeat(60)}
+
+${enhancedPrompt}
+
+Remember: Use recent conversation for context continuity.`;
+      }
+
+      // Stream the response
+      const textModel =
+        process.env.TEXT_MODEL || "gemini-2.0-flash-thinking-exp-01-21";
+      let fullText = "";
+      const startTime = Date.now();
+
+      try {
+        // Use streaming generator
+        for await (const chunk of generateContentStream({
+          model: textModel,
+          contents: [enhancedPrompt],
+        })) {
+          fullText += chunk;
+          // Send chunk to client
+          res.write(`data: ${JSON.stringify({ text: chunk })}\n\n`);
+        }
+
+        const duration = (Date.now() - startTime) / 1000;
+        
+        console.log(
+          `✅ Streaming complete (${fullText.length} chars) in ${duration.toFixed(2)}s`
+        );
+
+        // Cache the full response
+        if (fullText) {
+          let ttl = 3600;
+          const codeKeywords = ["code", "function", "html", "css", "javascript", "react", "component", "example"];
+          if (codeKeywords.some(kw => prompt.toLowerCase().includes(kw))) {
+            ttl = 86400;
+          }
+          cacheService.set(prompt, effectiveUserId, fullText, ttl);
+        }
+
+        // Send completion signal
+        res.write(`data: ${JSON.stringify({ done: true, duration })}\n\n`);
+        res.end();
+
+        // Note: Memory storage happens via /api/end-chat endpoint (same as regular endpoint)
+        
+      } catch (streamError: any) {
+        console.error("❌ Streaming error:", streamError);
+        res.write(`data: ${JSON.stringify({ error: streamError.message })}\n\n`);
+        res.end();
+      }
+    } catch (err: any) {
+      console.error("❌ FATAL ERROR in /api/ask-ai-stream:", err);
+      if (!res.headersSent) {
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        res.end();
+      }
     }
-  } finally {
-    try {
-      const keyUser = req.body?.userId || "anonymous";
-      const keyChat = req.body?.chatId || "global";
-      const inFlightKey = `${keyUser}:${keyChat}`;
-      const existing = inFlightChatRequests.get(inFlightKey);
-      if (existing) clearTimeout(existing);
-      inFlightChatRequests.delete(inFlightKey);
-    } catch {}
   }
-});
+);
 
 /**
  * POST /api/process-document
@@ -1802,9 +2703,7 @@ app.post(
   express.json(),
   async (req, res) => {
     if (!vertex && !ai)
-      return res
-        .status(500)
-        .json({ error: "AI client not initialized" });
+      return res.status(500).json({ error: "AI client not initialized" });
 
     try {
       const {
@@ -1819,25 +2718,46 @@ app.post(
       if (prompt) {
         const promptValidation = SecurityValidator.validatePrompt(prompt);
         if (!promptValidation.valid) {
-          logSecurityEvent("Invalid document processing prompt", { userId, error: promptValidation.error });
-          return res.status(400).json({ error: promptValidation.error || "Invalid prompt format" });
+          logSecurityEvent("Invalid document processing prompt", {
+            userId,
+            error: promptValidation.error,
+          });
+          return res
+            .status(400)
+            .json({ error: promptValidation.error || "Invalid prompt format" });
         }
       }
 
       if (userId) {
         const userIdValidation = SecurityValidator.validateUserId(userId);
         if (!userIdValidation.valid) {
-          logSecurityEvent("Invalid userId in document processing", { userId, error: userIdValidation.error });
-          return res.status(400).json({ error: userIdValidation.error || "Invalid user ID format" });
+          logSecurityEvent("Invalid userId in document processing", {
+            userId,
+            error: userIdValidation.error,
+          });
+          return res
+            .status(400)
+            .json({
+              error: userIdValidation.error || "Invalid user ID format",
+            });
         }
       }
 
       // Validate base64 document size if provided (10MB limit)
       if (fileBase64) {
-        const base64Validation = SecurityValidator.validateBase64Image(fileBase64);
+        const base64Validation =
+          SecurityValidator.validateBase64Image(fileBase64);
         if (!base64Validation.valid) {
-          logSecurityEvent("Document base64 validation failed", { userId, error: base64Validation.error });
-          return res.status(400).json({ error: base64Validation.error || "Document size exceeds 10MB limit" });
+          logSecurityEvent("Document base64 validation failed", {
+            userId,
+            error: base64Validation.error,
+          });
+          return res
+            .status(400)
+            .json({
+              error:
+                base64Validation.error || "Document size exceeds 10MB limit",
+            });
         }
       }
 
@@ -1873,9 +2793,11 @@ app.post(
         ".txt": "text/plain",
         ".md": "text/markdown",
         ".pdf": "application/pdf",
-        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".docx":
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".doc": "application/msword",
-        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsx":
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".csv": "text/csv",
         ".json": "application/json",
       };
@@ -1887,7 +2809,9 @@ app.post(
         const buffer = fs.readFileSync(filePath);
         base64Data = buffer.toString("base64");
         if (!clientMime) {
-          const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+          const ext = filePath
+            .substring(filePath.lastIndexOf("."))
+            .toLowerCase();
           mimeType = SUPPORTED_EXTENSIONS[ext] || "application/pdf";
         }
       } else {
@@ -1898,15 +2822,16 @@ app.post(
 
       // Check if file type is supported
       if (!SUPPORTED_MIME_TYPES.includes(mimeType)) {
-        const fileExtension = Object.keys(SUPPORTED_EXTENSIONS).find(
-          ext => SUPPORTED_EXTENSIONS[ext] === mimeType
-        ) || "this file type";
-        
+        const fileExtension =
+          Object.keys(SUPPORTED_EXTENSIONS).find(
+            (ext) => SUPPORTED_EXTENSIONS[ext] === mimeType
+          ) || "this file type";
+
         console.warn(`Unsupported file type attempted: ${mimeType}`);
-        return res.status(400).json({ 
-          success: false, 
+        return res.status(400).json({
+          success: false,
           error: `We don't have the capability to process ${fileExtension} files yet. Supported formats: PDF, DOCX, DOC, TXT, MD, CSV, JSON, XLSX`,
-          unsupportedType: mimeType
+          unsupportedType: mimeType,
         });
       }
 
@@ -1921,7 +2846,7 @@ app.post(
       }
 
       // Use Gemini for document processing
-  const DOC_MODEL = "gemini-2.5-flash";
+      const DOC_MODEL = "gemini-2.5-flash";
       const defaultPrompt =
         "Extract all text content from this document. Provide a clean, well-formatted extraction of the text.";
       const userPrompt =
@@ -1932,44 +2857,61 @@ app.post(
       let extractedText = "";
 
       // Fast-path 1: Plain text files can be returned directly
-      if (mimeType === "text/plain" || mimeType === "text/markdown" || mimeType === "application/json" || mimeType === "text/csv") {
+      if (
+        mimeType === "text/plain" ||
+        mimeType === "text/markdown" ||
+        mimeType === "application/json" ||
+        mimeType === "text/csv"
+      ) {
         try {
           // Clean base64 data - remove any whitespace/newlines that might cause decoding issues
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           const textContent = Buffer.from(cleanedBase64, "base64").toString(
             "utf8"
           );
           extractedText = textContent;
-          console.log(`✅ Direct text extraction successful (${mimeType}), length: ${extractedText.length}`);
+          console.log(
+            `✅ Direct text extraction successful (${mimeType}), length: ${extractedText.length}`
+          );
         } catch (decodeErr) {
-          console.warn("Failed to decode text base64, falling back to local extraction", decodeErr);
+          console.warn(
+            "Failed to decode text base64, falling back to local extraction",
+            decodeErr
+          );
         }
       }
 
       // Fast-path 2: Use local extraction for DOCX, DOC, XLSX (Gemini doesn't support these)
       if (!extractedText && LOCAL_EXTRACTION_TYPES.includes(mimeType)) {
         try {
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           const buffer = Buffer.from(cleanedBase64, "base64");
           const local = await extractTextFromDocument(buffer, mimeType);
           if (local.text && local.text.trim()) {
             extractedText = local.text;
-            console.log(`✅ Local extraction succeeded via ${local.method} for ${mimeType}`);
+            console.log(
+              `✅ Local extraction succeeded via ${local.method} for ${mimeType}`
+            );
           }
         } catch (localErr) {
-          console.warn(`Local extraction failed for ${mimeType}, will try Gemini:`, localErr);
+          console.warn(
+            `Local extraction failed for ${mimeType}, will try Gemini:`,
+            localErr
+          );
         }
       }
 
       // Try local extraction first for PDFs
       if (!extractedText && mimeType === "application/pdf") {
         try {
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           if (!cleanedBase64) {
             throw new Error("Base64 data is empty after cleaning.");
           }
           const buffer = Buffer.from(cleanedBase64, "base64");
-          console.log(`Attempting local PDF extraction, buffer size: ${buffer.length} bytes`);
+          console.log(
+            `Attempting local PDF extraction, buffer size: ${buffer.length} bytes`
+          );
           const local = await extractTextFromDocument(buffer, mimeType);
           if (local.text && local.text.trim()) {
             extractedText = local.text;
@@ -1983,7 +2925,7 @@ app.post(
       // 🛟 Fallback: AI-based extraction for PDFs when local fails
       if (!extractedText || !extractedText.trim()) {
         try {
-          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, '');
+          const cleanedBase64 = base64Data.replace(/[\r\n\s]/g, "");
           if (!cleanedBase64) {
             return res.status(400).json({
               error: "The provided document appears to be empty or invalid.",
@@ -1991,7 +2933,7 @@ app.post(
             });
           }
           console.log("Attempting AI-based extraction with Vertex/Gemini...");
-          
+
           const result = await generateContent({
             model: "gemini-2.5-flash", // GA model for document processing
             contents: [
@@ -2003,25 +2945,32 @@ app.post(
                       data: cleanedBase64,
                     },
                   },
-                  { text: prompt || "Extract all text from this document." }
-                ]
-              }
-            ]
+                  { text: prompt || "Extract all text from this document." },
+                ],
+              },
+            ],
           });
 
           const aiText = result.parts?.[0]?.text || "";
           if (aiText && aiText.trim()) {
             extractedText = aiText;
-            console.log(`✅ AI extraction succeeded, length: ${extractedText.length}`);
+            console.log(
+              `✅ AI extraction succeeded, length: ${extractedText.length}`
+            );
           } else {
-             // If AI also returns nothing, the document is likely unreadable
-             console.warn("AI extraction returned no text. The document may be unreadable.");
+            // If AI also returns nothing, the document is likely unreadable
+            console.warn(
+              "AI extraction returned no text. The document may be unreadable."
+            );
           }
         } catch (aiErr) {
           console.warn("AI extraction failed:", aiErr);
           // Check for the specific "no pages" error
           const errorMessage = (aiErr as Error).message || "";
-          if (errorMessage.includes("document has no pages") || errorMessage.includes("INVALID_ARGUMENT")) {
+          if (
+            errorMessage.includes("document has no pages") ||
+            errorMessage.includes("INVALID_ARGUMENT")
+          ) {
             return res.status(400).json({
               error: "The PDF document is invalid or has no pages.",
               code: "INVALID_PDF",
@@ -2031,7 +2980,8 @@ app.post(
       }
 
       // Optionally store the processed document in memory
-      const { storeInMemory = false, fileName = "Uploaded Document" } = req.body;
+      const { storeInMemory = false, fileName = "Uploaded Document" } =
+        req.body;
       if (storeInMemory && extractedText && userId) {
         try {
           // Store the document and get its ID and summary
@@ -2049,10 +2999,11 @@ app.post(
             extractedText: extractedText, // Frontend needs this
             isDocument: true,
           });
-
         } catch (storageErr) {
           console.error("Failed to store document:", storageErr);
-          return res.status(500).json({ error: "Failed to process and store document." });
+          return res
+            .status(500)
+            .json({ error: "Failed to process and store document." });
         }
       }
 
@@ -2097,7 +3048,7 @@ app.post(
 app.post(
   "/api/process-image",
   express.json(),
-  upload.single('image'), // Handle multipart/form-data
+  upload.single("image"), // Handle multipart/form-data
   rateLimitMiddleware("general"),
   async (req, res) => {
     if (!vertex && !ai)
@@ -2113,12 +3064,16 @@ app.post(
       // Check if request is multipart/form-data (has file) or JSON
       if (req.file) {
         // Multipart/form-data upload
-        imageBase64 = req.file.buffer.toString('base64');
-        fileName = req.body.fileName || req.file.originalname || "Uploaded Image";
-        storeInMemory = req.body.storeInMemory === 'true' || req.body.storeInMemory === true;
+        imageBase64 = req.file.buffer.toString("base64");
+        fileName =
+          req.body.fileName || req.file.originalname || "Uploaded Image";
+        storeInMemory =
+          req.body.storeInMemory === "true" || req.body.storeInMemory === true;
         userId = req.body.userId;
         prompt = req.body.prompt;
-        console.log(`🖼️ Received multipart/form-data image upload: ${fileName} (${req.file.size} bytes)`);
+        console.log(
+          `🖼️ Received multipart/form-data image upload: ${fileName} (${req.file.size} bytes)`
+        );
       } else {
         // JSON request
         ({ imageBase64, fileName, storeInMemory, userId, prompt } = req.body);
@@ -2131,16 +3086,27 @@ app.post(
         return res.status(400).json({ error: "imageBase64 is required" });
       }
 
-      const base64Validation = SecurityValidator.validateBase64Image(imageBase64);
+      const base64Validation =
+        SecurityValidator.validateBase64Image(imageBase64);
       if (!base64Validation.valid) {
-        logSecurityEvent("Image validation failed in process-image", { userId, error: base64Validation.error });
-        return res.status(400).json({ error: base64Validation.error || "Invalid image data (max 10MB)" });
+        logSecurityEvent("Image validation failed in process-image", {
+          userId,
+          error: base64Validation.error,
+        });
+        return res
+          .status(400)
+          .json({
+            error: base64Validation.error || "Invalid image data (max 10MB)",
+          });
       }
 
       if (userId) {
         const userIdValidation = SecurityValidator.validateUserId(userId);
         if (!userIdValidation.valid) {
-          logSecurityEvent("Invalid userId in process-image", { userId, error: userIdValidation.error });
+          logSecurityEvent("Invalid userId in process-image", {
+            userId,
+            error: userIdValidation.error,
+          });
           return res.status(400).json({ error: userIdValidation.error });
         }
       }
@@ -2148,7 +3114,10 @@ app.post(
       if (prompt) {
         const promptValidation = SecurityValidator.validatePrompt(prompt);
         if (!promptValidation.valid) {
-          logSecurityEvent("Invalid prompt in process-image", { userId, error: promptValidation.error });
+          logSecurityEvent("Invalid prompt in process-image", {
+            userId,
+            error: promptValidation.error,
+          });
           return res.status(400).json({ error: promptValidation.error });
         }
       }
@@ -2157,7 +3126,9 @@ app.post(
 
       // Use vision model to analyze the image
       const visionModel = "gemini-2.5-flash";
-      const analysisPrompt = prompt || `Analyze this image in detail. Describe:
+      const analysisPrompt =
+        prompt ||
+        `Analyze this image in detail. Describe:
 1. What you see (objects, people, scenes, text)
 2. The style and composition
 3. Colors and visual elements
@@ -2172,16 +3143,19 @@ Provide a comprehensive description that will help answer questions about this i
           {
             parts: [
               { inlineData: { data: imageBase64, mimeType: "image/png" } },
-              { text: analysisPrompt }
-            ]
-          }
-        ]
+              { text: analysisPrompt },
+            ],
+          },
+        ],
       });
 
       const parts: any[] = response?.parts ?? [];
-      const description = parts.map((p: any) => p.text ?? "").join("") || "Image processed";
+      const description =
+        parts.map((p: any) => p.text ?? "").join("") || "Image processed";
 
-      console.log(`✅ Image analyzed - description length: ${description.length} chars`);
+      console.log(
+        `✅ Image analyzed - description length: ${description.length} chars`
+      );
 
       // Store in cache if requested
       if (storeInMemory && userId) {
@@ -2191,7 +3165,7 @@ Provide a comprehensive description that will help answer questions about this i
             fileName: fileName || "Uploaded Image",
             imageBase64,
             description,
-            mimeType: "image/png"
+            mimeType: "image/png",
           });
 
           return res.json({
@@ -2203,7 +3177,9 @@ Provide a comprehensive description that will help answer questions about this i
           });
         } catch (storageErr) {
           console.error("Failed to store image:", storageErr);
-          return res.status(500).json({ error: "Failed to process and store image." });
+          return res
+            .status(500)
+            .json({ error: "Failed to process and store image." });
         }
       }
 
@@ -2211,9 +3187,9 @@ Provide a comprehensive description that will help answer questions about this i
       return res.json({ success: true, description });
     } catch (err: any) {
       console.error("process-image error:", err);
-      return res.status(500).json({ 
-        success: false, 
-        error: err?.message ?? String(err) 
+      return res.status(500).json({
+        success: false,
+        error: err?.message ?? String(err),
       });
     }
   }
@@ -2225,151 +3201,181 @@ Provide a comprehensive description that will help answer questions about this i
  * OR multipart/form-data with 'image' field and editPrompt
  * Edit an image using AI - provide either imageBase64, imageId from cache, or upload file directly
  */
-app.post("/api/edit-image", express.json(), upload.single('image'), rateLimitMiddleware("image"), async (req, res) => {
-  if (!vertex && !ai)
-    return res.status(500).json({ error: "AI client not initialized" });
+app.post(
+  "/api/edit-image",
+  upload.single("image"),
+  rateLimitMiddleware("image"),
+  async (req, res) => {
+    if (!vertex && !ai)
+      return res.status(500).json({ error: "AI client not initialized" });
 
-  try {
-    let imageBase64: string | undefined;
-    let editPrompt: string;
-    let model: string | undefined;
-    let userId: string | undefined;
-    let imageId: string | undefined;
+    try {
+      let imageBase64: string | undefined;
+      let editPrompt: string;
+      let model: string | undefined;
+      let userId: string | undefined;
+      let imageId: string | undefined;
 
-    // Check if request is multipart/form-data (has file) or JSON
-    if (req.file) {
-      // Multipart/form-data upload - image file provided directly
-      imageBase64 = req.file.buffer.toString('base64');
-      editPrompt = req.body.editPrompt;
-      model = req.body.model;
-      userId = req.body.userId;
-      console.log(`🎨 Received multipart image for editing: ${req.file.originalname} (${req.file.size} bytes)`);
-    } else {
-      // JSON request
-      const body = req.body;
-      imageBase64 = body.imageBase64;
-      imageId = body.imageId;
-      editPrompt = body.editPrompt;
-      model = body.model;
-      userId = body.userId;
-    }
-
-    // 🔒 Validate inputs
-    if (
-      !editPrompt ||
-      typeof editPrompt !== "string" ||
-      !SecurityValidator.validatePrompt(editPrompt)
-    ) {
-      logSecurityEvent("Invalid image edit prompt", { userId });
-      return res.status(400).json({ error: "Invalid or missing editPrompt" });
-    }
-
-    // Get image data - priority: uploaded file > imageBase64 > imageId from cache
-    if (!imageBase64 && imageId) {
-      // Retrieve from cache
-      const { getImage } = require("./services/imageCacheService");
-      const imageData = getImage(imageId);
-      
-      if (!imageData) {
-        return res.status(404).json({ error: `Image with ID "${imageId}" not found in cache` });
+      // Check if request is multipart/form-data (has file) or JSON
+      if (req.file) {
+        // Multipart/form-data upload - image file provided directly
+        imageBase64 = req.file.buffer.toString("base64");
+        editPrompt = req.body.editPrompt;
+        model = req.body.model;
+        userId = req.body.userId;
+        console.log(
+          `🎨 Received multipart image for editing: ${req.file.originalname} (${req.file.size} bytes)`
+        );
+      } else {
+        // JSON request
+        const body = req.body;
+        imageBase64 = body.imageBase64;
+        imageId = body.imageId;
+        editPrompt = body.editPrompt;
+        model = body.model;
+        userId = body.userId;
       }
-      
-      imageBase64 = imageData.imageBase64;
-      console.log(`🖼️ Retrieved image from cache for editing: ${imageData.fileName}`);
-    }
 
-    if (
-      !imageBase64 ||
-      typeof imageBase64 !== "string" ||
-      !SecurityValidator.validateBase64Image(imageBase64)
-    ) {
-      logSecurityEvent("Invalid image in edit-image", { userId });
-      return res
-        .status(400)
-        .json({ error: "Invalid or oversized imageBase64 (max 10MB). Provide either imageBase64 or imageId." });
-    }
+      // 🔒 Validate inputs
+      if (
+        !editPrompt ||
+        typeof editPrompt !== "string" ||
+        !SecurityValidator.validatePrompt(editPrompt)
+      ) {
+        logSecurityEvent("Invalid image edit prompt", { userId });
+        return res.status(400).json({ error: "Invalid or missing editPrompt" });
+      }
 
-    if (userId && !SecurityValidator.validateUserId(userId)) {
-      logSecurityEvent("Invalid userId in edit-image", { userId });
-      return res.status(400).json({ error: "Invalid user ID format" });
-    }
+      // Get image data - priority: uploaded file > imageBase64 > imageId from cache
+      if (!imageBase64 && imageId) {
+        // Retrieve from cache
+        const { getImage } = require("./services/imageCacheService");
+        const imageData = getImage(imageId);
 
-    console.log(`🎨 Editing image with prompt: "${editPrompt}"`);
-
-    // NOTE: Gemini's image models (gemini-2.5-flash-image) only GENERATE new images, they don't edit existing ones
-    // For "editing", we'll use the vision model to analyze the image and generate a new one based on the edit instruction
-
-    // Step 1: Use vision model to describe the image
-    const visionModel = "gemini-2.5-flash"; // vision model for description
-    const descriptionResponse = await generateContent({
-      model: visionModel,
-      contents: [
-        {
-          parts: [
-            { inlineData: { data: imageBase64, mimeType: "image/png" } },
-            { text: "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood." }
-          ]
+        if (!imageData) {
+          return res
+            .status(404)
+            .json({ error: `Image with ID "${imageId}" not found in cache` });
         }
-      ]
-    });
-    const imageDescription = ((descriptionResponse as any)?.parts ?? [])
-      .map((p: any) => p.text)
-      .filter(Boolean)
-      .join(" ") || "an image";
 
-    // Step 2: Generate a new image based on the description + edit instruction
-    const imageModel = model ?? "gemini-2.5-flash-image"; // image generation model
-    const combinedPrompt = `Based on this description: "${imageDescription}"
+        imageBase64 = imageData.imageBase64;
+        console.log(
+          `🖼️ Retrieved image from cache for editing: ${imageData.fileName}`
+        );
+      }
+
+      if (
+        !imageBase64 ||
+        typeof imageBase64 !== "string" ||
+        !SecurityValidator.validateBase64Image(imageBase64)
+      ) {
+        logSecurityEvent("Invalid image in edit-image", { userId });
+        return res
+          .status(400)
+          .json({
+            error:
+              "Invalid or oversized imageBase64 (max 10MB). Provide either imageBase64 or imageId.",
+          });
+      }
+
+      if (userId && !SecurityValidator.validateUserId(userId)) {
+        logSecurityEvent("Invalid userId in edit-image", { userId });
+        return res.status(400).json({ error: "Invalid user ID format" });
+      }
+
+      console.log(`🎨 Editing image with prompt: "${editPrompt}"`);
+
+      // NOTE: Gemini's image models (gemini-2.5-flash-image) only GENERATE new images, they don't edit existing ones
+      // For "editing", we'll use the vision model to analyze the image and generate a new one based on the edit instruction
+
+      // Step 1: Use vision model to describe the image
+      const visionModel = "gemini-2.5-flash"; // vision model for description
+      const descriptionResponse = await generateContent({
+        model: visionModel,
+        contents: [
+          {
+            parts: [
+              { inlineData: { data: imageBase64, mimeType: "image/png" } },
+              {
+                text: "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.",
+              },
+            ],
+          },
+        ],
+      });
+      const imageDescription =
+        ((descriptionResponse as any)?.parts ?? [])
+          .map((p: any) => p.text)
+          .filter(Boolean)
+          .join(" ") || "an image";
+
+      // Step 2: Generate a new image based on the description + edit instruction
+      const imageModel = model ?? "gemini-2.5-flash-image"; // image generation model
+      const combinedPrompt = `Based on this description: "${imageDescription}"
 
 Apply this edit: ${editPrompt}
 
 Generate a new image that matches the original description but with the requested edits applied.`;
 
-    const response = await generateContent({ model: imageModel, contents: [combinedPrompt] });
-    const parts: any[] = (response as any)?.parts ?? [];
-    let newImageBase64: string | null = null;
-    let imageUri: string | null = null;
-    let altText: string | null = null;
+      const response = await generateContent({
+        model: imageModel,
+        contents: [combinedPrompt],
+      });
+      const parts: any[] = (response as any)?.parts ?? [];
+      let newImageBase64: string | null = null;
+      let imageUri: string | null = null;
+      let altText: string | null = null;
 
-    for (const part of parts) {
-      if ((part as any).inlineData?.data)
-        newImageBase64 = (part as any).inlineData.data;
-      if ((part as any).fileData?.fileUri)
-        imageUri = (part as any).fileData.fileUri;
-      if ((part as any).text) altText = (part as any).text ?? altText;
-    }
-
-    // Save locally for instant load
-    let imageLocalUri: string | null = null;
-    try {
-      if (localImageCacheService.isEnabled()) {
-        if (newImageBase64) {
-          const saved = await localImageCacheService.saveBase64(userId || 'anonymous', 'edit', newImageBase64, 'png');
-          imageLocalUri = saved.localUri;
-        } else if (imageUri) {
-          const saved = await localImageCacheService.saveFromUri(userId || 'anonymous', 'edit', imageUri, 'png');
-          imageLocalUri = saved.localUri;
-        }
+      for (const part of parts) {
+        if ((part as any).inlineData?.data)
+          newImageBase64 = (part as any).inlineData.data;
+        if ((part as any).fileData?.fileUri)
+          imageUri = (part as any).fileData.fileUri;
+        if ((part as any).text) altText = (part as any).text ?? altText;
       }
-    } catch (e) {
-      console.warn('⚠️ Failed to save edited image locally:', e);
-    }
 
-    return res.json({
-      success: true,
-      imageBase64: newImageBase64,
-      imageUri,
-      imageLocalUri,
-      altText,
-      raw: response,
-    });
-  } catch (err: any) {
-    console.error("edit-image error:", err);
-    return res
-      .status(500)
-      .json({ success: false, error: err?.message ?? String(err) });
+      // Save locally for instant load
+      let imageLocalUri: string | null = null;
+      try {
+        if (localImageCacheService.isEnabled()) {
+          if (newImageBase64) {
+            const saved = await localImageCacheService.saveBase64(
+              userId || "anonymous",
+              "edit",
+              newImageBase64,
+              "png"
+            );
+            imageLocalUri = saved.localUri;
+          } else if (imageUri) {
+            const saved = await localImageCacheService.saveFromUri(
+              userId || "anonymous",
+              "edit",
+              imageUri,
+              "png"
+            );
+            imageLocalUri = saved.localUri;
+          }
+        }
+      } catch (e) {
+        console.warn("⚠️ Failed to save edited image locally:", e);
+      }
+
+      return res.json({
+        success: true,
+        imageBase64: newImageBase64,
+        imageUri,
+        imageLocalUri,
+        altText,
+        raw: response,
+      });
+    } catch (err: any) {
+      console.error("edit-image error:", err);
+      return res
+        .status(500)
+        .json({ success: false, error: err?.message ?? String(err) });
+    }
   }
-});
+);
 
 /**
  * POST /api/edit-image-with-mask
@@ -2379,7 +3385,10 @@ Generate a new image that matches the original description but with the requeste
 app.post(
   "/api/edit-image-with-mask",
   express.json(),
-  upload.fields([{ name: 'image', maxCount: 1 }, { name: 'mask', maxCount: 1 }]),
+  upload.fields([
+    { name: "image", maxCount: 1 },
+    { name: "mask", maxCount: 1 },
+  ]),
   rateLimitMiddleware("image"),
   async (req, res) => {
     if (!vertex && !ai)
@@ -2393,15 +3402,23 @@ app.post(
       let userId: string | undefined;
 
       // Check if request is multipart/form-data (has files) or JSON
-      if (req.files && typeof req.files === 'object' && !Array.isArray(req.files)) {
-        const files = req.files as { [fieldname: string]: Express.Multer.File[] };
-        
+      if (
+        req.files &&
+        typeof req.files === "object" &&
+        !Array.isArray(req.files)
+      ) {
+        const files = req.files as {
+          [fieldname: string]: Express.Multer.File[];
+        };
+
         if (!files.image || !files.mask) {
-          return res.status(400).json({ error: "Both 'image' and 'mask' files are required" });
+          return res
+            .status(400)
+            .json({ error: "Both 'image' and 'mask' files are required" });
         }
-        
-        imageBase64 = files.image[0].buffer.toString('base64');
-        maskBase64 = files.mask[0].buffer.toString('base64');
+
+        imageBase64 = files.image[0].buffer.toString("base64");
+        maskBase64 = files.mask[0].buffer.toString("base64");
         editPrompt = req.body.editPrompt;
         model = req.body.model;
         userId = req.body.userId;
@@ -2465,10 +3482,11 @@ app.post(
           { inlineData: { data: imageBase64, mimeType: "image/png" } },
         ],
       });
-      const imageDescription = ((descriptionResponse as any)?.parts ?? [])
-        .map((p: any) => p.text)
-        .filter(Boolean)
-        .join(" ") || "an image";
+      const imageDescription =
+        ((descriptionResponse as any)?.parts ?? [])
+          .map((p: any) => p.text)
+          .filter(Boolean)
+          .join(" ") || "an image";
 
       // Step 2: Analyze the mask to understand what areas to edit
       const maskResponse = await generateContent({
@@ -2478,13 +3496,14 @@ app.post(
           { inlineData: { data: maskBase64, mimeType: "image/png" } },
         ],
       });
-      const maskDescription = ((maskResponse as any)?.parts ?? [])
-        .map((p: any) => p.text)
-        .filter(Boolean)
-        .join(" ") || "marked areas";
+      const maskDescription =
+        ((maskResponse as any)?.parts ?? [])
+          .map((p: any) => p.text)
+          .filter(Boolean)
+          .join(" ") || "marked areas";
 
       // Step 3: Generate new image with edits applied to masked areas
-    const imageModel = model ?? "gemini-2.5-flash-image";
+      const imageModel = model ?? "gemini-2.5-flash-image";
       const combinedPrompt = `Original image: ${imageDescription}
 
 Masked areas to edit: ${maskDescription}
@@ -2493,8 +3512,11 @@ Edit instruction for the masked areas ONLY: ${editPrompt}
 
 Generate a new version of the image with the edit applied ONLY to the masked areas. Keep everything else the same as the original.`;
 
-  const response = await generateContent({ model: imageModel, contents: [combinedPrompt] });
-  const parts: any[] = (response as any)?.parts ?? [];
+      const response = await generateContent({
+        model: imageModel,
+        contents: [combinedPrompt],
+      });
+      const parts: any[] = (response as any)?.parts ?? [];
       let newImageBase64: string | null = null;
       let imageUri: string | null = null;
       let altText: string | null = null;
@@ -2512,15 +3534,25 @@ Generate a new version of the image with the edit applied ONLY to the masked are
       try {
         if (localImageCacheService.isEnabled()) {
           if (newImageBase64) {
-            const saved = await localImageCacheService.saveBase64(userId || 'anonymous', 'edit-mask', newImageBase64, 'png');
+            const saved = await localImageCacheService.saveBase64(
+              userId || "anonymous",
+              "edit-mask",
+              newImageBase64,
+              "png"
+            );
             imageLocalUri2 = saved.localUri;
           } else if (imageUri) {
-            const saved = await localImageCacheService.saveFromUri(userId || 'anonymous', 'edit-mask', imageUri, 'png');
+            const saved = await localImageCacheService.saveFromUri(
+              userId || "anonymous",
+              "edit-mask",
+              imageUri,
+              "png"
+            );
             imageLocalUri2 = saved.localUri;
           }
         }
       } catch (e) {
-        console.warn('⚠️ Failed to save edited(mask) image locally:', e);
+        console.warn("⚠️ Failed to save edited(mask) image locally:", e);
       }
 
       return res.json({
@@ -2938,7 +3970,7 @@ app.get("/api/recent-context/:userId", async (req, res) => {
  * POST /api/hybrid-memory-search
  * Search using hybrid memory system
  */
-app.post("/api/hybrid-memory-search", express.json(), async (req, res) => {
+app.post("/api/hybrid-memory-search", async (req, res) => {
   try {
     const {
       userId,
@@ -3003,31 +4035,25 @@ app.post(
 
       // Validate text fields length
       if (name && (typeof name !== "string" || name.length > 200)) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "Name must be a string (max 200 chars)",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "Name must be a string (max 200 chars)",
+        });
       }
       if (role && (typeof role !== "string" || role.length > 200)) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "Role must be a string (max 200 chars)",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "Role must be a string (max 200 chars)",
+        });
       }
       if (
         background &&
         (typeof background !== "string" || background.length > 5000)
       ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "Background must be a string (max 5000 chars)",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "Background must be a string (max 5000 chars)",
+        });
       }
 
       const profileData: any = {};
@@ -3145,7 +4171,7 @@ app.get("/api/performance-stats", (req, res) => {
  * Called when user switches chats - persists current chat to Pinecone
  * 🎯 OPTIMIZED: Respects cooldown to avoid spam uploads
  */
-app.post("/api/end-chat", rateLimitMiddleware("general"), express.json(), async (req, res) => {
+app.post("/api/end-chat", rateLimitMiddleware("general"), async (req, res) => {
   try {
     const { userId, chatId, force } = req.body;
 
@@ -3170,7 +4196,7 @@ app.post("/api/end-chat", rateLimitMiddleware("general"), express.json(), async 
 
     // Enqueue background persistence job with retry/backoff
     const queue = getJobQueue();
-    queue.enqueue('persist-chat', { userId, chatId, force: !!force });
+    queue.enqueue("persist-chat", { userId, chatId, force: !!force });
 
     // Respond immediately (don't make user wait for Pinecone upload)
     return res.json({
@@ -3231,12 +4257,10 @@ app.post(
             userId,
             chatId,
           });
-          return res
-            .status(400)
-            .json({
-              success: false,
-              error: `Invalid chatId format: ${chatId}`,
-            });
+          return res.status(400).json({
+            success: false,
+            error: `Invalid chatId format: ${chatId}`,
+          });
         }
       }
 
@@ -3249,7 +4273,7 @@ app.post(
       let enqueued = 0;
       for (const chatId of chatIds) {
         try {
-          queue.enqueue('persist-chat', { userId, chatId, force: true });
+          queue.enqueue("persist-chat", { userId, chatId, force: true });
           enqueued += 1;
         } catch (error) {
           console.error(`❌ Failed to enqueue save for chat ${chatId}:`, error);
@@ -3326,19 +4350,19 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
         const storedChats = await pineconeStorage.getUserChats(userId, 200);
 
         // Convert to API response format
-          const pineconeChats = storedChats.map((chat: any) => ({
+        const pineconeChats = storedChats.map((chat: any) => ({
           id: chat.chatId,
           title: chat.title,
           timestamp: new Date(chat.createdAt).toISOString(),
           userId: userId,
           messages: chat.messages.map((msg: any) => ({
-              id: msg.id,
+            id: msg.id,
             role: msg.role,
             content: msg.content,
-              timestamp: new Date(msg.timestamp).toISOString(),
-              attachments:
-                msg.hasImage && msg.imageUrl ? [msg.imageUrl] : undefined,
-              imagePrompt: msg.imagePrompt,
+            timestamp: new Date(msg.timestamp).toISOString(),
+            attachments:
+              msg.hasImage && msg.imageUrl ? [msg.imageUrl] : undefined,
+            imagePrompt: msg.imagePrompt,
           })),
           source: "pinecone", // Mark source
         }));
@@ -3389,42 +4413,135 @@ app.get("/api/chats", rateLimitMiddleware("general"), async (req, res) => {
 // Register job handlers (once at module load time)
 (() => {
   const queue = getJobQueue();
-  queue.register('persist-chat', async ({ userId, chatId, force }: { userId: string; chatId: string; force: boolean }) => {
-    console.log(`💾 [QUEUE] Persisting chat ${chatId} (force=${force})...`);
-    const hybridMemoryService = getHybridMemoryService();
-    if (force) {
-      await hybridMemoryService.forceUpload(userId, chatId);
-    } else {
-      await hybridMemoryService.persistChatSession(userId, chatId);
+  queue.register(
+    "persist-chat",
+    async ({
+      userId,
+      chatId,
+      force,
+    }: {
+      userId: string;
+      chatId: string;
+      force: boolean;
+    }) => {
+      console.log(`💾 [QUEUE] Persisting chat ${chatId} (force=${force})...`);
+      const hybridMemoryService = getHybridMemoryService();
+      if (force) {
+        await hybridMemoryService.forceUpload(userId, chatId);
+      } else {
+        await hybridMemoryService.persistChatSession(userId, chatId);
+      }
+      await firestoreChatService.markChatPersisted(userId, chatId);
+      console.log(`✅ [QUEUE] Chat ${chatId} persisted`);
     }
-    await firestoreChatService.markChatPersisted(userId, chatId);
-    console.log(`✅ [QUEUE] Chat ${chatId} persisted`);
-  });
+  );
 })();
 
 // Queue stats endpoint for debugging
-app.get('/api/queue-stats', rateLimitMiddleware('general'), (req, res) => {
+app.get("/api/queue-stats", rateLimitMiddleware("general"), (req, res) => {
   try {
     const stats = getJobQueue().getStats();
     return res.json({ success: true, stats });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || String(err) });
   }
 });
 
 // Dead-letter inspection endpoint (debug only)
-app.get('/api/queue-dead-letter', rateLimitMiddleware('general'), (req, res) => {
+app.get(
+  "/api/queue-dead-letter",
+  rateLimitMiddleware("general"),
+  (req, res) => {
+    try {
+      const limitParam =
+        typeof req.query.limit === "string"
+          ? parseInt(req.query.limit, 10)
+          : undefined;
+      const limit =
+        Number.isFinite(limitParam) && limitParam! > 0 ? limitParam! : 20;
+      const dead = getJobQueue().getDeadLetter(limit);
+      return res.json({ success: true, dead });
+    } catch (err: any) {
+      return res
+        .status(500)
+        .json({ success: false, error: err?.message || String(err) });
+    }
+  }
+);
+
+// 📊 Admin Analytics Endpoint - View intent classification statistics
+app.get("/api/admin/intent-analytics", (req, res) => {
   try {
-    const limitParam = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : undefined;
-    const limit = Number.isFinite(limitParam) && limitParam! > 0 ? limitParam! : 20;
-    const dead = getJobQueue().getDeadLetter(limit);
-    return res.json({ success: true, dead });
+    const totalClassifications = cacheHits + cacheMisses;
+    const cacheHitRate =
+      totalClassifications > 0
+        ? ((cacheHits / totalClassifications) * 100).toFixed(1) + "%"
+        : "0%";
+
+    const totalIntents = Array.from(intentAnalytics.values()).reduce(
+      (a, b) => a + b,
+      0
+    );
+    const intentDistribution = Array.from(intentAnalytics.entries()).map(
+      ([intent, count]) => ({
+        intent,
+        count,
+        percentage:
+          totalIntents > 0
+            ? ((count / totalIntents) * 100).toFixed(1) + "%"
+            : "0%",
+      })
+    );
+
+    const avgClassificationTime =
+      classificationTimes.length > 0
+        ? (
+            classificationTimes.reduce((a, b) => a + b, 0) /
+            classificationTimes.length
+          ).toFixed(2) + "ms"
+        : "N/A";
+
+    res.json({
+      success: true,
+      analytics: {
+        intentDistribution,
+        totalClassifications,
+        performance: {
+          avgClassificationTime,
+          cacheHitRate,
+          cacheHits,
+          cacheMisses,
+          cacheSize: intentCache.size,
+        },
+      },
+    });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || String(err) });
+    console.error("❌ Error fetching intent analytics:", err);
+    res
+      .status(500)
+      .json({ success: false, error: err?.message || String(err) });
   }
 });
 
-app.listen(port, () => {
+// Start server with increased timeout for long-running requests (code generation, etc.)
+const server = app.listen(port, async () => {
   console.log(`Server listening on http://localhost:${port}`);
   console.log(`✅ User profiles will be created dynamically from user data`);
+  
+  // Warm response cache with common questions
+  try {
+    const cacheService = getResponseCacheService();
+    await cacheService.warmCache();
+  } catch (error) {
+    console.warn("⚠️ Cache warming failed (non-critical):", error);
+  }
 });
+
+// Configure timeouts
+server.timeout = 300000; // 5 minutes (300 seconds)
+server.keepAliveTimeout = 305000; // 305 seconds (slightly higher than timeout)
+server.headersTimeout = 310000; // 310 seconds (slightly higher than keepAliveTimeout)
+console.log('✅ Server timeouts configured: 5 minutes for long requests');
+

@@ -103,10 +103,53 @@ export class ImageRehydrationService {
     }
 
     const rehydratedAttachments = await Promise.all(
-      message.attachments.map(async (attachment: any) => {
+      message.attachments.map(async (attachment: any, index: number) => {
+        // Check if attachment is an IndexedDB placeholder
+        if (attachment && typeof attachment === 'object' && attachment.type === 'indexeddb') {
+          const imageId = attachment.messageId || message.id;
+          console.log(`🔍 Found IndexedDB placeholder for message: ${imageId}, index: ${index}`);
+          try {
+            const cached = await imageStorageService.getImage(imageId);
+            if (cached) {
+              console.log(`✅ Rehydrated image from IndexedDB: ${imageId}`);
+              return cached.imageData;
+            }
+            console.warn(`⚠️ Image not found in IndexedDB with ID: ${imageId} - image may have been cleared or not yet stored`);
+          } catch (error) {
+            console.error(`❌ Failed to rehydrate from IndexedDB:`, error);
+          }
+          return null; // Return null if not found
+        }
+        
         const url = typeof attachment === 'string' ? attachment : attachment?.url;
         
-        if (!url) return attachment;
+        if (!url) {
+          // No URL - try to find in IndexedDB by message ID
+          // This handles generated images that were stripped from localStorage
+          console.log(`🔍 No attachment URL found, checking IndexedDB for message: ${message.id}`);
+          try {
+            // Try to find image by message ID
+            const imageId = `${message.id}-${index}` || message.id;
+            const cached = await imageStorageService.getImage(imageId);
+            if (cached) {
+              console.log(`✅ Found image in IndexedDB by message ID: ${imageId}`);
+              return cached.imageData;
+            }
+            
+            // Also try with just message ID (for single-image messages)
+            if (index === 0) {
+              const cached2 = await imageStorageService.getImage(message.id);
+              if (cached2) {
+                console.log(`✅ Found image in IndexedDB by message ID: ${message.id}`);
+                return cached2.imageData;
+              }
+            }
+          } catch (error) {
+            console.warn(`⚠️ Failed to search IndexedDB for message ${message.id}:`, error);
+          }
+          
+          return attachment; // Return undefined if not found
+        }
 
         // Skip if already base64 or already rehydrated
         if (this.isBase64Url(url)) {
@@ -159,9 +202,12 @@ export class ImageRehydrationService {
       })
     );
 
+    // Filter out null values (images that couldn't be rehydrated)
+    const validAttachments = rehydratedAttachments.filter(att => att !== null && att !== undefined);
+
     return {
       ...message,
-      attachments: rehydratedAttachments
+      attachments: validAttachments.length > 0 ? validAttachments : undefined
     };
   }
 

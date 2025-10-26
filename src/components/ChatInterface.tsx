@@ -3,6 +3,8 @@ import { Send, Paperclip, Mic, Download, Eye, Copy, Check, Square, Pencil, FileT
 import { Button } from "./ui/button";
 import Textarea from "react-textarea-autosize"; // Use auto-sizing textarea
 import { toast } from "sonner";
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { ChatHistory as Chat, ChatMessage as Message, User } from "../types"; // UPDATED: Use centralized types
 import { apiService, handleApiError } from "../services/api";
 import {
@@ -167,6 +169,7 @@ export function ChatInterface({
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false); // 🌊 NEW: Track streaming state
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isImageModeActive, setIsImageModeActive] = useState(false);
   const [pendingImagePrompt, setPendingImagePrompt] = useState<string | null>(null);
@@ -924,7 +927,145 @@ ${procResp.extractedText}`,
         console.log(`💡 Optimized context: Sending ${conversationHistory.length} recent messages + summary of ${olderMessages.length} older messages`);
       }
       
-      // Call the backend API with chat-scoped memory
+      // 🌊 STREAMING MODE: Use streaming for text-only requests
+      const useStreaming = !imageFile; // Stream only for text (not images)
+      
+      if (useStreaming) {
+        // 🌊 Create placeholder message that will update as chunks arrive
+        const placeholderMessageId = (Date.now() + 1).toString();
+        const placeholderMessage: Message = {
+          id: placeholderMessageId,
+          content: '',
+          role: 'assistant',
+          timestamp: new Date(),
+        };
+        
+        // Add placeholder immediately so user sees response starting
+        const chatWithPlaceholder = {
+          ...updatedChat,
+          messages: [...updatedChat.messages, placeholderMessage],
+          title: isFirstMessage
+            ? (text || "New Chat").slice(0, 40) + (text.length > 40 ? "..." : "")
+            : updatedChat.title,
+        };
+        
+        safeUpdateChat(() => chatWithPlaceholder);
+        setIsStreaming(true);
+        
+        let accumulatedText = '';
+        
+        try {
+          await apiService.askAIStream({
+            message: text,
+            userId: user?.id,
+            userName: user?.name,
+            chatId: targetChatId,
+            messageCount: targetChatSnapshot.messages.length,
+            conversationHistory,
+            conversationSummary,
+            useMemory: true,
+            onChunk: (chunk, isCached) => {
+              // Accumulate text as chunks arrive
+              accumulatedText += chunk;
+              
+              // Update the placeholder message with accumulated text
+              safeUpdateChat(chat => {
+                if (!chat) return chat;
+                return {
+                  ...chat,
+                  messages: chat.messages.map(m =>
+                    m.id === placeholderMessageId
+                      ? { ...m, content: accumulatedText }
+                      : m
+                  )
+                };
+              });
+            },
+            onComplete: (metadata) => {
+              console.log(`✅ Streaming complete in ${metadata.duration}s${metadata.cached ? ' (cached)' : ''}`);
+              
+              // Add final metadata to message
+              safeUpdateChat(chat => {
+                if (!chat) return chat;
+                return {
+                  ...chat,
+                  messages: chat.messages.map(m =>
+                    m.id === placeholderMessageId
+                      ? {
+                          ...m,
+                          metadata: {
+                            duration: metadata.duration,
+                            cached: metadata.cached,
+                            streaming: true
+                          }
+                        }
+                      : m
+                  )
+                };
+              });
+              
+              setIsStreaming(false);
+              setIsLoading(false);
+            },
+            onError: (error) => {
+              console.error('❌ Streaming error:', error);
+              toast.error(`Streaming error: ${error}`);
+              
+              // Replace placeholder with error message
+              safeUpdateChat(chat => {
+                if (!chat) return chat;
+                return {
+                  ...chat,
+                  messages: chat.messages.map(m =>
+                    m.id === placeholderMessageId
+                      ? {
+                          ...m,
+                          content: `Sorry, I encountered an error: ${error}. Please try again.`
+                        }
+                      : m
+                  )
+                };
+              });
+              
+              setIsStreaming(false);
+              setIsLoading(false);
+            },
+            signal: controller.signal
+          });
+          
+          return; // Exit after streaming completes
+          
+        } catch (error) {
+          // Handle abort or other errors
+          if ((error as Error).name === 'AbortError' && (signal as any).aborted && (controller as any).wasAborted) {
+            return; // User stopped generation
+          }
+          
+          const errorMessage = handleApiError(error);
+          toast.error(errorMessage);
+          
+          safeUpdateChat(chat => {
+            if (!chat) return chat;
+            return {
+              ...chat,
+              messages: chat.messages.map(m =>
+                m.id === placeholderMessageId
+                  ? {
+                      ...m,
+                      content: `Sorry, I encountered an error: ${errorMessage}. Please try again.`
+                    }
+                  : m
+              )
+            };
+          });
+          
+          setIsStreaming(false);
+          setIsLoading(false);
+          return;
+        }
+      }
+      
+      // 📦 NON-STREAMING MODE: For image requests, use traditional approach
       const response = await apiService.askAI({
         message: text,
         image: imageFile,
@@ -1747,9 +1888,47 @@ ${procResp.extractedText}`,
                               f.includes('/o/')
                             );
                           })) && (
-                            <p className="whitespace-pre-wrap text-sm">
-                              {message.content}
-                            </p>
+                            <div className="prose dark:prose-invert max-w-none text-sm break-words">
+                              <ReactMarkdown
+                                remarkPlugins={[remarkGfm]}
+                                components={{
+                                  // Custom styling for markdown elements
+                                  h1: ({ node, ...props }) => <h1 className="text-xl font-bold mt-4 mb-2 break-words" {...props} />,
+                                  h2: ({ node, ...props }) => <h2 className="text-lg font-bold mt-3 mb-2 break-words" {...props} />,
+                                  h3: ({ node, ...props }) => <h3 className="text-base font-semibold mt-2 mb-1 break-words" {...props} />,
+                                  code: ({ node, inline, className, children, ...props }: any) => {
+                                    if (inline) {
+                                      return (
+                                        <code className="bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 px-1.5 py-0.5 rounded text-xs font-mono break-all" {...props}>
+                                          {children}
+                                        </code>
+                                      );
+                                    }
+                                    // Block code
+                                    return (
+                                      <code className="text-zinc-900 dark:text-zinc-100 text-xs font-mono block whitespace-pre-wrap break-words" {...props}>
+                                        {children}
+                                      </code>
+                                    );
+                                  },
+                                  pre: ({ node, children, ...props }) => (
+                                    <pre className="bg-zinc-100 dark:bg-zinc-800 p-4 rounded-lg my-3 border border-zinc-200 dark:border-zinc-700 overflow-hidden max-w-full" {...props}>
+                                      {children}
+                                    </pre>
+                                  ),
+                                  ul: ({ node, ...props }) => <ul className="list-disc list-inside my-2 space-y-1 break-words" {...props} />,
+                                  ol: ({ node, ...props }) => <ol className="list-decimal list-inside my-2 space-y-1 break-words" {...props} />,
+                                  blockquote: ({ node, ...props }) => (
+                                    <blockquote className="border-l-4 border-primary pl-4 italic my-2 text-muted-foreground break-words" {...props} />
+                                  ),
+                                  p: ({ node, ...props }) => <p className="whitespace-pre-wrap my-1 break-words" {...props} />,
+                                  strong: ({ node, ...props }) => <strong className="font-bold break-words" {...props} />,
+                                  em: ({ node, ...props }) => <em className="italic break-words" {...props} />,
+                                }}
+                              >
+                                {message.content}
+                              </ReactMarkdown>
+                            </div>
                           )}
                           {message.attachments && message.attachments.length > 0 && editingMessageId !== message.id && (
                             <div className="mt-2 space-y-1">
@@ -1885,10 +2064,15 @@ ${procResp.extractedText}`,
               <div className="flex justify-start">
                 <div className="flex flex-col items-start animate-fade-in">
                   <div className="bg-gray-100 rounded-2xl px-4 py-3">
-                    <div className="flex space-x-1">
-                      <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
-                      <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
-                      <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                    <div className="flex items-center space-x-2">
+                      <div className="flex space-x-1">
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                      </div>
+                      {isStreaming && (
+                        <span className="text-xs text-gray-500 ml-2">✨ Streaming...</span>
+                      )}
                     </div>
                   </div>
                 </div>

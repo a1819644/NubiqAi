@@ -1,5 +1,6 @@
 import * as admin from "firebase-admin";
 import { ConversationTurn } from "./conversationService";
+import { getFirestore, initializeFirebaseAdmin } from "./firebaseAdmin";
 
 interface FirestoreChatMessage {
   id: string;
@@ -32,19 +33,12 @@ class FirestoreChatService {
   private readonly maxMessagesPerChat = 40;
 
   constructor() {
-    try {
-      if (!admin.apps.length) {
-        const serviceAccount = require("../serviceAccountKey.json");
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount),
-          storageBucket: `${serviceAccount.project_id}.firebasestorage.app`,
-        });
-        console.log("🔥 Firebase Admin initialized (FireStore Chat Service)");
-      }
-      this.firestore = admin.firestore();
-    } catch (error) {
-      console.error("❌ Failed to initialize Firestore:", error);
-      this.firestore = null;
+    initializeFirebaseAdmin();
+    this.firestore = getFirestore();
+    if (this.firestore) {
+      console.log("✅ FirestoreChatService initialized");
+    } else {
+      console.warn("⚠️ FirestoreChatService running without Firestore (operations will be skipped)");
     }
   }
 

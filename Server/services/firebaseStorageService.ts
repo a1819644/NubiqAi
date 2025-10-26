@@ -1,5 +1,6 @@
 import * as admin from 'firebase-admin';
 import { v4 as uuidv4 } from 'uuid';
+import { getStorageBucket, initializeFirebaseAdmin } from './firebaseAdmin';
 
 /**
  * Firebase Storage Service
@@ -20,21 +21,18 @@ class FirebaseStorageService {
 
   constructor() {
     try {
-      // Initialize Firebase Admin if not already initialized
-      if (!admin.apps.length) {
-        const serviceAccount = require('../serviceAccountKey.json');
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount),
-          storageBucket: `${serviceAccount.project_id}.firebasestorage.app` // Try new format
-        });
-        console.log('🔥 Firebase Admin initialized');
+      initializeFirebaseAdmin();
+      const storage = getStorageBucket();
+      
+      if (storage) {
+        this.bucket = storage.bucket();
+        this.initialized = true;
+        console.log('✅ Firebase Storage Service initialized');
+        console.log(`📦 Using bucket: ${this.bucket.name}`);
+      } else {
+        console.warn('⚠️ Firebase Storage Service running without storage (operations will fail gracefully)');
+        this.initialized = false;
       }
-
-      // Get the default bucket
-      this.bucket = admin.storage().bucket();
-      this.initialized = true;
-      console.log('✅ Firebase Storage Service initialized');
-      console.log(`📦 Using bucket: ${this.bucket.name}`);
     } catch (error) {
       console.error('❌ Failed to initialize Firebase Storage Service:', error);
       this.initialized = false;

@@ -17,6 +17,7 @@
     "@google/genai": "^1.21.0",
     "@pinecone-database/pinecone": "^6.1.2",
     "@types/multer": "^2.0.0",
+    "@types/uuid": "^10.0.0",
     "ai-dashboard-portal-mockup": "file:..",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
@@ -25,8 +26,12 @@
     "firebase-admin": "^13.5.0",
     "mammoth": "^1.7.0",
     "multer": "^2.0.2",
+    "node-cache": "^5.1.2",
     "node-fetch": "^3.3.2",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "uuid": "^13.0.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

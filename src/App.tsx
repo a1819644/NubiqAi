@@ -98,9 +98,14 @@ export default function App() {
           ...chat,
           messages: chat.messages.map(msg => ({
             ...msg,
-            attachments: msg.attachments?.map(att => {
+            attachments: msg.attachments?.map((att, index) => {
               // If attachment is an object with a URL, keep it
               if (typeof att === 'object' && att !== null && (att as any).url) {
+                // Check if it's a base64 URL in object form
+                if ((att as any).url.startsWith('data:image')) {
+                  // Keep a placeholder with message ID reference for IndexedDB lookup
+                  return { messageId: msg.id, index, type: 'indexeddb' };
+                }
                 return att;
               }
               // Keep Firebase URLs for rehydration
@@ -109,16 +114,16 @@ export default function App() {
               }
               // Remove base64 images to save space (will be loaded from IndexedDB)
               if (typeof att === 'string' && att.startsWith('data:image')) {
-                // IMPORTANT: This is where base64 is stripped. The rehydration logic must handle this.
-                return undefined; // Remove base64, will be rehydrated from IndexedDB
+                // IMPORTANT: Keep a placeholder so rehydration knows to look in IndexedDB
+                return { messageId: msg.id, index, type: 'indexeddb' };
               }
               return att;
-            }).filter(att => att !== undefined) // Remove undefined placeholders
+            }) // Don't filter - keep placeholders!
           }))
         }));
         
         localStorage.setItem(localStorageKey, JSON.stringify(chatsForStorage));
-        console.log(`💾 Auto-saved ${chats.length} chat(s) to localStorage (Firebase URLs preserved)`);
+        console.log(`💾 Auto-saved ${chats.length} chat(s) to localStorage (IndexedDB placeholders preserved)`);
       } catch (error: any) {
         if (error.name === 'QuotaExceededError') {
           console.error('❌ localStorage quota exceeded! Clearing old data...');

@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>IndexedDB Image Checker</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 1200px;
+      margin: 20px auto;
+      padding: 20px;
+      background: #1a1a1a;
+      color: #fff;
+    }
+    h1 { color: #3b82f6; }
+    .section {
+      background: #2a2a2a;
+      padding: 15px;
+      margin: 15px 0;
+      border-radius: 8px;
+      border: 1px solid #3a3a3a;
+    }
+    button {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 5px;
+    }
+    button:hover { background: #2563eb; }
+    pre {
+      background: #1a1a1a;
+      padding: 10px;
+      border-radius: 4px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .image-preview {
+      max-width: 200px;
+      max-height: 200px;
+      border: 2px solid #3b82f6;
+      border-radius: 4px;
+      margin: 10px 0;
+    }
+    .success { color: #10b981; }
+    .error { color: #ef4444; }
+    .warning { color: #f59e0b; }
+  </style>
+</head>
+<body>
+  <h1>🔍 IndexedDB Image Checker for NubiqAI</h1>
+  
+  <div class="section">
+    <h2>Quick Actions</h2>
+    <button onclick="checkIndexedDB()">🔍 Check IndexedDB Images</button>
+    <button onclick="checkLocalStorage()">📦 Check localStorage Chats</button>
+    <button onclick="clearIndexedDB()">🗑️ Clear All IndexedDB Images</button>
+    <button onclick="testImageStore()">🧪 Test Store Image</button>
+  </div>
+
+  <div id="results"></div>
+
+  <script>
+    const dbName = 'NubiqAI_ImageCache';
+    const storeName = 'images';
+
+    async function checkIndexedDB() {
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = '<div class="section"><h3>Checking IndexedDB...</h3></div>';
+
+      try {
+        const db = await openDB();
+        const transaction = db.transaction([storeName], 'readonly');
+        const store = transaction.objectStore(storeName);
+        const request = store.getAll();
+
+        request.onsuccess = () => {
+          const images = request.result;
+          
+          if (images.length === 0) {
+            resultsDiv.innerHTML += `
+              <div class="section error">
+                <h3>❌ No Images Found in IndexedDB</h3>
+                <p>IndexedDB database exists but contains no images.</p>
+                <p>This means images were never stored, or they were cleared.</p>
+              </div>
+            `;
+            return;
+          }
+
+          let html = `
+            <div class="section success">
+              <h3>✅ Found ${images.length} Image(s) in IndexedDB</h3>
+          `;
+
+          images.forEach((img, index) => {
+            const sizeKB = Math.round(img.size / 1024);
+            const date = new Date(img.timestamp).toLocaleString();
+            const lastAccessed = new Date(img.lastAccessed).toLocaleString();
+            
+            html += `
+              <div style="border-top: 1px solid #3a3a3a; padding-top: 10px; margin-top: 10px;">
+                <h4>Image ${index + 1}</h4>
+                <p><strong>ID:</strong> ${img.id}</p>
+                <p><strong>User ID:</strong> ${img.userId}</p>
+                <p><strong>Chat ID:</strong> ${img.chatId}</p>
+                <p><strong>Prompt:</strong> ${img.prompt || '(none)'}</p>
+                <p><strong>Firebase URL:</strong> ${img.firebaseUrl || '❌ Not set'}</p>
+                <p><strong>Size:</strong> ${sizeKB} KB</p>
+                <p><strong>Created:</strong> ${date}</p>
+                <p><strong>Last Accessed:</strong> ${lastAccessed}</p>
+                ${img.imageData.startsWith('data:image') ? 
+                  `<img src="${img.imageData}" class="image-preview" alt="Preview">` : 
+                  '<p class="warning">⚠️ Image data format: ' + img.imageData.substring(0, 50) + '...</p>'
+                }
+              </div>
+            `;
+          });
+
+          html += '</div>';
+          resultsDiv.innerHTML += html;
+        };
+
+        request.onerror = () => {
+          resultsDiv.innerHTML += `
+            <div class="section error">
+              <h3>❌ Error Reading IndexedDB</h3>
+              <pre>${request.error}</pre>
+            </div>
+          `;
+        };
+
+        db.close();
+      } catch (error) {
+        resultsDiv.innerHTML += `
+          <div class="section error">
+            <h3>❌ Failed to Open IndexedDB</h3>
+            <pre>${error}</pre>
+          </div>
+        `;
+      }
+    }
+
+    async function checkLocalStorage() {
+      const resultsDiv = document.getElementById('results');
+      
+      try {
+        // Find all localStorage keys that match chat history pattern
+        const chatKeys = Object.keys(localStorage).filter(k => k.startsWith('chat_history_'));
+        
+        if (chatKeys.length === 0) {
+          resultsDiv.innerHTML += `
+            <div class="section warning">
+              <h3>⚠️ No Chat History Found in localStorage</h3>
+              <p>No keys found matching 'chat_history_*'</p>
+            </div>
+          `;
+          return;
+        }
+
+        let html = `<div class="section"><h3>📦 localStorage Chat Analysis</h3>`;
+
+        chatKeys.forEach(key => {
+          const userId = key.replace('chat_history_', '');
+          const data = localStorage.getItem(key);
+          
+          if (!data) {
+            html += `<p class="warning">⚠️ Key "${key}" exists but is empty</p>`;
+            return;
+          }
+
+          try {
+            const chats = JSON.parse(data);
+            html += `<h4>User: ${userId} (${chats.length} chat(s))</h4>`;
+
+            chats.forEach((chat, chatIndex) => {
+              const messagesWithImages = chat.messages.filter(m => 
+                m.attachments && m.attachments.length > 0
+              );
+
+              if (messagesWithImages.length > 0) {
+                html += `
+                  <div style="margin-left: 20px; border-left: 3px solid #3b82f6; padding-left: 10px;">
+                    <p><strong>Chat ${chatIndex + 1}:</strong> ${chat.id}</p>
+                    <p>${messagesWithImages.length} message(s) with attachments</p>
+                `;
+
+                messagesWithImages.forEach(msg => {
+                  html += `
+                    <div style="margin: 10px 0; padding: 10px; background: #1a1a1a; border-radius: 4px;">
+                      <p><strong>Message ID:</strong> ${msg.id}</p>
+                      <p><strong>Attachments:</strong></p>
+                      <ul>
+                  `;
+
+                  msg.attachments.forEach((att, attIndex) => {
+                    if (typeof att === 'object' && att.type === 'indexeddb') {
+                      html += `<li class="warning">🔍 IndexedDB Placeholder: messageId=${att.messageId}, index=${att.index}</li>`;
+                    } else if (typeof att === 'string' && att.startsWith('data:image')) {
+                      html += `<li class="success">✅ Base64 image (${Math.round(att.length/1024)}KB)</li>`;
+                    } else if (typeof att === 'string' && att.includes('firebasestorage')) {
+                      html += `<li class="success">✅ Firebase URL: ${att.substring(0, 60)}...</li>`;
+                    } else {
+                      html += `<li class="error">❌ Unknown format: ${JSON.stringify(att).substring(0, 50)}</li>`;
+                    }
+                  });
+
+                  html += `
+                      </ul>
+                    </div>
+                  `;
+                });
+
+                html += `</div>`;
+              }
+            });
+          } catch (parseError) {
+            html += `<p class="error">❌ Failed to parse data for ${key}: ${parseError.message}</p>`;
+          }
+        });
+
+        html += '</div>';
+        resultsDiv.innerHTML += html;
+      } catch (error) {
+        resultsDiv.innerHTML += `
+          <div class="section error">
+            <h3>❌ Error Reading localStorage</h3>
+            <pre>${error}</pre>
+          </div>
+        `;
+      }
+    }
+
+    async function clearIndexedDB() {
+      if (!confirm('⚠️ This will delete ALL cached images. Continue?')) {
+        return;
+      }
+
+      try {
+        const db = await openDB();
+        const transaction = db.transaction([storeName], 'readwrite');
+        const store = transaction.objectStore(storeName);
+        const request = store.clear();
+
+        request.onsuccess = () => {
+          alert('✅ All images cleared from IndexedDB');
+          checkIndexedDB();
+        };
+
+        request.onerror = () => {
+          alert('❌ Failed to clear IndexedDB: ' + request.error);
+        };
+
+        db.close();
+      } catch (error) {
+        alert('❌ Error: ' + error.message);
+      }
+    }
+
+    async function testImageStore() {
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML += `<div class="section"><h3>🧪 Testing Image Storage...</h3></div>`;
+
+      try {
+        // Create a simple test image (1x1 red pixel)
+        const testImageBase64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+        const testId = `test-${Date.now()}`;
+
+        const db = await openDB();
+        const transaction = db.transaction([storeName], 'readwrite');
+        const store = transaction.objectStore(storeName);
+        
+        const testImage = {
+          id: testId,
+          userId: 'test-user',
+          chatId: 'test-chat',
+          imageData: testImageBase64,
+          prompt: 'Test image',
+          timestamp: Date.now(),
+          lastAccessed: Date.now(),
+          size: testImageBase64.length
+        };
+
+        const request = store.add(testImage);
+
+        request.onsuccess = () => {
+          resultsDiv.innerHTML += `
+            <div class="section success">
+              <h3>✅ Test Image Stored Successfully</h3>
+              <p>ID: ${testId}</p>
+              <p>Now checking if it can be retrieved...</p>
+            </div>
+          `;
+
+          // Try to retrieve it
+          const getRequest = store.get(testId);
+          getRequest.onsuccess = () => {
+            const retrieved = getRequest.result;
+            if (retrieved) {
+              resultsDiv.innerHTML += `
+                <div class="section success">
+                  <h3>✅ Test Image Retrieved Successfully</h3>
+                  <img src="${retrieved.imageData}" class="image-preview">
+                  <p>IndexedDB is working correctly!</p>
+                </div>
+              `;
+            }
+          };
+        };
+
+        request.onerror = () => {
+          resultsDiv.innerHTML += `
+            <div class="section error">
+              <h3>❌ Failed to Store Test Image</h3>
+              <pre>${request.error}</pre>
+            </div>
+          `;
+        };
+
+        db.close();
+      } catch (error) {
+        resultsDiv.innerHTML += `
+          <div class="section error">
+            <h3>❌ Test Failed</h3>
+            <pre>${error}</pre>
+          </div>
+        `;
+      }
+    }
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open(dbName, 1);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+
+    // Auto-check on load
+    window.onload = () => {
+      checkIndexedDB();
+      checkLocalStorage();
+    };
+  </script>
+</body>
+</html>

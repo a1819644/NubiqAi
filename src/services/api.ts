@@ -19,7 +19,7 @@ class ApiService {
 
   constructor() {
     this.baseURL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8000/api';
-    this.timeout = 30000; // 30 seconds (increase default to avoid premature aborts)
+    this.timeout = 120000; // 120 seconds (2 minutes) - for long responses like code generation
   }
 
   private async request<T>(
@@ -242,6 +242,121 @@ class ApiService {
           documentId: data.documentId            // 🎯 NEW! For RAG document retrieval
         }),
       });
+    }
+  }
+
+  /**
+   * Stream AI response using Server-Sent Events
+   * Provides real-time text generation (like ChatGPT typing effect)
+   */
+  async askAIStream(data: {
+    message: string;
+    userId?: string;
+    userName?: string;
+    chatId?: string;
+    messageCount?: number;
+    conversationHistory?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
+    conversationSummary?: string;
+    useMemory?: boolean;
+    onChunk: (text: string, isCached?: boolean) => void;
+    onComplete: (metadata: { duration: number; cached?: boolean }) => void;
+    onError: (error: string) => void;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    const url = `${this.baseURL}/ask-ai-stream`;
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: data.message,
+          userId: data.userId,
+          userName: data.userName,
+          chatId: data.chatId,
+          messageCount: data.messageCount,
+          conversationHistory: data.conversationHistory,
+          conversationSummary: data.conversationSummary,
+          memory: data.useMemory !== false,
+        }),
+        signal: data.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      // Read the response body as a stream
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('No response body');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // Decode chunk and add to buffer
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete SSE messages (lines ending with \n\n)
+        const messages = buffer.split('\n\n');
+        buffer = messages.pop() || ''; // Keep incomplete message in buffer
+
+        for (const message of messages) {
+          if (!message.trim() || !message.startsWith('data: ')) continue;
+
+          try {
+            const jsonStr = message.slice(6); // Remove 'data: ' prefix
+            const parsed = JSON.parse(jsonStr);
+
+            if (parsed.error) {
+              data.onError(parsed.error);
+              return;
+            }
+
+            if (parsed.done) {
+              data.onComplete({
+                duration: parsed.duration || 0,
+                cached: parsed.cached || false,
+              });
+              return;
+            }
+
+            if (parsed.text) {
+              data.onChunk(parsed.text, parsed.cached);
+            }
+          } catch (parseError) {
+            console.warn('Failed to parse SSE message:', message, parseError);
+          }
+        }
+      }
+
+      // Handle any remaining buffer
+      if (buffer.trim() && buffer.startsWith('data: ')) {
+        try {
+          const jsonStr = buffer.slice(6);
+          const parsed = JSON.parse(jsonStr);
+          if (parsed.done) {
+            data.onComplete({
+              duration: parsed.duration || 0,
+              cached: parsed.cached || false,
+            });
+          }
+        } catch (parseError) {
+          console.warn('Failed to parse final SSE message:', buffer);
+        }
+      }
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        console.log('Stream aborted by user');
+        return;
+      }
+      console.error('Streaming error:', err);
+      data.onError(err.message || 'Streaming failed');
     }
   }
 
