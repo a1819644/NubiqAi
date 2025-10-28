@@ -168,6 +168,8 @@ export function ChatInterface({
   const MAX_PREVIEW_LENGTH = 800; // chars before truncation
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
+  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
+  const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false); // 🌊 NEW: Track streaming state
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
@@ -381,6 +383,20 @@ export function ChatInterface({
     };
   }, [activeChat, user]);
 
+  // Cleanup effect for recording
+  useEffect(() => {
+    return () => {
+      // Stop recording if component unmounts
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+      // Clear recording timer
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current);
+      }
+    };
+  }, [mediaRecorder]);
+
   const removeFile = (id: string) => {
     const fileToRemove = attachedFiles.find(f => f.id === id);
     if (fileToRemove?.previewUrl) {
@@ -411,29 +427,109 @@ export function ChatInterface({
     setImageRetryTokens((prev) => ({ ...prev, [attachmentId]: Date.now() }));
   };
 
-  const startRecording = () => {
-    setIsRecording(true);
-    setRecordingTime(0);
-    recordingIntervalRef.current = setInterval(() => {
-      setRecordingTime((prev) => prev + 1);
-    }, 1000);
-    toast.success("Recording started");
+  const startRecording = async () => {
+    try {
+      // Request microphone access
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // Create MediaRecorder instance
+      const recorder = new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+      
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+      
+      recorder.onstop = async () => {
+        // Stop all tracks to release microphone
+        stream.getTracks().forEach(track => track.stop());
+        
+        // Create audio blob
+        const audioBlob = new Blob(chunks, { type: 'audio/webm' });
+        
+        // Send audio for transcription
+        await handleVoiceTranscription(audioBlob);
+      };
+      
+      // Start recording
+      recorder.start();
+      setMediaRecorder(recorder);
+      setIsRecording(true);
+      setRecordingTime(0);
+      setAudioChunks(chunks);
+      
+      // Start timer
+      recordingIntervalRef.current = setInterval(() => {
+        setRecordingTime((prev) => prev + 1);
+      }, 1000);
+      
+      toast.success("🎤 Recording started");
+    } catch (error) {
+      console.error("Failed to start recording:", error);
+      toast.error("Failed to access microphone. Please allow microphone permissions.");
+    }
   };
 
   const stopRecording = () => {
-    setIsRecording(false);
-    if (recordingIntervalRef.current) {
-      clearInterval(recordingIntervalRef.current);
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+      setIsRecording(false);
+      
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current);
+        recordingIntervalRef.current = null;
+      }
+      
+      toast.info("🎤 Processing voice...");
     }
+  };
 
-    const voiceMessage = `Voice recording (${Math.floor(recordingTime / 60)}:${(
-      recordingTime % 60
-    )
-      .toString()
-      .padStart(2, "0")})`;
-    handleSendMessage(voiceMessage, [], true);
-    setRecordingTime(0);
-    toast.success("Voice message sent");
+  const handleVoiceTranscription = async (audioBlob: Blob) => {
+    try {
+      setIsLoading(true);
+      
+      // Convert audio blob to base64
+      const reader = new FileReader();
+      reader.readAsDataURL(audioBlob);
+      
+      reader.onloadend = async () => {
+        const base64Audio = (reader.result as string).split(',')[1];
+        
+        // Send to backend for transcription using Gemini
+        const response = await fetch('http://localhost:8000/api/transcribe-audio', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            audio: base64Audio,
+            userId: user?.id,
+          }),
+        });
+        
+        if (!response.ok) {
+          throw new Error('Transcription failed');
+        }
+        
+        const data = await response.json();
+        
+        if (data.success && data.text) {
+          // Set the transcribed text as input
+          setInput(data.text);
+          toast.success("✅ Voice transcribed! Review and send.");
+        } else {
+          throw new Error(data.error || 'Transcription failed');
+        }
+      };
+    } catch (error) {
+      console.error("Transcription error:", error);
+      toast.error("Failed to transcribe audio. Please try again.");
+    } finally {
+      setIsLoading(false);
+      setRecordingTime(0);
+    }
   };
 
   const handleStopGeneration = () => {
@@ -928,7 +1024,7 @@ ${procResp.extractedText}`,
       }
       
       // 🌊 STREAMING MODE: Use streaming for text-only requests
-      const useStreaming = !imageFile; // Stream only for text (not images)
+      const useStreaming = false; // Disabled - streaming endpoint not implemented yet
       
       if (useStreaming) {
         // 🌊 Create placeholder message that will update as chunks arrive

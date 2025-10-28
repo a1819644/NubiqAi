@@ -246,11 +246,13 @@ async function generateContent(args: {
         resp?.response?.candidates?.[0]?.content?.parts ?? [];
       const usage = resp?.response?.usageMetadata;
       return { parts, raw: resp, usage };
-    } catch (err) {
-      console.warn(
-        "Vertex generateContent failed, will try Google fallback:",
-        err
-      );
+    } catch (err: any) {
+      // Suppress verbose permission errors (fallback will handle)
+      if (err?.code === 403 || err?.stackTrace?.code === 403) {
+        console.warn(`⚠️ Vertex AI permission denied (${model}) - using Google AI Studio fallback`);
+      } else {
+        console.warn("Vertex generateContent failed, will try Google fallback:", err);
+      }
     }
   }
 
@@ -395,6 +397,7 @@ process.on("unhandledRejection", (reason, promise) => {
  */
 app.post(
   "/api/ask-ai",
+  express.json(),
   upload.single("image"),
   rateLimitMiddleware("general"),
   async (req, res) => {
@@ -1283,19 +1286,24 @@ IMPORTANT CONTEXT RULES:
 
 ${conversationContext ? `CONVERSATION CONTEXT:\n${conversationContext}\n\n` : ''}
 
-CRITICAL: Analyze if the prompt is about the UPLOADED image or requesting a NEW unrelated image.
+CRITICAL RULES:
+- ANY mention of changing/editing the uploaded image = "imageEdit" (even if "generate" is mentioned)
+- "change X and generate" [with uploaded image] = "imageEdit" (user wants edited version of uploaded image)
+- "generate a NEW image of Y" [with uploaded X] = "imageGenerate" ONLY if Y is completely unrelated to X
 
 EXAMPLES:
 "add another dog" [with dog image] → {"intent": "imageEdit", "confidence": 0.95}
+"change the brand name to nubevest" [with shoe image] → {"intent": "imageEdit", "confidence": 0.95}
+"change the brand name and generate image" [with shoe] → {"intent": "imageEdit", "confidence": 0.95}
 "remove the background" [with any image] → {"intent": "imageEdit", "confidence": 0.95}
+"make the shoe red and generate it" [with shoe image] → {"intent": "imageEdit", "confidence": 0.95}
 "what's in this image?" [with any image] → {"intent": "visionQA", "confidence": 0.95}
-"draw me a picture of god from india" [with dog image, after discussing dogs] → {"intent": "imageGenerate", "confidence": 0.9}
-"create a sunset landscape" [with any unrelated image] → {"intent": "imageGenerate", "confidence": 0.9}
-"show me a car" [with any image] → {"intent": "imageGenerate", "confidence": 0.85}
+"draw me a picture of god from india" [with dog image] → {"intent": "imageGenerate", "confidence": 0.9}
+"create a sunset landscape" [with shoe image] → {"intent": "imageGenerate", "confidence": 0.9}
 
-KEYWORDS FOR EDITING: add to this, remove from this, change this, modify this, edit this, adjust this
-KEYWORDS FOR QUESTIONS: what, who, where, analyze this, describe this, count in this
-KEYWORDS FOR NEW IMAGE: draw, create, show me, imagine, generate, picture of, image of (when unrelated to uploaded image)
+KEYWORDS FOR EDITING: change, modify, edit, adjust, add to this, remove from this, replace, alter, update
+KEYWORDS FOR QUESTIONS: what, who, where, analyze this, describe this, count in this, tell me about
+KEYWORDS FOR NEW IMAGE: draw a NEW, create a DIFFERENT, show me SOMETHING ELSE (only when clearly unrelated)
 
 INPUT PROMPT:
 ${p}
@@ -1639,7 +1647,21 @@ Return ONLY valid JSON: {"intent": "<intent>", "confidence": <0-1>}`;
           "✏️ Edit intent detected with uploaded image - performing image editing"
         );
 
-        const editInstruction = `Edit this image as follows: ${prompt}\n\nRules:\n- Make only the requested modifications\n- Preserve all other parts of the image\n- Return a single edited image output`;
+        // 🎯 CRITICAL: Clean, focused edit instruction with NO conversation context
+        // This ensures the AI only modifies what the user explicitly requested
+        const editInstruction = `You are an expert image editor. Your task is to edit this image PRECISELY as requested.
+
+USER REQUEST: ${prompt}
+
+STRICT RULES:
+1. Make ONLY the specific changes requested by the user
+2. Preserve everything else EXACTLY as it appears in the original image
+3. Maintain the original image composition, lighting, style, and quality
+4. Do NOT add creative interpretations or extra elements
+5. Do NOT change the background, lighting, or overall scene unless explicitly requested
+6. Return a single edited image that looks natural and seamless
+
+Focus: Minimal, precise edits. Maximum preservation of the original image.`;
 
         let response;
         try {
@@ -1898,15 +1920,24 @@ Return ONLY valid JSON: {"intent": "<intent>", "confidence": <0-1>}`;
         const hasSpecificDescriptor =
           promptLower.includes(" of a ") ||
           promptLower.includes(" with a ") ||
-          promptLower.includes(" that has ");
+          promptLower.includes(" that has ") ||
+          promptLower.includes(" of "); // Added: "image of snake", "picture of X", etc.
 
         const isGenericRequest =
           (hasGenericKeyword || hasContinuationWord) &&
           prompt.length < 50 &&
           !hasSpecificDescriptor;
 
+        console.log(`📊 Image Request Analysis:`);
+        console.log(`   - Has Generic Keyword: ${hasGenericKeyword}`);
+        console.log(`   - Has Continuation Word: ${hasContinuationWord}`);
+        console.log(`   - Has Specific Descriptor: ${hasSpecificDescriptor}`);
+        console.log(`   - Prompt Length: ${prompt.length}`);
+        console.log(`   - Final Classification: ${isGenericRequest ? 'GENERIC' : 'SPECIFIC'}`);
+
+        // 🚫 CONTEXT-AWARE IMAGE GENERATION DISABLED
         // If generic request and we have chat history, add conversation context
-        if (isGenericRequest && effectiveUserId) {
+        if (false && isGenericRequest && effectiveUserId) {
           console.log(
             `🧠 Generic image request detected - fetching conversation context...`
           );
@@ -2062,7 +2093,20 @@ Create a detailed, visually compelling image that directly relates to and visual
           );
         }
 
-        console.log(`🎨 Generating image...`);
+        console.log(`\n${"█".repeat(80)}`);
+        console.log(`🎨 IMAGE GENERATION REQUEST`);
+        console.log(`${"█".repeat(80)}`);
+        console.log(`📝 USER TYPED: "${prompt}"`);
+        console.log(`📊 Classification:`);
+        console.log(`   - Generic Request: ${isGenericRequest}`);
+        console.log(`   - Has Conversation History: ${conversationHistory ? conversationHistory.length > 0 : false}`);
+        console.log(`   - Context-Aware Generation: DISABLED`);
+        console.log(`\n🔧 PROMPT SENT TO GEMINI:`);
+        console.log(`${"═".repeat(80)}`);
+        console.log(imagePrompt);
+        console.log(`${"═".repeat(80)}`);
+        console.log(`🤖 Model: ${imageModel}`);
+        console.log(`${"█".repeat(80)}\n`);
 
         // Retry logic: Gemini sometimes returns text instead of image
         let retryCount = 0;
@@ -2492,6 +2536,7 @@ Create a detailed, visually compelling image that directly relates to and visual
  */
 app.post(
   "/api/ask-ai-stream",
+  express.json(),
   rateLimitMiddleware("general"),
   async (req, res) => {
     if (!vertex && !ai)
@@ -3285,41 +3330,34 @@ app.post(
 
       console.log(`🎨 Editing image with prompt: "${editPrompt}"`);
 
-      // NOTE: Gemini's image models (gemini-2.5-flash-image) only GENERATE new images, they don't edit existing ones
-      // For "editing", we'll use the vision model to analyze the image and generate a new one based on the edit instruction
+      // IMPROVED: Send actual image pixels to preserve fidelity across multiple edits
+      // This avoids cumulative error from text descriptions
+      const imageModel = model ?? "gemini-2.5-flash-image";
+      
+      const editInstruction = `You are an expert image editor. Your task is to edit this image PRECISELY as requested.
 
-      // Step 1: Use vision model to describe the image
-      const visionModel = "gemini-2.5-flash"; // vision model for description
-      const descriptionResponse = await generateContent({
-        model: visionModel,
+USER REQUEST: ${editPrompt}
+
+STRICT RULES:
+1. Make ONLY the specific changes requested by the user
+2. Preserve everything else EXACTLY as it appears in the original image
+3. Maintain the original image composition, lighting, style, and quality
+4. Do NOT add creative interpretations or extra elements
+5. Do NOT change the background, lighting, or overall scene unless explicitly requested
+6. Return a single edited image that looks natural and seamless
+
+Focus: Minimal, precise edits. Maximum preservation of the original image.`;
+
+      const response = await generateContent({
+        model: imageModel,
         contents: [
           {
             parts: [
               { inlineData: { data: imageBase64, mimeType: "image/png" } },
-              {
-                text: "Describe this image in detail, focusing on all visual elements, style, colors, composition, and mood.",
-              },
+              { text: editInstruction },
             ],
           },
         ],
-      });
-      const imageDescription =
-        ((descriptionResponse as any)?.parts ?? [])
-          .map((p: any) => p.text)
-          .filter(Boolean)
-          .join(" ") || "an image";
-
-      // Step 2: Generate a new image based on the description + edit instruction
-      const imageModel = model ?? "gemini-2.5-flash-image"; // image generation model
-      const combinedPrompt = `Based on this description: "${imageDescription}"
-
-Apply this edit: ${editPrompt}
-
-Generate a new image that matches the original description but with the requested edits applied.`;
-
-      const response = await generateContent({
-        model: imageModel,
-        contents: [combinedPrompt],
       });
       const parts: any[] = (response as any)?.parts ?? [];
       let newImageBase64: string | null = null;
@@ -3471,50 +3509,51 @@ app.post(
       }
 
       // NOTE: Gemini doesn't support true mask-based editing like Stable Diffusion inpainting
-      // For mask-based editing, we'll use vision model to analyze BOTH images and generate a new one
-
-      // Step 1: Describe the original image
-      const visionModel = "gemini-2.5-flash";
-      const descriptionResponse = await generateContent({
-        model: visionModel,
-        contents: [
-          "Describe this image in detail.",
-          { inlineData: { data: imageBase64, mimeType: "image/png" } },
-        ],
-      });
-      const imageDescription =
-        ((descriptionResponse as any)?.parts ?? [])
-          .map((p: any) => p.text)
-          .filter(Boolean)
-          .join(" ") || "an image";
-
-      // Step 2: Analyze the mask to understand what areas to edit
-      const maskResponse = await generateContent({
-        model: visionModel,
-        contents: [
-          "Describe the colored/marked areas in this mask image. Where are they located and what parts of the image do they cover?",
-          { inlineData: { data: maskBase64, mimeType: "image/png" } },
-        ],
-      });
-      const maskDescription =
-        ((maskResponse as any)?.parts ?? [])
-          .map((p: any) => p.text)
-          .filter(Boolean)
-          .join(" ") || "marked areas";
-
-      // Step 3: Generate new image with edits applied to masked areas
+      // IMPROVED APPROACH: Send actual image + mask to preserve fidelity across multiple edits
+      
+      console.log(`🎨 Performing mask-based edit with prompt: "${editPrompt}"`);
+      
       const imageModel = model ?? "gemini-2.5-flash-image";
-      const combinedPrompt = `Original image: ${imageDescription}
+      
+      // Build strict edit instruction that references the visual mask
+      const editInstruction = `You are an expert image editor. Your task is to edit this image PRECISELY as requested.
 
-Masked areas to edit: ${maskDescription}
+MASK: A second image shows the areas to edit (white/colored regions). Focus ONLY on those areas.
 
-Edit instruction for the masked areas ONLY: ${editPrompt}
+USER REQUEST: ${editPrompt}
 
-Generate a new version of the image with the edit applied ONLY to the masked areas. Keep everything else the same as the original.`;
+STRICT RULES:
+1. Make ONLY the specific changes requested by the user in the masked areas
+2. Preserve everything else EXACTLY as it appears in the original image
+3. Maintain the original image composition, lighting, style, and quality
+4. Do NOT add creative interpretations or extra elements outside the mask
+5. Do NOT change the background, lighting, or overall scene unless explicitly requested
+6. The edit should blend seamlessly with the rest of the image
 
+Focus: Minimal, precise edits to masked areas only. Maximum preservation everywhere else.`;
+
+      // Send BOTH images directly to the model (no text descriptions)
       const response = await generateContent({
         model: imageModel,
-        contents: [combinedPrompt],
+        contents: [
+          {
+            parts: [
+              {
+                inlineData: {
+                  data: imageBase64,
+                  mimeType: "image/png",
+                },
+              },
+              {
+                inlineData: {
+                  data: maskBase64,
+                  mimeType: "image/png",
+                },
+              },
+              { text: editInstruction },
+            ],
+          },
+        ],
       });
       const parts: any[] = (response as any)?.parts ?? [];
       let newImageBase64: string | null = null;
@@ -4171,7 +4210,7 @@ app.get("/api/performance-stats", (req, res) => {
  * Called when user switches chats - persists current chat to Pinecone
  * 🎯 OPTIMIZED: Respects cooldown to avoid spam uploads
  */
-app.post("/api/end-chat", rateLimitMiddleware("general"), async (req, res) => {
+app.post("/api/end-chat", express.json(), rateLimitMiddleware("general"), async (req, res) => {
   try {
     const { userId, chatId, force } = req.body;
 
@@ -4524,6 +4563,88 @@ app.get("/api/admin/intent-analytics", (req, res) => {
       .json({ success: false, error: err?.message || String(err) });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// 🎤 AUDIO TRANSCRIPTION ENDPOINT
+// ═══════════════════════════════════════════════════════════════════════
+app.post(
+  "/api/transcribe-audio",
+  express.json({ limit: "50mb" }),
+  rateLimitMiddleware("general"),
+  async (req, res) => {
+    try {
+      console.log("🎤 Audio transcription request received");
+      
+      const { audio, userId } = req.body;
+      
+      if (!audio) {
+        return res.status(400).json({ success: false, error: "Audio data is required" });
+      }
+      
+      // 🔒 Validate userId if provided
+      if (userId) {
+        const userIdValidation = SecurityValidator.validateUserId(userId);
+        if (!userIdValidation.valid) {
+          logSecurityEvent("Invalid userId blocked", {
+            userId,
+            error: userIdValidation.error,
+          });
+          return res.status(400).json({ success: false, error: userIdValidation.error });
+        }
+      }
+      
+      // Use Gemini's multimodal capabilities for audio transcription
+      const model = "gemini-2.0-flash-lite-001"; // Fast model for transcription
+      
+      try {
+        const response = await generateContent({
+          model,
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: {
+                    data: audio,
+                    mimeType: "audio/webm",
+                  },
+                },
+                {
+                  text: "Please transcribe this audio accurately. Return ONLY the transcribed text, without any additional commentary or formatting.",
+                },
+              ],
+            },
+          ],
+        });
+        
+        const parts: any[] = (response as any)?.parts ?? [];
+        const transcribedText = parts
+          .map((p: any) => p.text ?? "")
+          .join("")
+          .trim();
+        
+        if (!transcribedText) {
+          throw new Error("No transcription returned");
+        }
+        
+        console.log(`✅ Audio transcribed successfully: "${transcribedText.substring(0, 100)}..."`);
+        
+        res.json({
+          success: true,
+          text: transcribedText,
+        });
+      } catch (transcriptionError: any) {
+        console.error("❌ Transcription failed:", transcriptionError);
+        throw new Error("Failed to transcribe audio: " + (transcriptionError.message || "Unknown error"));
+      }
+    } catch (err: any) {
+      console.error("❌ Error in /api/transcribe-audio:", err);
+      res.status(500).json({
+        success: false,
+        error: err?.message || "Audio transcription failed",
+      });
+    }
+  }
+);
 
 // Start server with increased timeout for long-running requests (code generation, etc.)
 const server = app.listen(port, async () => {
