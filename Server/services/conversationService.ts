@@ -242,8 +242,15 @@ class ConversationService {
           await this.summarizeAndUploadSession(session);
           session.isSummarized = true;
           console.log(`✅ Summarized session: ${session.sessionId}`);
-        } catch (error) {
-          console.error(`❌ Failed to summarize session ${session.sessionId}:`, error);
+        } catch (error: any) {
+          const errorMsg = error?.message || String(error);
+          console.error(`❌ Failed to summarize session ${session.sessionId}: ${errorMsg}`);
+          // Don't mark as summarized so it can retry later
+          // But if it's a persistent error (not network), we should eventually give up
+          if (!errorMsg.includes('fetch failed') && !errorMsg.includes('ECONNRESET')) {
+            session.isSummarized = true; // Mark as summarized to prevent infinite retries
+            console.warn(`⚠️ Marking session as summarized to prevent retry loop`);
+          }
         }
       }
 
@@ -319,11 +326,38 @@ Please provide:
 
 Format as a structured summary that would be useful for future conversations with this user.`;
 
-    // Generate summary using Gemini
-    const response = await this.ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [summarizationPrompt]
-    });
+    // Generate summary using Gemini with retry logic for network failures
+    let response;
+    let lastError;
+    const maxRetries = 3;
+    const baseDelay = 1000; // 1 second
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        response = await this.ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: [summarizationPrompt]
+        });
+        break; // Success, exit retry loop
+      } catch (error: any) {
+        lastError = error;
+        const isNetworkError = error?.message?.includes('fetch failed') || 
+                               error?.message?.includes('ECONNRESET') ||
+                               error?.message?.includes('ETIMEDOUT');
+        
+        if (isNetworkError && attempt < maxRetries) {
+          const delay = baseDelay * Math.pow(2, attempt - 1); // Exponential backoff
+          console.warn(`⚠️ Network error on attempt ${attempt}/${maxRetries}, retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          throw error; // Non-network error or max retries reached
+        }
+      }
+    }
+    
+    if (!response) {
+      throw lastError || new Error('Failed to generate summary after retries');
+    }
 
     const summaryText = response?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
     
