@@ -109,6 +109,25 @@ class ApiService {
     throw new Error('Failed to complete request');
   }
 
+  // Binary request helper (for file downloads)
+  private async requestBlob(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<Blob> {
+    const url = `${this.baseURL}${endpoint}`;
+    const isFormData = typeof FormData !== 'undefined' && (options as any)?.body instanceof FormData;
+    const mergedHeaders: Record<string, string> = {
+      ...(options.headers as any),
+    };
+    if (!isFormData) {
+      mergedHeaders['Content-Type'] = mergedHeaders['Content-Type'] || 'application/json';
+    }
+    const config: RequestInit = { ...options, headers: mergedHeaders };
+    const resp = await fetch(url, config);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await resp.blob();
+  }
+
   // Authentication endpoints
   async signInWithGoogle(idToken: string): Promise<ApiResponse<{ user: any; token: string }>> {
     return this.request('/auth/google', {
@@ -200,6 +219,7 @@ class ApiService {
     imageUri?: string | null;
     imageLocalUri?: string | null;
     isImageGeneration?: boolean;
+    export?: { format: 'pdf' | 'docx' | 'csv' | 'txt' };
     metadata?: {
       tokens?: number;
       candidatesTokenCount?: number;
@@ -697,6 +717,15 @@ class ApiService {
     return this.request('/save-all-chats', {
       method: 'POST',
       body: JSON.stringify(data),
+    });
+  }
+
+  // Export content as a file
+  async exportContent(params: { content: string; format: 'pdf' | 'docx' | 'csv' | 'txt'; filename?: string }): Promise<Blob> {
+    return this.requestBlob('/export', {
+      method: 'POST',
+      body: JSON.stringify(params),
+      headers: { 'Content-Type': 'application/json' },
     });
   }
 

@@ -1,5 +1,6 @@
 // server.ts (TypeScript)
 import path from "path";
+import * as fs from "fs";
 // Load environment variables from .env file in the 'Server' directory
 require("dotenv").config({ path: path.resolve(__dirname, "../Server/.env") });
 import express from "express";
@@ -32,6 +33,9 @@ import {
 import { firestoreChatService } from "./services/firestoreChatService";
 import { getJobQueue } from "./services/jobQueue";
 import { getResponseCacheService } from "./services/responseCacheService";
+import { getResponseStyleGuide, getResponseTips, getClosingNote, type ResponseTone } from "./services/responseStyle";
+import { formatResponse } from "./services/responseFormatter";
+import { exportContent } from "./services/exportService";
 
 // Import performance optimizations with error handling
 let profileCache: any;
@@ -77,6 +81,13 @@ try {
     "⚠️ Using fallback implementations for performance optimizations"
   );
 }
+
+// ===== Response style configuration (tone + emoji) =====
+const EMOJI_ENABLED = process.env.ENABLE_EMOJI !== "false"; // default true
+const RESPONSE_TONE = ((process.env.RESPONSE_TONE as string) || "playful") as ResponseTone;
+const STYLE_GUIDE = getResponseStyleGuide(EMOJI_ENABLED, RESPONSE_TONE);
+const RESPONSE_TIPS = getResponseTips(EMOJI_ENABLED, RESPONSE_TONE);
+const CLOSING_NOTE = getClosingNote(EMOJI_ENABLED, RESPONSE_TONE);
 
 const app = express();
 const port = Number(process.env.PORT ?? 8000);
@@ -169,6 +180,12 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Initialize Vertex AI client (preferred for scalability)
 let vertex: VertexAI | undefined;
+let vertexProjectId: string | undefined;
+let vertexLocation: string | undefined;
+let serviceAccountEmail: string | undefined;
+const FORCE_VERTEX_ONLY =
+  String(process.env.FORCE_VERTEX_ONLY).toLowerCase() === "true" ||
+  String(process.env.AI_PROVIDER_MODE).toLowerCase() === "vertex";
 try {
   const projectId =
     process.env.GOOGLE_CLOUD_PROJECT ||
@@ -185,6 +202,17 @@ try {
     console.log(
       `Vertex AI client initialized. project=${projectId}, location=${location}`
     );
+    vertexProjectId = projectId;
+    vertexLocation = location;
+    try {
+      const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+      if (credPath && fs.existsSync(credPath)) {
+        const cred = JSON.parse(fs.readFileSync(credPath, "utf8"));
+        serviceAccountEmail = cred?.client_email;
+      }
+    } catch (e) {
+      console.warn("⚠️ Could not read service account email for diagnostics:", e);
+    }
   } else {
     console.warn(
       "GOOGLE_CLOUD_PROJECT not set; Vertex AI client not initialized. Set GOOGLE_CLOUD_PROJECT and GOOGLE_APPLICATION_CREDENTIALS to use Vertex AI."
@@ -208,7 +236,7 @@ try {
 }
 
 // Unified generation helper using Vertex first, then Google as fallback
-type GenResult = { parts: any[]; raw: any; usage?: any };
+type GenResult = { parts: any[]; raw: any; usage?: any; provider?: 'vertex' | 'google' };
 async function generateContent(args: {
   model: string;
   contents: any[];
@@ -216,42 +244,76 @@ async function generateContent(args: {
   const { model, contents } = args;
   // Try Vertex first
   if (vertex) {
-    try {
-      const gm = vertex.getGenerativeModel({ model });
-      // Normalize contents to Vertex format
-      let vContents: any[];
-      if (typeof contents[0] === "string") {
-        vContents = [
-          {
-            role: "user",
-            parts: contents.map((t) => ({ text: String(t) })),
-          },
-        ];
-      } else if (
-        contents[0] &&
-        typeof contents[0] === "object" &&
-        "parts" in contents[0]
-      ) {
-        vContents = [
-          {
-            role: "user",
-            parts: (contents[0] as any).parts,
-          },
-        ];
-      } else {
-        vContents = contents as any[];
-      }
-      const resp: any = await gm.generateContent({ contents: vContents });
-      const parts: any[] =
-        resp?.response?.candidates?.[0]?.content?.parts ?? [];
-      const usage = resp?.response?.usageMetadata;
-      return { parts, raw: resp, usage };
-    } catch (err: any) {
-      // Suppress verbose permission errors (fallback will handle)
-      if (err?.code === 403 || err?.stackTrace?.code === 403) {
-        console.warn(`⚠️ Vertex AI permission denied (${model}) - using Google AI Studio fallback`);
-      } else {
-        console.warn("Vertex generateContent failed, will try Google fallback:", err);
+    // Normalize contents to Vertex format
+    const gm = vertex.getGenerativeModel({ model });
+    let vContents: any[];
+    if (typeof contents[0] === "string") {
+      vContents = [
+        {
+          role: "user",
+          parts: contents.map((t) => ({ text: String(t) })),
+        },
+      ];
+    } else if (
+      contents[0] &&
+      typeof contents[0] === "object" &&
+      "parts" in contents[0]
+    ) {
+      vContents = [
+        {
+          role: "user",
+          parts: (contents[0] as any).parts,
+        },
+      ];
+    } else {
+      vContents = contents as any[];
+    }
+
+    const maxRetries = Number(process.env.VERTEX_MAX_RETRIES ?? 2);
+    const baseDelayMs = Number(process.env.VERTEX_RETRY_BACKOFF_MS ?? 750);
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const resp: any = await gm.generateContent({ contents: vContents });
+        const parts: any[] = resp?.response?.candidates?.[0]?.content?.parts ?? [];
+        const usage = resp?.response?.usageMetadata;
+        return { parts, raw: resp, usage, provider: 'vertex' };
+      } catch (err: any) {
+        const msg = String(err?.message || "");
+        const code = (err?.cause?.code || err?.code || "") as string;
+        const isTimeout = /UND_ERR_CONNECT_TIMEOUT|Connect Timeout|fetch failed/i.test(msg) || code === 'UND_ERR_CONNECT_TIMEOUT';
+        if (isTimeout && attempt < maxRetries) {
+          const wait = baseDelayMs * Math.pow(2, attempt);
+          console.warn(`⏳ Vertex connect timeout (attempt ${attempt + 1}/${maxRetries}). Retrying in ${wait}ms...`);
+          await new Promise((r) => setTimeout(r, wait));
+          continue;
+        }
+        // Build diagnostic payload
+        const diag = {
+          project: vertexProjectId,
+          location: vertexLocation,
+          serviceAccount: serviceAccountEmail,
+          model,
+          code: err?.code ?? err?.cause?.code,
+          message: err?.message,
+          providerAttempted: 'vertex' as const,
+        };
+
+        // Permission errors -> controlled fallback or hard fail if forced
+        const isPermission = err?.code === 403 || err?.stackTrace?.code === 403 || /permission/i.test(msg);
+        if (isPermission) {
+          console.warn(`⚠️ Vertex AI permission denied (${model})`, diag);
+        } else {
+          console.warn("Vertex generateContent failed", diag);
+        }
+
+        if (FORCE_VERTEX_ONLY) {
+          const e: any = new Error(`Vertex-only mode: request failed for model ${model}`);
+          e.details = diag;
+          throw e; // propagate to route; no fallback
+        }
+
+        // Not forced -> break to fallback
+        break;
       }
     }
   }
@@ -264,7 +326,7 @@ async function generateContent(args: {
     });
     const parts: any[] = resp?.candidates?.[0]?.content?.parts ?? [];
     const usage = resp?.usageMetadata;
-    return { parts, raw: resp, usage };
+    return { parts, raw: resp, usage, provider: 'google' };
   }
 
   throw new Error("No AI client initialized");
@@ -375,6 +437,49 @@ const classificationTimes: number[] = [];
 
 // Home / health
 app.get("/api", (req, res) => res.json({ ok: true }));
+
+// Lightweight detector for export intent in user's prompt
+function detectExportFormat(prompt: string | undefined | null): "pdf" | "docx" | "csv" | "txt" | null {
+  if (!prompt) return null;
+  const p = prompt.toLowerCase();
+  // Require an explicit format keyword combined with export-ish language
+  const wants = /(as|in|into|to|export|download|give).*?(pdf|docx|word|csv|comma\s*separated|txt|text)/i.test(p);
+  if (!wants) return null;
+  if (/pdf/.test(p)) return "pdf";
+  if (/(docx|word)/.test(p)) return "docx";
+  if (/(csv|comma\s*separated)/.test(p)) return "csv";
+  if (/(txt|text\s*file)/.test(p)) return "txt";
+  return null;
+}
+// =========================================================
+// POST /api/export - Generate document (pdf, docx, csv, txt)
+// =========================================================
+app.post(
+  "/api/export",
+  rateLimitMiddleware("general"),
+  sanitizeBodyMiddleware,
+  async (req, res) => {
+    try {
+      const { content, format, filename } = req.body || {};
+      if (!content || typeof content !== "string") {
+        return res.status(400).json({ success: false, error: "Missing 'content' string in body" });
+      }
+      const fmt = String(format || "pdf").toLowerCase();
+      if (!["pdf", "docx", "csv", "txt"].includes(fmt)) {
+        return res.status(400).json({ success: false, error: "Invalid 'format'. Use pdf|docx|csv|txt" });
+      }
+
+      const result = await exportContent(content, fmt as any, filename);
+      const safeName = (filename && String(filename).replace(/[^\w\-\.]+/g, "_")) || `nubiq-export.${result.extension}`;
+      res.setHeader("Content-Type", result.mimeType);
+      res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+      res.send(result.buffer);
+    } catch (error) {
+      console.error("❌ Error in /api/export:", error);
+      res.status(500).json({ success: false, error: "Failed to generate document" });
+    }
+  }
+);
 
 // Global error handlers to prevent server crashes
 process.on("uncaughtException", (error) => {
@@ -743,19 +848,9 @@ Respond naturally.`;
             }
 
             if (profileContext) {
-              enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent assistant with persistent memory.
+              enhancedPrompt = `SYSTEM: You are NubiqAI${EMOJI_ENABLED ? " ✨" : ""} - an intelligent assistant with persistent memory.
 
-📝 **FORMATTING GUIDELINES** (Use ChatGPT-style markdown):
-- Use **bold** for emphasis and key terms
-- Use *italic* for subtle emphasis
-- Use ## for section headings (not # which is too large)
-- Use ### for subsections
-- Use \`code\` for technical terms, commands, or code snippets
-- Use bullet points with - or * for lists
-- Use 1. 2. 3. for numbered lists
-- Add blank lines between sections for readability
-- Use > for quotes or important callouts
-- Use code blocks with \`\`\`language for multi-line code
+${STYLE_GUIDE}
 
 ⚠️ **CRITICAL INSTRUCTIONS**:
 - Do NOT address the user by name (e.g., "Okay, [Name]" or "Hi [Name]")
@@ -770,7 +865,7 @@ ${"=".repeat(60)}
 💬 CURRENT USER QUESTION:
 ${prompt}
 
-💡 Respond like ChatGPT: For CODE - use "Here's a [type] example 👍", add "💡 How to use it:" steps, "🔑 Key Points" section. For EXPLANATIONS - use ## headings with emojis, **bold** key terms, end with follow-up question. Be engaging and educational!`;
+${RESPONSE_TIPS}`;
 
               console.log("✅ Enhanced prompt with user profile context");
             } else {
@@ -835,17 +930,14 @@ ${prompt}
                 );
               }
 
-              enhancedPrompt = `You are NubiqAI ✨ - helpful AI assistant with memory.
+              enhancedPrompt = `You are NubiqAI${EMOJI_ENABLED ? " ✨" : ""} - helpful AI assistant with memory.
 
 ⚠️ RULES:
 - Never use user's name
 - Answer "do you know X" with full explanations, not "yes I know"
 - "write an article" = detailed content
 
-
-📝 FORMAT:
-**CODE:** "Here's [type] 👍" + code + "💡 How to:" (steps) + "🔑 Key:" (concepts) + question
-**EXPLAIN:** ## headings + **bold** terms + bullets + "💡 Summary"
+${STYLE_GUIDE}
 
 ============================================================
 🧠 CONTEXT:
@@ -854,7 +946,7 @@ ${rollingSummarySection}${memoryResult.combinedContext}
 
 💬 Q: ${prompt}
 
-Be engaging!`;
+${CLOSING_NOTE}`;
 
               console.log(
                 `✅ Enhanced prompt with ${memoryResult.type} memory context + ChatGPT-style formatting`
@@ -914,27 +1006,19 @@ Remember: Use recent conversation for context continuity.`;
         );
       } else if (!enhancedPrompt.includes("SYSTEM:")) {
         // If no memory context and no conversation history, add base structured prompt
-        enhancedPrompt = `SYSTEM: You are NubiqAI ✨ - an intelligent, helpful assistant.
+  enhancedPrompt = `SYSTEM: You are NubiqAI${EMOJI_ENABLED ? " ✨" : ""} - an intelligent, helpful assistant.
 
 ⚠️ **CRITICAL INSTRUCTIONS**:
 - Do NOT address the user by name. Start directly with your answer.
 - When user asks "do you know about X" or "tell me about X", provide comprehensive information - don't just say "yes I know"
 - Treat questions like "write an article" or "tell me about" as requests for detailed content
 
-📝 **FORMATTING GUIDELINES** (Use ChatGPT-style markdown):
-- Use **bold** for emphasis
-- Use *italic* for subtle emphasis
-- Use ## for section headings
-- Use \`code\` for technical terms
-- Use bullet lists with - or *
-- Use 1. 2. 3. for numbered lists
-- Add blank lines between sections
-- Use > for important callouts
+${STYLE_GUIDE}
 
 USER QUESTION:
 ${prompt}
 
-💡 Respond like ChatGPT: For CODE - friendly intro ("Here's a [type] example 👍"), code block, "💡 How to use it:" with steps, "🔑 Key Points" explaining concepts, follow-up question. For EXPLANATIONS - ## headings with emojis, **bold** terms, engaging style!`;
+${RESPONSE_TIPS}`;
         console.log(`📋 Using base structured response prompt`);
       }
       // ADD THIS CODE AT LINE 817 (right after: console.log(`📋 Using base structured response prompt`);)
@@ -1315,13 +1399,24 @@ Return ONLY valid JSON: {"intent": "<intent>", "confidence": <0-1>}`;
 Return a JSON object with fields intent and confidence (0-1).
 Valid intents: "imageGenerate" or "text".
 
+CRITICAL: Only classify as "imageGenerate" if user explicitly wants to CREATE/DRAW/VISUALIZE an image.
+Writing text content (articles, essays, code, explanations) is ALWAYS "text", never "imageGenerate".
+
 ${conversationContext ? `CONVERSATION CONTEXT:\n${conversationContext}\n\n` : ''}
 
-EXAMPLES:
+IMAGE GENERATION EXAMPLES (must mention visual creation):
 "draw a cat" → {"intent": "imageGenerate", "confidence": 0.95}
-"show me a sunset" → {"intent": "imageGenerate", "confidence": 0.9}
+"show me a sunset picture" → {"intent": "imageGenerate", "confidence": 0.9}
 "create a logo" → {"intent": "imageGenerate", "confidence": 0.95}
 "picture of god from india" → {"intent": "imageGenerate", "confidence": 0.95}
+"illustrate a scene with mountains" → {"intent": "imageGenerate", "confidence": 0.95}
+"generate an image of a dog" → {"intent": "imageGenerate", "confidence": 0.95}
+
+TEXT EXAMPLES (writing, explaining, coding):
+"write an article on india" → {"intent": "text", "confidence": 0.99}
+"write me n article on india again" → {"intent": "text", "confidence": 0.99}
+"create a blog post" → {"intent": "text", "confidence": 0.99}
+"generate code for a website" → {"intent": "text", "confidence": 0.99}
 "how are you?" → {"intent": "text", "confidence": 0.99}
 "explain this" → {"intent": "text", "confidence": 0.98}
 
@@ -1552,16 +1647,21 @@ Return ONLY valid JSON: {"intent": "<intent>", "confidence": <0-1>}`;
         signal?: string;
       } {
         if (!p) return { likely: false, confidence: 0 };
-        const terms = [
-          "generate",
-          "create",
-          "make",
+        
+        const lower = p.toLowerCase();
+        
+        // STRICT: Must explicitly mention visual/image creation keywords
+        const visualVerbs = [
           "draw",
           "illustrate",
           "visualize",
           "render",
-          "produce",
           "design",
+          "sketch",
+          "paint",
+        ];
+        
+        const explicitImageNouns = [
           "image of",
           "picture of",
           "photo of",
@@ -1569,32 +1669,85 @@ Return ONLY valid JSON: {"intent": "<intent>", "confidence": <0-1>}`;
           "logo",
           "icon",
           "avatar",
-          "/imagine",
           "wallpaper",
           "poster",
           "banner",
           "thumbnail",
+          "graphic",
+          "illustration",
         ];
-        const cont = ["another", "more", "again", "one more"];
-        const lower = p.toLowerCase();
-        const { matched } = fuzzyIncludes(lower, terms, 1);
-        const continuation = cont.some((w) =>
-          new RegExp(`\\b${w}\\b`, "i").test(lower)
-        );
-        if (matched || continuation) {
-          // If phrase has descriptors like "of a", assume specific generation intent
-          const specific =
-            lower.includes(" of a ") ||
-            lower.includes(" with a ") ||
-            lower.includes(" that has ");
-          let conf = 0.6 + (specific ? 0.2 : 0);
-          if (continuation && p.length < 60) conf = Math.max(conf, 0.7);
+        
+        // "generate"/"create"/"make" alone is ambiguous - require visual context
+        const ambiguousVerbs = ["generate", "create", "make", "produce"];
+        const hasAmbiguousVerb = ambiguousVerbs.some(v => new RegExp(`\\b${v}\\b`, "i").test(lower));
+        
+        // Check for explicit visual nouns
+        const { matched: visualNoun } = fuzzyIncludes(lower, explicitImageNouns, 1);
+        if (visualNoun) {
           return {
             likely: true,
-            confidence: Math.min(0.95, conf),
-            signal: matched || "continuation",
+            confidence: 0.9,
+            signal: visualNoun,
           };
         }
+        
+        // Check for visual verbs (draw, illustrate, etc.)
+        const { matched: visualVerb } = fuzzyIncludes(lower, visualVerbs, 1);
+        if (visualVerb) {
+          return {
+            likely: true,
+            confidence: 0.85,
+            signal: visualVerb,
+          };
+        }
+        
+        // /imagine command
+        if (lower.includes("/imagine")) {
+          return { likely: true, confidence: 0.95, signal: "/imagine" };
+        }
+        
+        // If ambiguous verb + visual descriptors (specific objects, colors, compositions)
+        if (hasAmbiguousVerb) {
+          const visualDescriptors = [
+            " landscape",
+            " sunset",
+            " portrait",
+            " scene",
+            " background",
+            " with colors",
+            " with blue",
+            " with red",
+            " with green",
+            " in style of",
+            " realistic",
+            " anime",
+            " cartoon",
+            " 3d render",
+          ];
+          const hasVisualDescriptor = visualDescriptors.some(d => lower.includes(d));
+          
+          if (hasVisualDescriptor) {
+            return {
+              likely: true,
+              confidence: 0.75,
+              signal: "ambiguous verb + visual descriptor",
+            };
+          }
+        }
+        
+        // "another/more/again" should only trigger if the prompt is very short and context suggests images
+        // Otherwise "write another article" would incorrectly trigger
+        const continuationWords = ["another", "more", "one more"];
+        const hasContinuation = continuationWords.some(w => new RegExp(`\\b${w}\\b`, "i").test(lower));
+        if (hasContinuation && p.length < 30) {
+          // Very short continuation like "another" or "one more" - likely image if recent context
+          return {
+            likely: true,
+            confidence: 0.65,
+            signal: "short continuation",
+          };
+        }
+        
         return { likely: false, confidence: 0.2 };
       }
 
@@ -2414,13 +2567,18 @@ Create a detailed, visually compelling image that directly relates to and visual
         });
       }
 
-      const duration = (Date.now() - startTime) / 1000; // Convert to seconds
-      const parts = (response as any)?.parts ?? [];
-      const text = parts.map((p: any) => p.text ?? "").join("");
+  const duration = (Date.now() - startTime) / 1000; // Convert to seconds
+  const parts = (response as any)?.parts ?? [];
+  const rawText = parts.map((p: any) => p.text ?? "").join("");
+  // Log which provider actually served this request
+  console.log(`🔌 Provider used: ${(response as any)?.provider || (vertex ? 'vertex' : 'google')} (model: ${textModel})`);
 
       console.log(
-        `✅ AI response generated (${text.length} chars) in ${duration.toFixed(2)}s - sending to user immediately...`
+        `✅ AI response generated (${rawText.length} chars) in ${duration.toFixed(2)}s - applying formatter...`
       );
+
+      // Apply light post-formatting for consistency
+      const text = formatResponse(rawText, { emojiEnabled: EMOJI_ENABLED, tone: RESPONSE_TONE });
 
       // ═══════════════════════════════════════════════════════════════════════
       // � CACHE RESPONSE: Store successful text responses for future reuse
@@ -2442,20 +2600,25 @@ Create a detailed, visually compelling image that directly relates to and visual
       // ═══════════════════════════════════════════════════════════════════════
       // �🚀 CRITICAL: Send response to user FIRST (don't make them wait!)
       // ═══════════════════════════════════════════════════════════════════════
+      // Detect if user explicitly requested a file export format
+      const requestedExport = detectExportFormat(prompt);
+
       const jsonResponse = {
         success: true,
         text,
         raw: response,
         metadata: {
+          provider: (response as any)?.provider || (vertex ? 'vertex' : 'google'),
           tokens: (response as any)?.usage?.totalTokenCount || 0,
           candidatesTokenCount:
             (response as any)?.usage?.candidatesTokenCount || 0,
           promptTokenCount: (response as any)?.usage?.promptTokenCount || 0,
           duration: parseFloat(duration.toFixed(2)),
         },
+        export: requestedExport ? { format: requestedExport } : undefined,
       };
       res.json(jsonResponse);
-      console.log(`📤 Response sent to user!`);
+  console.log(`📤 Response sent to user!`);
 
       // ═══════════════════════════════════════════════════════════════════════
       // 💾 LIGHTWEIGHT: Store in local memory only (no Pinecone, super fast!)
@@ -2717,8 +2880,11 @@ Remember: Use recent conversation for context continuity.`;
           cacheService.set(prompt, effectiveUserId, fullText, ttl);
         }
 
-        // Send completion signal
-        res.write(`data: ${JSON.stringify({ done: true, duration })}\n\n`);
+  // Send completion signal (include export intent hint if requested)
+  const requestedExport = detectExportFormat(prompt);
+  const donePayload: any = { done: true, duration };
+  if (requestedExport) donePayload.export = { format: requestedExport };
+  res.write(`data: ${JSON.stringify(donePayload)}\n\n`);
         res.end();
 
         // Note: Memory storage happens via /api/end-chat endpoint (same as regular endpoint)

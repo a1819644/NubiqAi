@@ -5,6 +5,11 @@ import Textarea from "react-textarea-autosize"; // Use auto-sizing textarea
 import { toast } from "sonner";
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import rehypeHighlight from 'rehype-highlight';
+import rehypeSlug from 'rehype-slug';
+import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 import type { ChatHistory as Chat, ChatMessage as Message, User } from "../types"; // UPDATED: Use centralized types
 import { apiService, handleApiError } from "../services/api";
 import {
@@ -1258,6 +1263,28 @@ ${procResp.extractedText}`,
         if (abortControllerRef.current !== controller) return;
 
         safeUpdateChat(() => finalChat);
+        
+        // 🚀 Auto-export if the user explicitly asked for a file (pdf/docx/csv/txt)
+        try {
+          const exportHint = (response as any)?.export?.format as ('pdf'|'docx'|'csv'|'txt'|undefined);
+          if (exportHint && response.text) {
+            const format = exportHint;
+            const baseName = (finalChat.title || 'answer').replace(/[\\\/:*?"<>|]/g, '_').slice(0, 60) || 'answer';
+            const blob = await apiService.exportContent({ content: response.text, format, filename: `${baseName}.${format}` });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${baseName}.${format}`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            try { toast.success(`${format.toUpperCase()} exported`); } catch {}
+          }
+        } catch (e) {
+          console.error('Auto-export failed:', e);
+          try { toast.error('Failed to auto-export. You can use Export to download.'); } catch {}
+        }
         // If the request was aborted while we were processing, the controller would be null.
         // We should stop here to prevent further execution.
         if (!abortControllerRef.current) {
@@ -1986,40 +2013,57 @@ ${procResp.extractedText}`,
                           })) && (
                             <div className="prose dark:prose-invert max-w-none text-sm break-words">
                               <ReactMarkdown
-                                remarkPlugins={[remarkGfm]}
+                                remarkPlugins={[remarkGfm, remarkMath]}
+                                rehypePlugins={[rehypeSlug, [rehypeAutolinkHeadings, { behavior: 'append' }], rehypeKatex, rehypeHighlight]}
                                 components={{
                                   // Custom styling for markdown elements
-                                  h1: ({ node, ...props }) => <h1 className="text-xl font-bold mt-4 mb-2 break-words" {...props} />,
-                                  h2: ({ node, ...props }) => <h2 className="text-lg font-bold mt-3 mb-2 break-words" {...props} />,
-                                  h3: ({ node, ...props }) => <h3 className="text-base font-semibold mt-2 mb-1 break-words" {...props} />,
+                                  h1: ({ node, ...props }) => <h1 className="text-2xl font-bold mt-6 mb-3 break-words" {...props} />,
+                                  h2: ({ node, ...props }) => <h2 className="text-xl font-bold mt-5 mb-3 break-words" {...props} />,
+                                  h3: ({ node, ...props }) => <h3 className="text-lg font-semibold mt-4 mb-2 break-words" {...props} />,
+                                  h4: ({ node, ...props }) => <h4 className="text-base font-semibold mt-3 mb-2 break-words" {...props} />,
                                   code: ({ node, inline, className, children, ...props }: any) => {
                                     if (inline) {
                                       return (
-                                        <code className="bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 px-1.5 py-0.5 rounded text-xs font-mono break-all" {...props}>
+                                        <code className="bg-zinc-100 dark:bg-zinc-800 text-rose-600 dark:text-rose-400 px-1.5 py-0.5 rounded text-[0.875em] font-mono break-words whitespace-pre-wrap" {...props}>
                                           {children}
                                         </code>
                                       );
                                     }
                                     // Block code
                                     return (
-                                      <code className="text-zinc-900 dark:text-zinc-100 text-xs font-mono block whitespace-pre-wrap break-words" {...props}>
+                                      <code className="text-zinc-900 dark:text-zinc-100 text-sm font-mono block whitespace-pre-wrap break-words" {...props}>
                                         {children}
                                       </code>
                                     );
                                   },
                                   pre: ({ node, children, ...props }) => (
-                                    <pre className="bg-zinc-100 dark:bg-zinc-800 p-4 rounded-lg my-3 border border-zinc-200 dark:border-zinc-700 overflow-hidden max-w-full" {...props}>
+                                    <pre className="bg-zinc-100 dark:bg-zinc-900 p-4 rounded-lg my-4 border border-zinc-200 dark:border-zinc-700 overflow-x-auto max-w-full" {...props}>
                                       {children}
                                     </pre>
                                   ),
-                                  ul: ({ node, ...props }) => <ul className="list-disc list-inside my-2 space-y-1 break-words" {...props} />,
-                                  ol: ({ node, ...props }) => <ol className="list-decimal list-inside my-2 space-y-1 break-words" {...props} />,
+                                  ul: ({ node, ...props }) => <ul className="list-disc ml-5 my-3 space-y-1.5 break-words" {...props} />,
+                                  ol: ({ node, ...props }) => <ol className="list-decimal ml-5 my-3 space-y-1.5 break-words" {...props} />,
+                                  li: ({ node, ...props }) => <li className="my-1 leading-relaxed break-words" {...props} />,
                                   blockquote: ({ node, ...props }) => (
-                                    <blockquote className="border-l-4 border-primary pl-4 italic my-2 text-muted-foreground break-words" {...props} />
+                                    <blockquote className="border-l-4 border-primary pl-4 italic my-3 text-muted-foreground break-words" {...props} />
                                   ),
-                                  p: ({ node, ...props }) => <p className="whitespace-pre-wrap my-1 break-words" {...props} />,
-                                  strong: ({ node, ...props }) => <strong className="font-bold break-words" {...props} />,
+                                  p: ({ node, ...props }) => <p className="my-2 leading-relaxed break-words whitespace-pre-wrap" {...props} />,
+                                  strong: ({ node, ...props }) => <strong className="font-semibold break-words" {...props} />,
                                   em: ({ node, ...props }) => <em className="italic break-words" {...props} />,
+                                  a: ({ node, ...props }) => (
+                                    <a className="text-primary hover:underline break-words" target="_blank" rel="noopener noreferrer" {...props} />
+                                  ),
+                                  table: ({ node, ...props }) => (
+                                    <div className="overflow-x-auto my-4">
+                                      <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700" {...props} />
+                                    </div>
+                                  ),
+                                  th: ({ node, ...props }) => (
+                                    <th className="px-4 py-2 bg-zinc-100 dark:bg-zinc-800 font-semibold text-left" {...props} />
+                                  ),
+                                  td: ({ node, ...props }) => (
+                                    <td className="px-4 py-2 border-t border-zinc-200 dark:border-zinc-700" {...props} />
+                                  ),
                                 }}
                               >
                                 {message.content}
