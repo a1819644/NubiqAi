@@ -1,0 +1,12 @@
+node_modules
+npm-debug.log
+Dockerfile
+.dockerignore
+local-images
+*.md
+.env
+.env.*
+.git
+.gitignore
+dist
+serviceAccountKey.json

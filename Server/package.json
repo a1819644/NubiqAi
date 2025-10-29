@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "nodemon index.ts",
+    "build": "tsc",
+    "start:prod": "node dist/index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "clear-history": "ts-node clear-all-history.ts",
     "clear-pinecone": "ts-node delete-all-pinecone-data.ts"
@@ -18,7 +20,6 @@
     "@pinecone-database/pinecone": "^6.1.2",
     "@types/multer": "^2.0.0",
     "@types/uuid": "^10.0.0",
-    "ai-dashboard-portal-mockup": "file:..",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "docx": "^9.5.1",
