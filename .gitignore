@@ -112,6 +112,8 @@ coverage/
 *.backup
 *.bak
 *.tmp
+cloudrun-env.*
+Server/cloudrun-env.*
 
 # Pinecone and AI-related files
 *.vector
@@ -124,9 +126,11 @@ checkpoints/
 
 # Firebase
 /firebase/
+.firebase/
 .firebaserc
 firebase-debug.log*
 firebase-debug.*.log*
+firebase-private-key*
 
 # Package files
 *.7z
