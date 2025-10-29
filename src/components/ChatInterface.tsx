@@ -1582,10 +1582,18 @@ ${procResp.extractedText}`,
         throw new Error('AbortError');
       }
 
+      const requestPayload = {
+        imageBase64,
+        editPrompt,
+        userId: user?.id,
+        chatId: activeChat?.id,
+        useMemory: true,
+      } as const;
+
       if (maskBase64) {
-        editResp = await apiService.editImageWithMask({ imageBase64, maskBase64, editPrompt, signal });
+        editResp = await apiService.editImageWithMask({ ...requestPayload, maskBase64 });
       } else {
-        editResp = await apiService.editImage({ imageBase64, editPrompt, signal });
+        editResp = await apiService.editImage(requestPayload);
       }
 
       if (editResp.success && (editResp.imageBase64 || editResp.imageUri)) {
@@ -1597,15 +1605,33 @@ ${procResp.extractedText}`,
           if (abortControllerRef.current !== controller) return;
 
           const filtered = activeChat.messages.filter(m => !(m.attachments && m.attachments.includes('__editing_image__')));
+          const baseMessageId = placeholderId || `edit-${Date.now()}`;
+          const newMessageId = `${baseMessageId}`;
           const newMsg: Message = {
-                  id: (Date.now() + 1).toString(),
+                  id: newMessageId,
                   content: editPrompt, // SELALU gunakan prompt asli pengguna
                   role: 'assistant',
                   timestamp: new Date(),
                   attachments: [newUrl],
-                  metadata: { altText: editResp.altText } 
                 };
           onUpdateChat({ ...activeChat, messages: [...filtered, newMsg] });
+
+          // Cache edited image for reload persistence
+          if (user?.id && newUrl) {
+            try {
+              await imageStorageService.storeImage(
+                newMessageId,
+                user.id,
+                activeChat.id,
+                newUrl,
+                editPrompt,
+                editResp.imageUri || undefined
+              );
+              console.log('💾 Cached edited image in IndexedDB');
+            } catch (cacheErr) {
+              console.warn('⚠️ Failed to cache edited image:', cacheErr);
+            }
+          }
         }
 
         setViewerSrc(newUrl);

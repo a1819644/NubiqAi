@@ -99,6 +99,18 @@ export class ImageRehydrationService {
    */
   async rehydrateMessageImages(message: any, userId: string, chatId: string): Promise<any> {
     if (!message.attachments || message.attachments.length === 0) {
+      try {
+        const cached = await imageStorageService.getImage(message.id);
+        if (cached) {
+          console.log(`✅ Rehydrated image for message ${message.id} (no attachments persisted)`);
+          return {
+            ...message,
+            attachments: [cached.imageData],
+          };
+        }
+      } catch (error) {
+        console.warn(`⚠️ Failed to rehydrate missing attachments for message ${message.id}:`, error);
+      }
       return message;
     }
 

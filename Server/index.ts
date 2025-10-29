@@ -2,7 +2,10 @@
 import path from "path";
 import * as fs from "fs";
 // Load environment variables from .env file in the 'Server' directory
-require("dotenv").config({ path: path.resolve(__dirname, "../Server/.env") });
+require("dotenv").config({
+  path: path.resolve(__dirname, "../Server/.env"),
+  override: true, // Ensure local .env values take precedence over OS-level vars
+});
 import express from "express";
 import cors from "cors";
 import type { CorsOptions } from "cors";
@@ -121,6 +124,20 @@ function isAllowedOrigin(origin: string): boolean {
   } catch {
     return false;
   }
+}
+
+function parseBoolean(value: unknown, defaultValue: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off"].includes(normalized)) return false;
+  }
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+  }
+  return defaultValue;
 }
 
 // CORS with origin validation function - wrapping callback in try-catch to prevent crashes
@@ -3426,6 +3443,8 @@ app.post(
       let model: string | undefined;
       let userId: string | undefined;
       let imageId: string | undefined;
+      let chatId: string | undefined;
+      let useMemory = true;
 
       // Check if request is multipart/form-data (has file) or JSON
       if (req.file) {
@@ -3434,6 +3453,8 @@ app.post(
         editPrompt = req.body.editPrompt;
         model = req.body.model;
         userId = req.body.userId;
+        chatId = req.body.chatId;
+        useMemory = parseBoolean(req.body.useMemory, true);
         console.log(
           `🎨 Received multipart image for editing: ${req.file.originalname} (${req.file.size} bytes)`
         );
@@ -3445,6 +3466,8 @@ app.post(
         editPrompt = body.editPrompt;
         model = body.model;
         userId = body.userId;
+        chatId = body.chatId;
+        useMemory = parseBoolean(body.useMemory, true);
       }
 
       // 🔒 Validate inputs
@@ -3489,9 +3512,31 @@ app.post(
           });
       }
 
-      if (userId && !SecurityValidator.validateUserId(userId)) {
-        logSecurityEvent("Invalid userId in edit-image", { userId });
-        return res.status(400).json({ error: "Invalid user ID format" });
+      if (userId) {
+        const userValidation = SecurityValidator.validateUserId(userId);
+        if (!userValidation.valid) {
+          logSecurityEvent("Invalid userId in edit-image", {
+            userId,
+            error: userValidation.error,
+          });
+          return res
+            .status(400)
+            .json({ error: userValidation.error || "Invalid user ID format" });
+        }
+      }
+
+      if (chatId) {
+        const chatValidation = SecurityValidator.validateChatId(chatId);
+        if (!chatValidation.valid) {
+          logSecurityEvent("Invalid chatId in edit-image", {
+            userId,
+            chatId,
+            error: chatValidation.error,
+          });
+          return res
+            .status(400)
+            .json({ error: chatValidation.error || "Invalid chat ID format" });
+        }
       }
 
       console.log(`🎨 Editing image with prompt: "${editPrompt}"`);
@@ -3545,7 +3590,7 @@ Focus: Minimal, precise edits. Maximum preservation of the original image.`;
           if (newImageBase64) {
             const saved = await localImageCacheService.saveBase64(
               userId || "anonymous",
-              "edit",
+              chatId || "default",
               newImageBase64,
               "png"
             );
@@ -3553,7 +3598,7 @@ Focus: Minimal, precise edits. Maximum preservation of the original image.`;
           } else if (imageUri) {
             const saved = await localImageCacheService.saveFromUri(
               userId || "anonymous",
-              "edit",
+              chatId || "default",
               imageUri,
               "png"
             );
@@ -3564,7 +3609,7 @@ Focus: Minimal, precise edits. Maximum preservation of the original image.`;
         console.warn("⚠️ Failed to save edited image locally:", e);
       }
 
-      return res.json({
+      res.json({
         success: true,
         imageBase64: newImageBase64,
         imageUri,
@@ -3572,6 +3617,110 @@ Focus: Minimal, precise edits. Maximum preservation of the original image.`;
         altText,
         raw: response,
       });
+
+      setImmediate(async () => {
+        try {
+          if (localImageCacheService.isEnabled()) {
+            if (!imageLocalUri && newImageBase64) {
+              const saved = await localImageCacheService.saveBase64(
+                userId || "anonymous",
+                chatId || "default",
+                newImageBase64,
+                "png"
+              );
+              imageLocalUri = saved.localUri;
+              console.log(
+                `🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`
+              );
+            } else if (!imageLocalUri && imageUri) {
+              const saved = await localImageCacheService.saveFromUri(
+                userId || "anonymous",
+                chatId || "default",
+                imageUri,
+                "png"
+              );
+              imageLocalUri = saved.localUri;
+              console.log(
+                `🗃️ [BACKGROUND] Cached edited image locally: ${imageLocalUri}`
+              );
+            }
+          }
+        } catch (cacheError) {
+          console.warn(
+            "⚠️ [BACKGROUND] Failed to save edited image locally:",
+            cacheError
+          );
+        }
+
+        if (!useMemory || !userId || (!newImageBase64 && !imageUri)) {
+          return;
+        }
+
+        try {
+          const hybridMemoryService = getHybridMemoryService();
+          let firebaseImageUrl: string | undefined;
+
+          if (newImageBase64) {
+            firebaseImageUrl = await firebaseStorageService.uploadImage(
+              userId,
+              chatId || "default",
+              newImageBase64,
+              editPrompt
+            );
+          } else if (imageUri) {
+            try {
+              const resp = await fetch(imageUri);
+              if (resp.ok) {
+                const arrayBuf = await resp.arrayBuffer();
+                const buffer = Buffer.from(arrayBuf);
+                const b64 = buffer.toString("base64");
+                firebaseImageUrl = await firebaseStorageService.uploadImage(
+                  userId,
+                  chatId || "default",
+                  b64,
+                  editPrompt
+                );
+              } else {
+                console.warn(
+                  `⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`
+                );
+                firebaseImageUrl = imageUri;
+              }
+            } catch (downloadError) {
+              console.warn(
+                "⚠️ Error downloading URI for upload, storing URI as-is:",
+                downloadError
+              );
+              firebaseImageUrl = imageUri;
+            }
+          }
+
+          if (!firebaseImageUrl) {
+            return;
+          }
+
+          const conversationTurn = hybridMemoryService.storeConversationTurn(
+            userId,
+            editPrompt,
+            altText || "Image edited",
+            chatId,
+            { url: firebaseImageUrl, prompt: editPrompt }
+          );
+
+          await firestoreChatService.saveTurn(conversationTurn);
+
+          console.log(
+            `🖼️ [BACKGROUND] Stored edited image URL in conversation history`
+          );
+        } catch (memoryError) {
+          console.warn(
+            "⚠️ [BACKGROUND] Failed to upload/store edited image:",
+            memoryError
+          );
+        }
+      });
+
+      return;
     } catch (err: any) {
       console.error("edit-image error:", err);
       return res
@@ -3599,11 +3748,13 @@ app.post(
       return res.status(500).json({ error: "AI client not initialized" });
 
     try {
-      let imageBase64: string;
-      let maskBase64: string;
-      let editPrompt: string;
-      let model: string | undefined;
-      let userId: string | undefined;
+  let imageBase64: string;
+  let maskBase64: string;
+  let editPrompt: string;
+  let model: string | undefined;
+  let userId: string | undefined;
+  let chatId: string | undefined;
+  let useMemory = true;
 
       // Check if request is multipart/form-data (has files) or JSON
       if (
@@ -3626,6 +3777,8 @@ app.post(
         editPrompt = req.body.editPrompt;
         model = req.body.model;
         userId = req.body.userId;
+        chatId = req.body.chatId;
+        useMemory = parseBoolean(req.body.useMemory, true);
         console.log(`🎨 Received multipart image+mask for editing`);
       } else {
         // JSON request
@@ -3635,6 +3788,8 @@ app.post(
         editPrompt = body.editPrompt;
         model = body.model;
         userId = body.userId;
+        chatId = body.chatId;
+        useMemory = parseBoolean(body.useMemory, true);
       }
 
       // 🔒 Validate inputs
@@ -3669,9 +3824,31 @@ app.post(
           .json({ error: "Invalid or oversized maskBase64 (max 10MB)" });
       }
 
-      if (userId && !SecurityValidator.validateUserId(userId)) {
-        logSecurityEvent("Invalid userId in edit-image-with-mask", { userId });
-        return res.status(400).json({ error: "Invalid user ID format" });
+      if (userId) {
+        const userValidation = SecurityValidator.validateUserId(userId);
+        if (!userValidation.valid) {
+          logSecurityEvent("Invalid userId in edit-image-with-mask", {
+            userId,
+            error: userValidation.error,
+          });
+          return res
+            .status(400)
+            .json({ error: userValidation.error || "Invalid user ID format" });
+        }
+      }
+
+      if (chatId) {
+        const chatValidation = SecurityValidator.validateChatId(chatId);
+        if (!chatValidation.valid) {
+          logSecurityEvent("Invalid chatId in edit-image-with-mask", {
+            userId,
+            chatId,
+            error: chatValidation.error,
+          });
+          return res
+            .status(400)
+            .json({ error: chatValidation.error || "Invalid chat ID format" });
+        }
       }
 
       // NOTE: Gemini doesn't support true mask-based editing like Stable Diffusion inpainting
@@ -3741,7 +3918,7 @@ Focus: Minimal, precise edits to masked areas only. Maximum preservation everywh
           if (newImageBase64) {
             const saved = await localImageCacheService.saveBase64(
               userId || "anonymous",
-              "edit-mask",
+              chatId || "default",
               newImageBase64,
               "png"
             );
@@ -3749,7 +3926,7 @@ Focus: Minimal, precise edits to masked areas only. Maximum preservation everywh
           } else if (imageUri) {
             const saved = await localImageCacheService.saveFromUri(
               userId || "anonymous",
-              "edit-mask",
+              chatId || "default",
               imageUri,
               "png"
             );
@@ -3760,7 +3937,7 @@ Focus: Minimal, precise edits to masked areas only. Maximum preservation everywh
         console.warn("⚠️ Failed to save edited(mask) image locally:", e);
       }
 
-      return res.json({
+      res.json({
         success: true,
         imageBase64: newImageBase64,
         imageUri,
@@ -3768,6 +3945,110 @@ Focus: Minimal, precise edits to masked areas only. Maximum preservation everywh
         altText,
         raw: response,
       });
+
+      setImmediate(async () => {
+        try {
+          if (localImageCacheService.isEnabled()) {
+            if (!imageLocalUri2 && newImageBase64) {
+              const saved = await localImageCacheService.saveBase64(
+                userId || "anonymous",
+                chatId || "default",
+                newImageBase64,
+                "png"
+              );
+              imageLocalUri2 = saved.localUri;
+              console.log(
+                `🗃️ [BACKGROUND] Cached edited(mask) image locally: ${imageLocalUri2}`
+              );
+            } else if (!imageLocalUri2 && imageUri) {
+              const saved = await localImageCacheService.saveFromUri(
+                userId || "anonymous",
+                chatId || "default",
+                imageUri,
+                "png"
+              );
+              imageLocalUri2 = saved.localUri;
+              console.log(
+                `🗃️ [BACKGROUND] Cached edited(mask) image locally: ${imageLocalUri2}`
+              );
+            }
+          }
+        } catch (cacheError) {
+          console.warn(
+            "⚠️ [BACKGROUND] Failed to save edited(mask) image locally:",
+            cacheError
+          );
+        }
+
+        if (!useMemory || !userId || (!newImageBase64 && !imageUri)) {
+          return;
+        }
+
+        try {
+          const hybridMemoryService = getHybridMemoryService();
+          let firebaseImageUrl: string | undefined;
+
+          if (newImageBase64) {
+            firebaseImageUrl = await firebaseStorageService.uploadImage(
+              userId,
+              chatId || "default",
+              newImageBase64,
+              editPrompt
+            );
+          } else if (imageUri) {
+            try {
+              const resp = await fetch(imageUri);
+              if (resp.ok) {
+                const arrayBuf = await resp.arrayBuffer();
+                const buffer = Buffer.from(arrayBuf);
+                const b64 = buffer.toString("base64");
+                firebaseImageUrl = await firebaseStorageService.uploadImage(
+                  userId,
+                  chatId || "default",
+                  b64,
+                  editPrompt
+                );
+              } else {
+                console.warn(
+                  `⚠️ Failed to fetch image URI for upload (status ${resp.status}). Storing URI as-is.`
+                );
+                firebaseImageUrl = imageUri;
+              }
+            } catch (downloadError) {
+              console.warn(
+                "⚠️ Error downloading URI for upload, storing URI as-is:",
+                downloadError
+              );
+              firebaseImageUrl = imageUri;
+            }
+          }
+
+          if (!firebaseImageUrl) {
+            return;
+          }
+
+          const conversationTurn = hybridMemoryService.storeConversationTurn(
+            userId,
+            editPrompt,
+            altText || "Image edited",
+            chatId,
+            { url: firebaseImageUrl, prompt: editPrompt }
+          );
+
+          await firestoreChatService.saveTurn(conversationTurn);
+
+          console.log(
+            `🖼️ [BACKGROUND] Stored mask-edited image URL in conversation history`
+          );
+        } catch (memoryError) {
+          console.warn(
+            "⚠️ [BACKGROUND] Failed to upload/store mask-edited image:",
+            memoryError
+          );
+        }
+      });
+
+      return;
     } catch (err: any) {
       console.error("edit-image-with-mask error:", err);
       return res
@@ -4760,7 +5041,8 @@ app.post(
       }
       
       // Use Gemini's multimodal capabilities for audio transcription
-      const model = "gemini-2.0-flash-lite-001"; // Fast model for transcription
+      // Use INTENT_MODEL from env (fast model) or fallback to gemini-2.5-flash
+      const model = process.env.INTENT_MODEL || "gemini-2.5-flash";
       
       try {
         const response = await generateContent({

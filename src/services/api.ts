@@ -501,7 +501,7 @@ class ApiService {
   }
 
   /** Edit an image (base64) with a prompt */
-  async editImage(options: { imageBase64: string; editPrompt: string; model?: string }): Promise<{ success: boolean; imageBase64?: string | null; imageUri?: string | null; altText?: string | null; error?: string }> {
+  async editImage(options: { imageBase64: string; editPrompt: string; model?: string; userId?: string; chatId?: string; useMemory?: boolean }): Promise<{ success: boolean; imageBase64?: string | null; imageUri?: string | null; altText?: string | null; error?: string }> {
     const url = `${this.baseURL}/edit-image`;
     const controller = new AbortController();
     const timeoutMs = 2 * 60 * 1000; // 2 minutes
@@ -511,7 +511,14 @@ class ApiService {
       const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64: options.imageBase64, editPrompt: options.editPrompt, model: options.model }),
+        body: JSON.stringify({
+          imageBase64: options.imageBase64,
+          editPrompt: options.editPrompt,
+          model: options.model,
+          userId: options.userId,
+          chatId: options.chatId,
+          useMemory: options.useMemory !== false,
+        }),
         signal: controller.signal,
       });
 
@@ -533,7 +540,7 @@ class ApiService {
   }
 
   /** Edit an image using a mask (both base64) */
-  async editImageWithMask(options: { imageBase64: string; maskBase64: string; editPrompt: string; model?: string }): Promise<{ success: boolean; imageBase64?: string | null; imageUri?: string | null; altText?: string | null; error?: string }> {
+  async editImageWithMask(options: { imageBase64: string; maskBase64: string; editPrompt: string; model?: string; userId?: string; chatId?: string; useMemory?: boolean }): Promise<{ success: boolean; imageBase64?: string | null; imageUri?: string | null; altText?: string | null; error?: string }> {
     const url = `${this.baseURL}/edit-image-with-mask`;
     const controller = new AbortController();
     const timeoutMs = 2 * 60 * 1000; // 2 minutes
@@ -543,7 +550,15 @@ class ApiService {
       const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64: options.imageBase64, maskBase64: options.maskBase64, editPrompt: options.editPrompt, model: options.model }),
+        body: JSON.stringify({
+          imageBase64: options.imageBase64,
+          maskBase64: options.maskBase64,
+          editPrompt: options.editPrompt,
+          model: options.model,
+          userId: options.userId,
+          chatId: options.chatId,
+          useMemory: options.useMemory !== false,
+        }),
         signal: controller.signal,
       });
 

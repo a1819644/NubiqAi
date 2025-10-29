@@ -14,7 +14,7 @@ import { imageRehydrationService } from "./services/imageRehydrationService";
 import { Toaster } from "sonner";
 import { toast } from "sonner";
 import { useDarkMode } from "./hooks/useDarkMode";
-import { useAuth, User } from "./hooks/useAuth";
+import { useAuth } from "./hooks/useAuth";
 import { cn } from "./components/ui/utils";
 import { ChatHistory, NavigationSection } from "./types";
 
@@ -272,7 +272,11 @@ export default function App() {
                       typeof att === "string" &&
                       att.startsWith("data:image")
                     ) {
-                      return undefined;
+                      return {
+                        type: "indexeddb",
+                        messageId: msg.id,
+                        chatId: chat.id,
+                      };
                     }
                     return att;
                   })
@@ -408,7 +412,11 @@ export default function App() {
                 }
                 // Remove base64 images to save space
                 if (typeof att === 'string' && att.startsWith('data:image')) {
-                  return undefined;
+                  return {
+                    type: 'indexeddb',
+                    messageId: msg.id,
+                    chatId: chat.id,
+                  };
                 }
                 return att;
               }).filter((att: any) => att !== undefined)

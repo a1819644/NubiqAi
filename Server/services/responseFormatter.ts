@@ -98,6 +98,42 @@ function normalizeListsAndPunctuation(md: string): string {
     // If line starts with many spaces before a list marker, trim to avoid code block indentation
     line = line.replace(/^[\t ]{2,}(-|\*|\d+\.)\s+/, "$1 ");
 
+    // Merge multiline bullets that models often split across several lines (Method titles, etc.)
+    if (/^\s*[-*]\s+/.test(line)) {
+      let combined = line.trimEnd();
+      let consumed = 0;
+
+      for (let j = i + 1; j < lines.length; j++) {
+        const candidateRaw = lines[j];
+        const candidate = candidateRaw.trim();
+        if (!candidate) break;
+        if (/^[#`]/.test(candidate)) break; // stop at headings or code fences
+        if (/^[-*\d+\.]/.test(candidate)) break; // stop at new lists or numbered items
+        if (candidate.length > 80) break; // likely a new paragraph
+
+        combined += combined.endsWith("(") ? candidate : ` ${candidate}`;
+        consumed += 1;
+
+        if (candidate.endsWith(")")) break;
+      }
+
+      if (consumed > 0) {
+        // Normalize spacing inside parentheses
+        combined = combined.replace(/\(\s+/g, "(").replace(/\s+\)/g, ")");
+        // Wrap common expression patterns in backticks for nicer rendering
+        combined = combined.replace(/\(([^()]{1,40})\)/g, (_m, inner) => {
+          const trimmedInner = inner.trim();
+          if (/[?&|=+<>]/.test(trimmedInner) && !trimmedInner.includes("`")) {
+            return ` (\`${trimmedInner.replace(/\s+/g, " ")}\`)`;
+          }
+          return ` (${trimmedInner})`;
+        });
+        out.push(combined);
+        i += consumed;
+        continue;
+      }
+    }
+
     // CRITICAL: Detect inline code bullets (like `• `GenerativeModel(...)`` or `- `code``) 
     // and format as bold paragraphs instead of list items
     if (/^\s*[•◦●\-*]\s+`[^`]+`/.test(line)) {
