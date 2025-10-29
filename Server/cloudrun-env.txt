@@ -1,0 +1,2 @@
+NODE_ENV=production
+CORS_ORIGINS=https://vectorslabai-16a5b.firebaseapp.com,https://vectorslabai-16a5b.web.app

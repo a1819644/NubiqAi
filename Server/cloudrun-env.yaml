@@ -1,0 +1,6 @@
+NODE_ENV: "production"
+CORS_ORIGINS: "https://vectorslabai-16a5b.firebaseapp.com,https://vectorslabai-16a5b.web.app"
+GOOGLE_CLOUD_PROJECT: "vectorslabai-16a5b"
+VERTEX_LOCATION: "us-central1"
+ENABLE_EMOJI: "true"
+FIREBASE_STORAGE_BUCKET: "vectorslabai-16a5b.firebasestorage.app"

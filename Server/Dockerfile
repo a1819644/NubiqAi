@@ -31,7 +31,8 @@ COPY --from=builder /app/dist ./dist
 
 # Copy non-TS runtime assets if needed
 COPY ecosystem.config.js ./ecosystem.config.js
-COPY cors.json ./cors.json
+# Optional Firebase Storage CORS config; safe to omit in runtime image
+# COPY cors.json ./cors.json
 COPY style.css ./style.css
 
 # Expose the port Cloud Run will listen on
